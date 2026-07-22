@@ -1,0 +1,3 @@
+# This directory holds runtime control files.
+# Create a file named KILL here (e.g. `touch control/KILL`) to trip the kill switch:
+# no new entries are opened and open positions are flattened on the next loop.

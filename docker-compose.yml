@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: smt
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-smt}
+      POSTGRES_DB: smt
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Bind to loopback only; the app talks to it over the compose network.
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smt"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  trader:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # Inside compose, reach Postgres by service name.
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://smt:${POSTGRES_PASSWORD:-smt}@postgres:5432/smt}
+      # Kill switch lives in a bind-mounted control dir: `touch control/KILL`
+      # on the host to stop trading without SSH into the container.
+      KILL_FILE: /app/control/KILL
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./control:/app/control
+    command: ["smt", "run"]
+
+volumes:
+  pgdata:

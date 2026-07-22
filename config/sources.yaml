@@ -1,0 +1,35 @@
+# Social sources config. Ingest polls on a schedule (hours->intraday horizon).
+
+poll_interval_seconds: 300   # 5 min
+
+reddit:
+  enabled: true
+  subreddits:
+    - CryptoCurrency
+    - CryptoMarkets
+    - solana
+    - Bitcoin
+    - ethereum
+  # How many new posts/comments to pull per subreddit per poll.
+  limit_per_subreddit: 50
+
+youtube:
+  enabled: true
+  # Channels and/or search queries to watch for new videos.
+  channels: []            # channel IDs
+  queries:
+    - "crypto news today"
+    - "solana price"
+  max_results_per_query: 10
+  fetch_transcripts: true
+
+x:
+  enabled: false          # deferred until paper loop is stable + budget set
+  watch_accounts: []      # e.g. ["someanalyst"]
+  keywords: ["$BTC", "$ETH", "$SOL"]
+
+# Mock source is used when a real source is disabled/unconfigured so the
+# paper loop always has data to run against.
+mock:
+  enabled: true
+  events_per_poll: 30

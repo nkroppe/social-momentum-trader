@@ -1,0 +1,39 @@
+# Fund-protection / withdrawal-hardening controls.
+# These are enforced in code before any LIVE order is placed.
+
+# Bot startup asserts the Coinbase API key permissions. If can_transfer is
+# true, the app REFUSES to run live.
+require_trade_only_key: true
+forbid_transfer_permission: true
+
+# The executor is only allowed to call these Coinbase REST paths. Any attempt
+# to touch a transfer/withdraw/portfolio-move path is a hard error.
+allowed_api_path_prefixes:
+  - /api/v3/brokerage/orders            # create/cancel/list orders
+  - /api/v3/brokerage/accounts          # read balances
+  - /api/v3/brokerage/products          # market data
+  - /api/v3/brokerage/best_bid_ask
+  - /api/v3/brokerage/key_permissions   # startup assertion
+
+# Substrings that must NEVER appear in an outbound request path.
+forbidden_api_path_substrings:
+  - withdraw
+  - transfer
+  - payment
+  - sweep
+  - convert
+  - address
+
+# Transfer/withdrawal monitor: poll account activity; if any outbound
+# transfer is detected, trip the kill switch and page.
+transfer_monitor:
+  enabled: true
+  poll_interval_seconds: 300
+
+# Balance anomaly: alert if isolated portfolio equity drops more than this
+# fraction outside of logged fills within one poll (possible key abuse).
+balance_anomaly_drop_pct: 0.10
+
+# Live-readiness gate: number of consecutive clean paper-soak days required
+# before LIVE=true is honored.
+min_paper_soak_days: 14

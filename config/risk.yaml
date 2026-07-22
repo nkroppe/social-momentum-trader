@@ -1,0 +1,43 @@
+# Hard risk limits. The trader CANNOT override these at runtime.
+# Tuned conservatively for a ~$1k-$10k isolated portfolio.
+
+# Fraction of the isolated portfolio deployable into a single position.
+max_position_pct: 0.10
+
+# Max simultaneous open positions.
+max_open_positions: 3
+
+# Max NEW entries opened per rolling 24h.
+max_trades_per_day: 8
+
+# Halt opening new trades if realized+unrealized PnL for the day drops below this
+# fraction of starting-of-day equity (e.g. -0.05 = -5%).
+daily_loss_halt_pct: -0.05
+
+# Weekly equivalent.
+weekly_loss_halt_pct: -0.12
+
+# After a stop-out on a symbol, ignore new signals for it for this many minutes.
+cooldown_minutes_after_stop: 120
+
+# Exit parameters (defaults; tuned during paper soak).
+take_profit_pct: 0.06      # +6% target
+stop_loss_pct: 0.03        # -3% stop
+time_stop_hours: 6         # flatten if neither TP nor SL hits within N hours
+
+# Minimum notional per order (avoid dust / fee-dominated trades), USD.
+min_order_notional_usd: 25
+
+# Assumed round-trip fee for paper sizing sanity (Coinbase taker ~ per side).
+assumed_fee_pct_per_side: 0.006
+
+# --- Signal entry thresholds (tuned during paper soak) ---
+# Velocity z-score required to consider an entry.
+signal_min_zscore: 2.5
+# Require confirmation across at least this many distinct sources.
+signal_min_distinct_sources: 2
+# Require at least this many raw mentions over the lookback window.
+signal_min_mentions: 8
+# Scorer bucketing.
+scorer_bucket_minutes: 30
+scorer_lookback_buckets: 8
