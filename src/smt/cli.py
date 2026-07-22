@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 import argparse
-import uuid
-from datetime import timedelta
 
 from . import __version__
 from .logging_setup import get_logger
-from .models import SocialEvent, utcnow
 
 log = get_logger("smt.cli")
 
@@ -44,24 +41,46 @@ def _cmd_score(_args: argparse.Namespace) -> int:
 
 
 def _cmd_status(_args: argparse.Namespace) -> int:
-    from .config import get_settings
-    from .store import Store
+    from .run import Runner
 
-    settings = get_settings()
-    store = Store(settings.database_url)
-    store.init_db()
-    open_trades = store.open_trades()
-    realized = store.total_realized_pnl()
-    day_pnl = store.realized_pnl_since(utcnow() - timedelta(days=1))
-
-    print(f"Mode           : {'LIVE' if settings.live else 'PAPER'}")
-    print(f"Open positions : {len(open_trades)}")
-    for t in open_trades:
+    r = Runner()
+    print(f"Mode  : {'LIVE' if r.settings.live else 'PAPER'}")
+    print(f"Total equity : ${r.manager.equity():.2f}")
+    for st in r.strategies:
+        open_trades = r.store.open_trades(st.name)
+        alloc_eq = r.manager.allocation_equity(st)
         print(
-            f"  - {t.ticker:<6} qty={t.qty:.6f} entry={t.entry_price:.6f} "
-            f"tp={t.take_profit:.6f} sl={t.stop_loss:.6f}"
+            f"\n[{st.name}] allocation={st.allocation:.0%} "
+            f"alloc_equity=${alloc_eq:.2f} open={len(open_trades)}"
         )
-    print(f"Realized PnL   : ${realized:.2f} (24h: ${day_pnl:.2f})")
+        for t in open_trades:
+            print(
+                f"  - {t.ticker:<6} qty={t.qty:.6f} entry={t.entry_price:.6f} "
+                f"tp={t.take_profit:.6f} sl={t.stop_loss:.6f}"
+            )
+    return 0
+
+
+def _cmd_compare(_args: argparse.Namespace) -> int:
+    """Side-by-side performance of each strategy over the soak."""
+    from .run import Runner
+
+    r = Runner()
+    print(f"Mode: {'LIVE' if r.settings.live else 'PAPER'}  |  Comparing strategies\n")
+    header = (
+        f"{'STRATEGY':<10}{'ALLOC':>7}{'ALLOC_EQ':>12}{'OPEN':>6}"
+        f"{'CLOSED':>8}{'WINRATE':>9}{'PNL':>10}{'PNL_24H':>10}{'AVG_HOLD_H':>12}"
+    )
+    print(header)
+    print("-" * len(header))
+    for st in r.strategies:
+        s = r.store.strategy_stats(st.name)
+        alloc_eq = r.manager.allocation_equity(st)
+        print(
+            f"{st.name:<10}{st.allocation:>6.0%} {alloc_eq:>11.2f}{s['open_positions']:>6}"
+            f"{s['closed_trades']:>8}{s['win_rate']:>8.0%} {s['total_pnl']:>9.2f}"
+            f"{s['day_pnl']:>10.2f}{s['avg_hold_hours']:>12.2f}"
+        )
     return 0
 
 
@@ -84,11 +103,14 @@ def _cmd_clear_kill(_args: argparse.Namespace) -> int:
 
 
 def _cmd_simulate(args: argparse.Namespace) -> int:
-    """Deterministic end-to-end demo: seed baseline + burst, open, then hit TP.
+    """Deterministic end-to-end demo exercising BOTH strategies.
 
-    Proves ingest -> score -> signal -> risk -> paper fill -> exit without any
-    external credentials or waiting for real time to pass.
+    Seeds one ticker with baseline + multi-source burst so intraday AND swing
+    each open their own independent position, then forces the price to each
+    take-profit and closes them. Proves ingest -> score -> per-strategy signal
+    -> per-strategy risk/allocation -> paper fill -> exit, with no credentials.
     """
+    from .demo import seed_momentum
     from .run import Runner
 
     r = Runner()
@@ -101,78 +123,51 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
         print(f"Unknown ticker {ticker}; choose from {list(r.universe.symbols)}")
         return 2
     product_id = r.universe.symbols[ticker].product_id
-    bucket = r.risk.scorer_bucket_minutes
-    lookback = r.risk.scorer_lookback_buckets
 
-    # 1) Seed a low, steady baseline across older buckets (single source).
-    baseline_events: list[SocialEvent] = []
-    for i in range(lookback, 1, -1):
-        ts = utcnow() - timedelta(minutes=bucket * i - 1)
-        for _ in range(2):
-            baseline_events.append(
-                SocialEvent(
-                    source="reddit",
-                    external_id=uuid.uuid4().hex,
-                    ticker=ticker,
-                    author="baseline",
-                    text=f"${ticker} chatter",
-                    url="",
-                    weight=1.0,
-                    created_at=ts,
-                )
-            )
-    r.store.add_events(baseline_events)
+    # 1) Seed data that clears every enabled strategy's thresholds.
+    seed_momentum(r.store, ticker, r.strategies)
 
-    # 2) Burst in the most recent bucket, across TWO distinct sources (confirmation).
-    burst: list[SocialEvent] = []
-    now = utcnow()
-    for src in ("reddit", "youtube"):
-        for _ in range(12):
-            burst.append(
-                SocialEvent(
-                    source=src,
-                    external_id=uuid.uuid4().hex,
-                    ticker=ticker,
-                    author=f"{src}user",
-                    text=f"${ticker} exploding, huge momentum",
-                    url="",
-                    weight=1.0,
-                    created_at=now,
-                )
-            )
-    r.store.add_events(burst)
-
-    # 3) Score + show.
-    result = r.scorer.score_ticker(ticker)
-    print(
-        f"Score for {ticker}: {result.reason} | "
-        f"sources={result.distinct_sources} mentions={result.mentions_window}"
-    )
-
-    # 4) Evaluate + open.
-    r.evaluate_and_trade()
-    open_trade = r.store.open_trade_for(ticker)
-    if open_trade is None:
-        print("No position opened (thresholds not met). Adjust config/risk.yaml.")
-        return 1
-    print(
-        f"OPENED {ticker}: qty={open_trade.qty:.8f} entry={open_trade.entry_price:.6f} "
-        f"tp={open_trade.take_profit:.6f} sl={open_trade.stop_loss:.6f}"
-    )
-
-    # 5) Force price above TP and manage exits -> should close as TAKE_PROFIT.
-    r.broker.set_price(product_id, open_trade.take_profit * 1.05)  # type: ignore[attr-defined]
-    r.manager.manage_open_trades()
-
-    closed = r.store.closed_trades_for(ticker)
-    if closed:
-        t = closed[-1]
+    # 2) Per-strategy scores.
+    for st in r.strategies:
+        res = r.scorers[st.name].score_ticker(ticker)
         print(
-            f"CLOSED {ticker}: reason={t.exit_reason.value} "
-            f"exit={t.exit_price:.6f} pnl=${t.realized_pnl:.2f}"
+            f"[{st.name}] {ticker} z={res.zscore:.2f} sources={res.distinct_sources} "
+            f"mentions={res.mentions_window} (min_z={st.signal_min_zscore} "
+            f"min_src={st.signal_min_distinct_sources} min_men={st.signal_min_mentions})"
         )
-    print(f"Total realized PnL: ${r.store.total_realized_pnl():.2f}")
-    print("Simulation complete: ingest -> score -> signal -> risk -> fill -> exit all exercised.")
+
+    # 3) Evaluate + open, independently per strategy.
+    r.evaluate_and_trade()
+    opened = {st.name: r.store.open_trade_for(ticker, st.name) for st in r.strategies}
+    for name, tr in opened.items():
+        if tr is None:
+            print(f"WARNING: {name} did not open a position for {ticker}.")
+        else:
+            print(
+                f"OPENED[{name}] {ticker}: qty={tr.qty:.8f} entry={tr.entry_price:.6f} "
+                f"tp={tr.take_profit:.6f} sl={tr.stop_loss:.6f}"
+            )
+
+    # 4) Force price above the highest TP so every open position hits take-profit.
+    open_trades = r.store.open_trades()
+    if open_trades:
+        highest_tp = max(t.take_profit for t in open_trades)
+        r.broker.set_price(product_id, highest_tp * 1.05)  # type: ignore[attr-defined]
+        r.manager.manage_open_trades()
+
+    # 5) Report closes per strategy.
+    for st in r.strategies:
+        closed = r.store.closed_trades_for(ticker, st.name)
+        if closed:
+            t = closed[-1]
+            print(
+                f"CLOSED[{st.name}] {ticker}: reason={t.exit_reason.value} "
+                f"exit={t.exit_price:.6f} pnl=${t.realized_pnl:.2f}"
+            )
+
+    print("\nComparison after simulation:")
+    _cmd_compare(args)
+    print("\nSimulation complete: BOTH strategies exercised end-to-end.")
     return 0
 
 
@@ -186,7 +181,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("score", help="Ingest once and print current momentum scores").set_defaults(
         func=_cmd_score
     )
-    sub.add_parser("status", help="Show open positions and PnL").set_defaults(func=_cmd_status)
+    sub.add_parser("status", help="Show open positions and PnL by strategy").set_defaults(
+        func=_cmd_status
+    )
+    sub.add_parser("compare", help="Compare strategy performance side by side").set_defaults(
+        func=_cmd_compare
+    )
 
     k = sub.add_parser("kill", help="Trip the kill switch")
     k.add_argument("--reason", default="")

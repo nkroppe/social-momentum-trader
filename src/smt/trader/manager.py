@@ -1,10 +1,15 @@
-"""Trade manager: opens approved entries and manages exits (TP/SL/time-stop/kill)."""
+"""Trade manager: opens approved entries and manages exits (TP/SL/time-stop/kill).
+
+Exit levels and the time-stop are derived from the opening strategy's params
+and stored on the trade, so each position is managed by its own methodology.
+Capital is tracked per strategy via independent allocation equity.
+"""
 
 from __future__ import annotations
 
 from datetime import timedelta
 
-from ..config import RiskConfig, Settings, UniverseConfig
+from ..config import Settings, StrategyConfig, UniverseConfig
 from ..logging_setup import get_logger
 from ..models import ExitReason, Trade, TradeStatus, utcnow
 from ..store import Store
@@ -18,13 +23,11 @@ class TradeManager:
     def __init__(
         self,
         settings: Settings,
-        risk: RiskConfig,
         universe: UniverseConfig,
         store: Store,
         broker: Broker,
     ):
         self.settings = settings
-        self.risk = risk
         self.universe = universe
         self.store = store
         self.broker = broker
@@ -32,7 +35,7 @@ class TradeManager:
     # ---- Equity ------------------------------------------------------------
 
     def equity(self) -> float:
-        """Current portfolio equity.
+        """Total portfolio equity across all strategies.
 
         Paper: start equity + all realized PnL + mark-to-market of open trades.
         Live: read from the exchange (isolated portfolio).
@@ -49,16 +52,41 @@ class TradeManager:
             eq += (price - t.entry_price) * t.qty
         return eq
 
+    def allocation_start_equity(self, strategy: StrategyConfig) -> float:
+        """The strategy's starting capital slice."""
+        return self.settings.paper_start_equity * strategy.allocation
+
+    def allocation_equity(self, strategy: StrategyConfig) -> float:
+        """Current equity of this strategy's independent allocation.
+
+        = its starting slice + its own realized PnL + MTM of its open trades.
+        This keeps the two strategies' capital fully independent.
+        """
+        if self.broker.name == "coinbase":
+            try:
+                return self.broker.portfolio_equity_usd() * strategy.allocation  # type: ignore[attr-defined]
+            except Exception as exc:  # noqa: BLE001
+                log.warning("failed to read live equity, falling back: %s", exc)
+
+        eq = self.allocation_start_equity(strategy) + self.store.total_realized_pnl(strategy.name)
+        for t in self.store.open_trades(strategy.name):
+            price = self.broker.current_price(t.product_id)
+            eq += (price - t.entry_price) * t.qty
+        return eq
+
     # ---- Entry -------------------------------------------------------------
 
-    def open_position(self, candidate: TradeCandidate, notional_usd: float) -> Trade:
+    def open_position(
+        self, candidate: TradeCandidate, notional_usd: float, strategy: StrategyConfig
+    ) -> Trade:
         entry_price = self.broker.current_price(candidate.product_id)
-        tp = round(entry_price * (1 + self.risk.take_profit_pct), 8)
-        sl = round(entry_price * (1 - self.risk.stop_loss_pct), 8)
+        tp = round(entry_price * (1 + strategy.take_profit_pct), 8)
+        sl = round(entry_price * (1 - strategy.stop_loss_pct), 8)
 
         fill = self.broker.open_long(candidate.product_id, notional_usd, tp, sl)
         trade = Trade(
             ticker=candidate.ticker,
+            strategy=strategy.name,
             product_id=candidate.product_id,
             is_live=(self.broker.name == "coinbase"),
             status=TradeStatus.OPEN,
@@ -67,13 +95,14 @@ class TradeManager:
             entry_notional=notional_usd,
             take_profit=tp,
             stop_loss=sl,
-            time_stop_at=utcnow() + timedelta(hours=self.risk.time_stop_hours),
+            time_stop_at=utcnow() + timedelta(hours=strategy.time_stop_hours),
             fees_paid=fill.fee,
             broker_entry_order_id=fill.order_id,
         )
         trade = self.store.add_trade(trade)
         log.info(
-            "OPENED %s qty=%.8f entry=%.6f tp=%.6f sl=%.6f notional=$%.2f",
+            "OPENED[%s] %s qty=%.8f entry=%.6f tp=%.6f sl=%.6f notional=$%.2f",
+            strategy.name,
             trade.ticker,
             trade.qty,
             trade.entry_price,
@@ -102,7 +131,8 @@ class TradeManager:
         trade.closed_at = utcnow()
         self.store.update_trade(trade)
         log.info(
-            "CLOSED %s reason=%s exit=%.6f pnl=$%.2f (fees=$%.2f)",
+            "CLOSED[%s] %s reason=%s exit=%.6f pnl=$%.2f (fees=$%.2f)",
+            trade.strategy,
             trade.ticker,
             reason.value,
             exit_price,
@@ -111,6 +141,7 @@ class TradeManager:
         )
 
     def manage_open_trades(self, force_flatten: bool = False) -> None:
+        # Kill switch flattens EVERY strategy's positions.
         for trade in self.store.open_trades():
             # Normalize tz for time-stop comparison.
             tstop = trade.time_stop_at

@@ -71,6 +71,8 @@ class Trade(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     ticker: Mapped[str] = mapped_column(String(16), index=True)
+    # Which strategy opened this trade (e.g. "intraday" / "swing").
+    strategy: Mapped[str] = mapped_column(String(16), default="intraday", index=True)
     product_id: Mapped[str] = mapped_column(String(32))
     is_live: Mapped[bool] = mapped_column(default=False)
     status: Mapped[TradeStatus] = mapped_column(

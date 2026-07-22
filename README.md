@@ -13,14 +13,29 @@ safety latches and a paper soak.
 
 ```
 ingest (Reddit/YouTube/mock) -> normalize/dedupe -> velocity z-score
-   -> signal (multi-source confirmation) -> HARD RISK GATE
+   -> per-strategy signal (multi-source confirmation) -> HARD RISK GATE (per strategy)
    -> paper/live executor (entry + TP/SL + time-stop) -> manage exits
 ```
 
 - **Direction:** long-only spot (USD pairs on an allowlist).
-- **Hold horizon:** hours to intraday (time-stop flattens stragglers).
 - **Signals v1:** keyword + mention-velocity only. No LLM (deferred to phase 2).
 - **Region/broker:** US -> Coinbase Advanced Trade spot.
+
+## Two strategies, one capital pool
+
+The bot runs **two methodologies simultaneously** on a configurable capital
+split (default 50/50) so you can compare which performs best over the soak:
+
+| Strategy | Hold | Take-profit | Stop-loss | Time-stop | Entry thresholds |
+|---|---|---|---|---|---|
+| `intraday` | hours-intraday | +6% | -3% | 6h | z>=2.5, >=2 sources, >=8 mentions, 30m x 8 buckets |
+| `swing` | 1-3 days | +15% | -7% | 48h (max 72h) | z>=3.0, >=3 sources, >=15 mentions, 120m x 12 buckets |
+
+Each strategy sizes off its **own** allocation half and enforces its **own**
+limits (max position %, max open, max trades/day, daily/weekly loss halts,
+cooldown). One strategy hitting a limit or loss-halt does **not** affect the
+other. A ticker may be held by both strategies independently; every trade is
+tagged with the strategy that opened it. Enabled allocations must sum to <= 1.0.
 
 ## Quick start (paper, no credentials needed)
 
@@ -29,13 +44,16 @@ ingest (Reddit/YouTube/mock) -> normalize/dedupe -> velocity z-score
 python -m venv .venv && . .venv/Scripts/activate   # Windows PowerShell: .venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
 
-# 2) Prove the whole pipeline end-to-end with a deterministic demo
+# 2) Prove the whole pipeline (BOTH strategies) with a deterministic demo
 smt simulate --ticker SOL
 
-# 3) See current momentum scores (uses mock data until real sources are set)
+# 3) Compare strategy performance side by side
+smt compare
+
+# 4) See current momentum scores (uses mock data until real sources are set)
 smt score
 
-# 4) Run the loop in paper mode
+# 5) Run the loop in paper mode
 smt run
 ```
 
@@ -44,11 +62,20 @@ the `simulate` demo run with zero external accounts.
 
 ## Configuration
 
-- `config/risk.yaml` - hard limits, exit params, signal thresholds
+- `config/risk.yaml` - global hard caps / shared defaults (inherited by strategies)
+- `config/strategies.yaml` - per-strategy enabled flag, allocation, exit params, and signal thresholds; any omitted field inherits from `risk.yaml`
 - `config/universe.yaml` - tradeable USD spot pairs + mention aliases
 - `config/sources.yaml` - Reddit/YouTube/X polling + mock toggle
 - `config/security.yaml` - fund-protection controls
 - `.env` (copy from `.env.example`) - secrets + mode flags
+
+### Schema migrations
+
+`init_db()` runs a lightweight, idempotent migration that adds the
+`trades.strategy` column to databases created before dual-strategy support
+(SQLite `ALTER TABLE ... ADD COLUMN`; Postgres `ADD COLUMN IF NOT EXISTS`).
+No manual step is required; existing rows default to `intraday`. To start
+fresh in dev instead, delete `data/smt.sqlite`.
 
 ## Going live (only after a clean paper soak)
 
@@ -92,7 +119,8 @@ smt clear-kill          # resume
 ## Safety / status
 
 ```bash
-smt status              # open positions + realized PnL
+smt status              # open positions + allocation equity, by strategy
+smt compare             # per-strategy trades, win rate, PnL, avg hold
 ```
 
 ## Layout
@@ -101,9 +129,10 @@ smt status              # open positions + realized PnL
 src/smt/
   ingest/   reddit, youtube, x (stub), mock + ticker extraction
   scorer/   mention-velocity z-score
-  trader/   signals, risk gate, paper + coinbase brokers, trade manager
+  trader/   signals (per-strategy), risk gate (per-strategy), paper + coinbase brokers, trade manager
   ops/      alerts, kill switch
+  demo.py   deterministic seeding for simulate/tests
   run.py    orchestrator     cli.py  CLI
-config/     risk, universe, sources, security
+config/     risk, strategies, universe, sources, security
 docs/       compromise-runbook.md
 ```

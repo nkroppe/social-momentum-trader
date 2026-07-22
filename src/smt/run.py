@@ -9,6 +9,7 @@ from .config import (
     get_security,
     get_settings,
     get_sources,
+    get_strategies,
     get_universe,
 )
 from .ingest import build_collectors
@@ -33,6 +34,7 @@ class Runner:
         self.universe = get_universe()
         self.sources = get_sources()
         self.security = get_security()
+        self.strategies = get_strategies().enabled()
 
         self._enforce_live_latches()
 
@@ -42,24 +44,43 @@ class Runner:
         self.alerter = Alerter(self.settings)
         self.kill = KillSwitch(self.settings.kill_file)
         self.collectors = build_collectors(self.settings, self.sources, self.universe)
+
+        # One scorer + signal engine per strategy (own bucket/lookback + thresholds).
+        self.scorers = {
+            st.name: MomentumScorer(
+                self.store,
+                self.universe,
+                bucket_minutes=st.scorer_bucket_minutes,
+                lookback_buckets=st.scorer_lookback_buckets,
+            )
+            for st in self.strategies
+        }
+        self.signal_engines = {st.name: SignalEngine(st, self.universe) for st in self.strategies}
+        # A general-purpose scorer (global defaults) for the `score` CLI/demos.
         self.scorer = MomentumScorer(
             self.store,
             self.universe,
             bucket_minutes=self.risk.scorer_bucket_minutes,
             lookback_buckets=self.risk.scorer_lookback_buckets,
         )
-        self.signals = SignalEngine(self.risk, self.universe)
+
         self.broker = build_broker(self.settings)
-        self.risk_gate = RiskGate(self.risk, self.store)
-        self.manager = TradeManager(
-            self.settings, self.risk, self.universe, self.store, self.broker
-        )
+        self.risk_gate = RiskGate(self.store)
+        self.manager = TradeManager(self.settings, self.universe, self.store, self.broker)
         self._last_ingest = 0.0
         self._killed_notified = False
 
         mode = "LIVE" if self.broker.name == "coinbase" else "PAPER"
-        log.info("Runner ready in %s mode (broker=%s)", mode, self.broker.name)
-        self.store.add_security_event("startup", f"mode={mode} broker={self.broker.name}")
+        names = ", ".join(f"{st.name}({st.allocation:.0%})" for st in self.strategies)
+        log.info(
+            "Runner ready in %s mode (broker=%s) strategies=[%s]",
+            mode,
+            self.broker.name,
+            names,
+        )
+        self.store.add_security_event(
+            "startup", f"mode={mode} broker={self.broker.name} strategies=[{names}]"
+        )
 
     def _enforce_live_latches(self) -> None:
         """Second latch: force paper unless LIVE and the ack phrase are both set."""
@@ -88,16 +109,19 @@ class Runner:
         return total
 
     def evaluate_and_trade(self) -> None:
-        equity = self.manager.equity()
-        scores = self.scorer.score_all()
-        candidates = self.signals.candidates(scores)
-        for cand in candidates:
-            decision = self.risk_gate.evaluate(cand, equity, self.settings.paper_start_equity)
-            if not decision.approved:
-                log.info("REJECT %s: %s", cand.ticker, decision.reason)
-                continue
-            self.manager.open_position(cand, decision.notional_usd)
-            equity = self.manager.equity()  # refresh after deploying capital
+        """Evaluate each strategy independently against its own allocation."""
+        for st in self.strategies:
+            equity_alloc = self.manager.allocation_equity(st)
+            start_alloc = self.manager.allocation_start_equity(st)
+            scores = self.scorers[st.name].score_all()
+            candidates = self.signal_engines[st.name].candidates(scores)
+            for cand in candidates:
+                decision = self.risk_gate.evaluate(cand, st, equity_alloc, start_alloc)
+                if not decision.approved:
+                    log.info("REJECT[%s] %s: %s", st.name, cand.ticker, decision.reason)
+                    continue
+                self.manager.open_position(cand, decision.notional_usd, st)
+                equity_alloc = self.manager.allocation_equity(st)  # refresh after deploying
 
     def step(self) -> None:
         # 1) Kill switch: flatten and block entries.
