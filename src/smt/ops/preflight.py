@@ -100,7 +100,6 @@ def _x_budget_check(settings) -> CheckResult:
     averaging over them would report a comfortable burn while the budget is
     hours from running out.
     """
-    from calendar import monthrange
     from datetime import UTC, datetime
 
     from ..ingest.x import ReadBudget
@@ -110,27 +109,32 @@ def _x_budget_check(settings) -> CheckResult:
     used = budget.reads_used
     started = budget.started_at
 
+    allowance = budget.daily_allowance()
+    day_used = budget.day_used()
     spend = f"${budget.spend_usd:,.2f} of ${budget.budget_usd:,.2f}"
-    pace = f"today {budget.day_used():,}/{budget.daily_allowance():,}"
+    pace = f"today {day_used:,}/{allowance:,}"
 
     if used == 0 or started is None:
         return CheckResult("x_read_budget", True, f"{spend} used this month | {pace}")
 
+    # The monthly cap is enforced in the collector, so overspend is not the
+    # risk worth flagging. The risk is spending the daily allowance early and
+    # going blind for the rest of the day, which a soak would not survive.
     now = datetime.now(UTC)
-    # Floor the window so the first few minutes cannot imply an absurd rate.
-    hours = max((now - started).total_seconds() / 3600.0, 0.5)
-    per_day = used / hours * 24.0
+    day_elapsed = (now.hour + now.minute / 60.0) / 24.0
+    spent_ahead_of_pace = allowance > 0 and (day_used / allowance) > day_elapsed + 0.25
 
-    days_in_month = monthrange(now.year, now.month)[1]
-    days_left = max(days_in_month - ((now.day - 1) + now.hour / 24.0), 0.0)
-    projected = used + per_day * days_left
-
-    return CheckResult(
-        "x_read_budget",
-        projected <= limit,
-        f"{spend} over {hours:.1f}h | {pace} | unpaced trend "
-        f"~${projected * settings.x_read_cost_usd:,.0f}/mo",
-    )
+    if used > limit:
+        return CheckResult("x_read_budget", False, f"{spend} - monthly cap exceeded | {pace}")
+    if spent_ahead_of_pace:
+        blind_from = (day_used / allowance) * 24 if allowance else 24
+        return CheckResult(
+            "x_read_budget",
+            False,
+            f"{spend} | {pace} - burning today's allowance by "
+            f"{blind_from:.0f}h UTC, ingest pauses after that",
+        )
+    return CheckResult("x_read_budget", True, f"{spend} | {pace} on pace")
 
 
 def run_preflight(profile: str = "production") -> list[CheckResult]:
