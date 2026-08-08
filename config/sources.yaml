@@ -1,9 +1,11 @@
 # Social sources config. Ingest polls on a schedule (hours->intraday horizon).
 
-# X bills per tweet returned, so the poll interval is the main cost lever.
-# 15 min is well inside the 6h intraday hold: social momentum does not decay
-# fast enough for 5-minute resolution to buy anything the strategy can use.
-poll_interval_seconds: 900   # 15 min
+# Sized to the read budget rather than to what the strategy would prefer. At
+# $100/mo (20k distinct posts) the daily pace is ~780 posts; seven queries
+# returning the API's 10-post minimum costs ~70 per poll, so ~11 polls/day is
+# the most that fits. Two hours also matches the swing bucket width, which is
+# the timeframe this much data can actually support.
+poll_interval_seconds: 7200  # 2h
 
 reddit:
   enabled: false   # enable when REDDIT_* creds are approved
@@ -33,10 +35,10 @@ x:
     - "$PUMP"
     - "$BICO"
     - "$CAP"
-  # 100 is the API max, but the budget binds hard: measured burn at 100 was
-  # ~42k reads/day against a 50k monthly cap. This clips the busiest cashtags
-  # (which are also the spammiest) while leaving the quiet ones untouched.
-  max_results_per_query: 25
+  # 10 is the API's minimum for recent search, and the budget cannot afford
+  # more. Every returned post is billed on first sight, so this is the floor on
+  # cost per query and the reason poll cadence carries the rest of the saving.
+  max_results_per_query: 10
   mention_weight: 2.0        # X mentions weighted higher than Reddit in scorer
   exclude_retweets: true     # spend budget on original posts, not amplification
   exclude_replies: true
