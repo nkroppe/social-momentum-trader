@@ -253,6 +253,10 @@ class SymbolSpec(BaseModel):
     aliases: list[str] = Field(default_factory=list)
     # Liquidity/market-cap bucket; selects a tier profile from signals.yaml.
     tier: str = "mid"
+    # Only count a mention when it carries a `$` cashtag. Required for tickers
+    # that collide with ordinary words ("cap"), which would otherwise pick up
+    # every "market cap" as attention on the token.
+    require_cashtag: bool = False
 
 
 class UniverseConfig(BaseModel):

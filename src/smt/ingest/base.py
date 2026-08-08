@@ -20,32 +20,60 @@ class Collector(Protocol):
         ...
 
 
-def _build_alias_index(universe: UniverseConfig) -> dict[str, str]:
-    """Map a lowercased alias -> canonical ticker."""
+def _build_alias_index(universe: UniverseConfig) -> tuple[dict[str, str], set[str]]:
+    """Map lowercased alias -> ticker, plus the aliases that require a `$`."""
     index: dict[str, str] = {}
+    cashtag_only: set[str] = set()
     for ticker, spec in universe.symbols.items():
-        index[ticker.lower()] = ticker
-        for alias in spec.aliases:
-            index[alias.lower().lstrip("$")] = ticker
-    return index
+        aliases = {ticker.lower()} | {a.lower().lstrip("$") for a in spec.aliases}
+        aliases.discard("")
+        for alias in aliases:
+            index[alias] = ticker
+            if spec.require_cashtag:
+                cashtag_only.add(alias)
+    return index, cashtag_only
 
 
-# Cache the compiled matcher per universe id to avoid rebuilding each call.
-_MATCHER_CACHE: dict[int, tuple[re.Pattern[str], dict[str, str]]] = {}
+# Cache the compiled matcher per universe *content*. Keying on id() is unsound:
+# a freed config's address can be reused and hand back another universe's regex.
+_MatcherKey = tuple[tuple[str, bool, tuple[str, ...]], ...]
+_MATCHER_CACHE: dict[_MatcherKey, tuple[re.Pattern[str], dict[str, str]]] = {}
+
+# Matches nothing, for an empty universe. An empty alternation would instead
+# match the empty string at every position.
+_NEVER = r"(?!)"
+
+
+def _alternation(aliases: set[str]) -> str:
+    # Longest aliases first so "bitcoin" wins over "btc" substrings.
+    return "|".join(re.escape(a) for a in sorted(aliases, key=len, reverse=True))
+
+
+def _cache_key(universe: UniverseConfig) -> _MatcherKey:
+    return tuple(
+        (ticker, spec.require_cashtag, tuple(sorted(spec.aliases)))
+        for ticker, spec in sorted(universe.symbols.items())
+    )
 
 
 def _get_matcher(universe: UniverseConfig) -> tuple[re.Pattern[str], dict[str, str]]:
-    key = id(universe)
+    key = _cache_key(universe)
     cached = _MATCHER_CACHE.get(key)
     if cached is not None:
         return cached
-    alias_index = _build_alias_index(universe)
-    # Longest aliases first so "bitcoin" wins over "btc" substrings.
-    aliases = sorted(alias_index.keys(), key=len, reverse=True)
-    pattern = re.compile(
-        r"(?<![a-z0-9])(?:" + "|".join(re.escape(a) for a in aliases) + r")(?![a-z0-9])",
-        re.IGNORECASE,
-    )
+
+    alias_index, cashtag_only = _build_alias_index(universe)
+    plain = set(alias_index) - cashtag_only
+
+    branches: list[str] = []
+    if cashtag_only:
+        branches.append(r"\$(?:" + _alternation(cashtag_only) + r")(?![a-z0-9])")
+    if plain:
+        # A plain alias still matches when written as a cashtag: the lookbehind
+        # excludes only alphanumerics, so "$btc" hits the "btc" alias.
+        branches.append(r"(?<![a-z0-9])(?:" + _alternation(plain) + r")(?![a-z0-9])")
+
+    pattern = re.compile("|".join(branches) or _NEVER, re.IGNORECASE)
     _MATCHER_CACHE[key] = (pattern, alias_index)
     return pattern, alias_index
 

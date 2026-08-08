@@ -26,6 +26,8 @@ x:
     - "$HYPE"
     - "$ZEC"
     - "$PUMP"
+    - "$BICO"
+    - "$CAP"
   # 100 is the API max. A z-score computed on 10 samples is mostly noise, and
   # the monthly read budget is nowhere near binding at this poll interval.
   max_results_per_query: 100

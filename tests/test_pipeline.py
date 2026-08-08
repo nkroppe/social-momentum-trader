@@ -7,6 +7,7 @@ from datetime import timedelta
 
 from _helpers import make_store, make_strategy, make_universe, social_only_market_cfg
 
+from smt.config import UniverseConfig
 from smt.ingest.base import extract_tickers
 from smt.models import SocialEvent, TradeStatus, utcnow
 from smt.scorer import MomentumScorer
@@ -20,6 +21,31 @@ def test_extract_tickers():
     assert found == {"SOL", "BTC"}
     # substring guard: "solar" should not match "sol"
     assert extract_tickers("solar panels", u) == set()
+
+
+def _cashtag_universe() -> UniverseConfig:
+    return UniverseConfig(
+        quote_currency="USD",
+        symbols={
+            "CAP": {"product_id": "CAP-USD", "aliases": ["$cap"], "require_cashtag": True},
+            "SOL": {"product_id": "SOL-USD", "aliases": ["sol", "solana"]},
+        },
+    )
+
+
+def test_cashtag_only_ticker_ignores_the_bare_word():
+    """`CAP` collides with everyday crypto vocabulary, so require the $ form."""
+    u = _cashtag_universe()
+    assert extract_tickers("what's the market cap on this", u) == set()
+    assert extract_tickers("no cap this is a low cap gem", u) == set()
+    assert extract_tickers("CAP is going to run", u) == set()
+
+
+def test_cashtag_only_ticker_still_matches_the_cashtag():
+    u = _cashtag_universe()
+    assert extract_tickers("accumulating $CAP here", u) == {"CAP"}
+    # Mixed post: the cashtag rule must not suppress ordinary aliases.
+    assert extract_tickers("$CAP and solana both bid", u) == {"CAP", "SOL"}
 
 
 def test_velocity_signal_fires_on_burst(tmp_path):

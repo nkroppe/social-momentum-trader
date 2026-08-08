@@ -33,7 +33,7 @@ selects which gates must pass:
 |---|---|---|---|---|
 | `major` (BTC, ETH) | `trend` | ignored | required | required |
 | `large` / `mid` | `hybrid` | required | required | required |
-| `micro` (PUMP) | `social` | required | ignored | required |
+| `micro` (PUMP, BICO, CAP) | `social` | required | ignored | required |
 
 - **Social gate** — velocity z-score, raw mentions, distinct *accounts*, and a
   bullish-vs-bearish ratio. Distinct authors matter most when running a single
