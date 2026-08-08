@@ -11,7 +11,7 @@ strategies:
     stop_loss_pct: 0.03
     time_stop_hours: 6
     signal_min_zscore: 2.5
-    signal_min_distinct_sources: 2
+    signal_min_distinct_sources: 1   # X-only soak; raise to 2 when Reddit is added
     signal_min_mentions: 8
     scorer_bucket_minutes: 30
     scorer_lookback_buckets: 8
@@ -24,7 +24,7 @@ strategies:
     stop_loss_pct: 0.07
     time_stop_hours: 48          # configurable up to 72
     signal_min_zscore: 3.0
-    signal_min_distinct_sources: 2
+    signal_min_distinct_sources: 1   # X-only soak; raise to 2 when Reddit is added
     signal_min_mentions: 15
     scorer_bucket_minutes: 120
     scorer_lookback_buckets: 12

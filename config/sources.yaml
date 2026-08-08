@@ -3,7 +3,7 @@
 poll_interval_seconds: 300   # 5 min
 
 reddit:
-  enabled: true
+  enabled: false   # enable when REDDIT_* creds are approved
   subreddits:
     - CryptoCurrency
     - CryptoMarkets
@@ -30,8 +30,7 @@ x:
   max_results_per_query: 10
   mention_weight: 2.0        # X mentions weighted higher than Reddit in scorer
 
-# Mock source fills the paper loop when no live credentials are configured.
-# Disable on the VPS once REDDIT_* and X_BEARER_TOKEN are set in .env.
+# Mock off for VPS paper soak — X-only. Set enabled: true for local dev without API keys.
 mock:
-  enabled: true
+  enabled: false
   events_per_poll: 30
