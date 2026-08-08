@@ -336,9 +336,63 @@ class PreflightConfig(BaseModel):
     require_postgres: bool = True
 
 
+class TradeAlertsConfig(BaseModel):
+    """Per-trade notifications on entry and exit."""
+
+    enabled: bool = True
+    on_open: bool = True
+    on_close: bool = True
+
+
+WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+
+class WeeklyReportConfig(BaseModel):
+    """Scheduled weekly performance summary, sent on wall-clock local time."""
+
+    enabled: bool = True
+    # IANA zone, so the send time tracks daylight saving automatically.
+    timezone: str = "America/New_York"
+    weekday: str = "sunday"
+    hour: int = 20
+    minute: int = 0
+    state_file: str = "./data/weekly_report.json"
+    # Cap the per-trade list; the rest are summarized as a count.
+    max_trades_listed: int = 40
+
+    @field_validator("weekday")
+    @classmethod
+    def _valid_weekday(cls, v: str) -> str:
+        name = v.strip().lower()
+        if name not in WEEKDAYS:
+            raise ValueError(f"weekday must be one of {', '.join(WEEKDAYS)}")
+        return name
+
+    @field_validator("hour")
+    @classmethod
+    def _valid_hour(cls, v: int) -> int:
+        if not 0 <= v <= 23:
+            raise ValueError("hour must be between 0 and 23")
+        return v
+
+    @field_validator("minute")
+    @classmethod
+    def _valid_minute(cls, v: int) -> int:
+        if not 0 <= v <= 59:
+            raise ValueError("minute must be between 0 and 59")
+        return v
+
+    @property
+    def weekday_index(self) -> int:
+        """Monday=0, matching datetime.weekday()."""
+        return WEEKDAYS.index(self.weekday)
+
+
 class OpsConfig(BaseModel):
     soak: SoakOpsConfig = Field(default_factory=SoakOpsConfig)
     preflight: PreflightConfig = Field(default_factory=PreflightConfig)
+    trade_alerts: TradeAlertsConfig = Field(default_factory=TradeAlertsConfig)
+    weekly_report: WeeklyReportConfig = Field(default_factory=WeeklyReportConfig)
 
 
 # ----------------------------------------------------------------------------

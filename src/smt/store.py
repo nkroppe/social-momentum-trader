@@ -319,6 +319,34 @@ class Store:
                 stmt = stmt.where(Trade.strategy == strategy)
             return list(s.scalars(stmt.order_by(Trade.closed_at)))
 
+    def closed_trades_between(
+        self, start: datetime, end: datetime, strategy: str | None = None
+    ) -> Sequence[Trade]:
+        """Trades closed within [start, end), oldest first."""
+        with self.session() as s:
+            stmt = select(Trade).where(
+                Trade.status == TradeStatus.CLOSED,
+                Trade.closed_at.is_not(None),
+                Trade.closed_at >= start,
+                Trade.closed_at < end,
+            )
+            if strategy is not None:
+                stmt = stmt.where(Trade.strategy == strategy)
+            return list(s.scalars(stmt.order_by(Trade.closed_at)))
+
+    def count_trades_opened_between(
+        self, start: datetime, end: datetime, strategy: str | None = None
+    ) -> int:
+        with self.session() as s:
+            stmt = (
+                select(func.count())
+                .select_from(Trade)
+                .where(Trade.opened_at >= start, Trade.opened_at < end)
+            )
+            if strategy is not None:
+                stmt = stmt.where(Trade.strategy == strategy)
+            return int(s.scalar(stmt) or 0)
+
     def count_open_trades(self, strategy: str | None = None) -> int:
         with self.session() as s:
             stmt = select(func.count()).select_from(Trade).where(

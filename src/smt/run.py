@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from pathlib import Path
 
 from .config import (
@@ -22,6 +23,8 @@ from .ingest import build_collectors
 from .logging_setup import get_logger
 from .market import MarketData
 from .ops import Alerter, KillSwitch
+from .ops.reports import build_weekly_report
+from .ops.schedule import WeeklyScheduler
 from .ops.soak import SoakTracker
 from .scorer import MomentumScorer
 from .store import Store
@@ -118,8 +121,11 @@ class Runner:
             self.broker,
             self.market,
             self.market_cfg,
+            alerter=self.alerter,
+            trade_alerts=self.ops.trade_alerts,
         )
         self.soak = SoakTracker(Path(self.ops.soak.state_file))
+        self.weekly = WeeklyScheduler(self.ops.weekly_report)
         self._last_ingest = 0.0
         self._last_digest = 0.0
         self._digest_interval_s = self.ops.soak.digest_interval_hours * 3600
@@ -242,6 +248,31 @@ class Runner:
         self.alerter.notify("Daily soak digest", body, critical=False)
         log.info("Sent soak digest")
 
+    def weekly_report(self, occurrence: datetime | None = None) -> tuple[str, str]:
+        """Build the report for `occurrence` (defaults to the latest due window)."""
+        occurrence = occurrence or self.weekly.previous_occurrence()
+        start, end = self.weekly.report_window(occurrence)
+        return build_weekly_report(
+            self.store,
+            [st.name for st in self.strategies],
+            start,
+            end,
+            self.weekly.tz,
+            mode="LIVE" if self.broker.name == "coinbase" else "PAPER",
+            max_trades_listed=self.ops.weekly_report.max_trades_listed,
+            mark_price=self.broker.current_price,
+        )
+
+    def _send_weekly_if_due(self) -> None:
+        occurrence = self.weekly.due()
+        if occurrence is None:
+            return
+        subject, body = self.weekly_report(occurrence)
+        self.alerter.notify(subject, body, critical=False)
+        # Only mark after a successful build+send so a crash retries next loop.
+        self.weekly.mark_sent(occurrence)
+        log.info("Sent weekly report for week ending %s", occurrence.isoformat())
+
     def step(self) -> None:
         # 1) Kill switch: flatten and block entries.
         if self.kill.is_active():
@@ -274,12 +305,16 @@ class Runner:
         self.ingest()
         self._last_ingest = time.monotonic()
         self._last_digest = time.monotonic()
+        self.weekly.ensure_initialized()
+        if self.ops.weekly_report.enabled:
+            log.info("Next weekly report: %s", self.weekly.next_occurrence().isoformat())
         while True:
             try:
                 self.step()
                 if time.monotonic() - self._last_digest >= self._digest_interval_s:
                     self._send_digest()
                     self._last_digest = time.monotonic()
+                self._send_weekly_if_due()
             except Exception as exc:  # noqa: BLE001
                 log.exception("loop error: %s", exc)
                 self.alerter.notify("Loop error", str(exc))

@@ -175,11 +175,27 @@ smt doctor --live       # go-live checks (Coinbase key, soak duration, LIVE flag
 smt test-alerts         # send a test alert to configured channels
 smt soak-report         # soak progress + strategy comparison
 smt preview             # live exit levels + position size per symbol
+smt weekly-report       # preview this week's P/L (--send to deliver, --last for prior week)
 smt soak-reset          # restart the soak clock after changing signal logic
 ```
 
 Reset the soak clock whenever entry or exit logic changes. Days accumulated
 under different rules do not evidence the system that would go live.
+
+### Notifications
+
+Every entry and exit pushes a message, with realized P/L (dollars and percent),
+exit reason, fees, and hold time on each sell. A performance report covering the
+week's completed trades is sent on a schedule — by default Sunday 8 PM
+`America/New_York`, configured in `config/ops.yaml`.
+
+The schedule tracks local wall-clock time, so the hour holds across daylight
+saving instead of drifting. The last send is persisted, so a restart neither
+double-sends nor skips a week, and a report missed during downtime is delivered
+late rather than dropped.
+
+Email and Telegram receive everything. ntfy stays reserved for critical events
+(kill switch, loss halts) so its urgent-priority push keeps its meaning.
 
 Before enabling live trading, complete [docs/go-live-checklist.md](docs/go-live-checklist.md)
 and run `smt doctor --live` until all checks pass.

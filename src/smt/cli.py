@@ -173,6 +173,36 @@ def _cmd_soak_report(args: argparse.Namespace) -> int:
     return _cmd_compare(args)
 
 
+def _cmd_weekly_report(args: argparse.Namespace) -> int:
+    """Print the weekly report, and optionally deliver it now.
+
+    Defaults to the week in progress, which is what you want when checking on
+    demand; the scheduled send always covers a completed week.
+    """
+    from .run import Runner
+
+    r = Runner()
+    occurrence = r.weekly.previous_occurrence() if args.last else r.weekly.next_occurrence()
+    subject, body = r.weekly_report(occurrence)
+    print(subject)
+    print("-" * len(subject))
+    print(body)
+
+    cfg = r.ops.weekly_report
+    print(
+        f"\nSchedule: {cfg.weekday.capitalize()} {cfg.hour:02d}:{cfg.minute:02d} "
+        f"{cfg.timezone} ({'enabled' if cfg.enabled else 'DISABLED'})"
+    )
+    last = r.weekly.last_sent()
+    print(f"Last sent: {last.isoformat() if last else 'never'}")
+    print(f"Next due:  {r.weekly.next_occurrence().isoformat()}")
+
+    if args.send:
+        r.alerter.notify(subject, body, critical=False)
+        print("\nReport dispatched to configured alert channels.")
+    return 0
+
+
 def _cmd_preview(_args: argparse.Namespace) -> int:
     """Show the exit levels and position size each symbol would get right now.
 
@@ -360,6 +390,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "preview", help="Show live exit levels and position sizes per symbol"
     ).set_defaults(func=_cmd_preview)
+
+    weekly = sub.add_parser("weekly-report", help="Preview this week's performance report")
+    weekly.add_argument(
+        "--send", action="store_true", help="Also deliver it to the alert channels now"
+    )
+    weekly.add_argument(
+        "--last", action="store_true", help="Show the last completed week instead"
+    )
+    weekly.set_defaults(func=_cmd_weekly_report)
 
     reset = sub.add_parser(
         "soak-reset", help="Restart the paper soak clock (after a signal change)"

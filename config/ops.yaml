@@ -10,3 +10,20 @@ preflight:
   require_x: true
   require_alert_channel: true
   require_postgres: true
+
+# Push a message on every entry and exit. Exits carry realized P/L.
+trade_alerts:
+  enabled: true
+  on_open: true
+  on_close: true
+
+# Scheduled performance summary. Sent on local wall-clock time, so the hour
+# stays put across daylight saving rather than drifting with UTC.
+weekly_report:
+  enabled: true
+  timezone: America/New_York
+  weekday: sunday
+  hour: 20            # 24h clock -> 8 PM
+  minute: 0
+  state_file: ./data/weekly_report.json
+  max_trades_listed: 40

@@ -9,10 +9,19 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from ..config import MarketConfig, Settings, StrategyConfig, UniverseConfig, get_market
+from ..config import (
+    MarketConfig,
+    Settings,
+    StrategyConfig,
+    TradeAlertsConfig,
+    UniverseConfig,
+    get_market,
+)
 from ..logging_setup import get_logger
 from ..market import MarketData, atr, horizon_volatility
 from ..models import ExitReason, Trade, TradeStatus, utcnow
+from ..ops.alerts import Alerter
+from ..ops.reports import trade_closed_alert, trade_opened_alert
 from ..store import Store
 from .broker import Broker
 from .signals import TradeCandidate
@@ -29,6 +38,8 @@ class TradeManager:
         broker: Broker,
         market: MarketData | None = None,
         market_cfg: MarketConfig | None = None,
+        alerter: Alerter | None = None,
+        trade_alerts: TradeAlertsConfig | None = None,
     ):
         self.settings = settings
         self.universe = universe
@@ -36,6 +47,19 @@ class TradeManager:
         self.broker = broker
         self.market = market
         self.market_cfg = market_cfg if market_cfg is not None else get_market()
+        self.alerter = alerter
+        self.trade_alerts = trade_alerts if trade_alerts is not None else TradeAlertsConfig()
+
+    # ---- Notifications -------------------------------------------------------
+
+    def _notify(self, subject: str, body: str) -> None:
+        """Best-effort: a failed notification must never abort a trade."""
+        if self.alerter is None or not self.trade_alerts.enabled:
+            return
+        try:
+            self.alerter.notify(subject, body)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("trade notification failed: %s", exc)
 
     # ---- Equity ------------------------------------------------------------
 
@@ -167,6 +191,8 @@ class TradeManager:
             notional_usd,
             exit_note,
         )
+        if self.trade_alerts.on_open:
+            self._notify(*trade_opened_alert(trade, notional_usd, exit_note))
         return trade
 
     # ---- Exit --------------------------------------------------------------
@@ -196,6 +222,8 @@ class TradeManager:
             trade.realized_pnl,
             total_fees,
         )
+        if self.trade_alerts.on_close:
+            self._notify(*trade_closed_alert(trade))
 
     def manage_open_trades(self, force_flatten: bool = False) -> None:
         # Kill switch flattens EVERY strategy's positions.
