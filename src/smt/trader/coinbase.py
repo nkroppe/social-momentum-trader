@@ -1,5 +1,9 @@
 """Live Coinbase Advanced Trade broker with fund-protection guardrails.
 
+This is the ONLY supported live execution venue for social-momentum-trader.
+Do not add alternate exchange adapters to this repo; future on-chain Solana
+trading belongs in a separate project.
+
 Guardrails enforced here (Layers 1, 5 of the security plan):
   * On construction, assert the API key is TRADE-ONLY (can_transfer == False).
     If transfer is enabled, refuse to run.

@@ -18,8 +18,8 @@ ingest (Reddit/X/mock) -> normalize/dedupe -> velocity z-score
 ```
 
 - **Direction:** long-only spot (USD pairs on an allowlist).
+- **Execution venue (locked):** [Coinbase Advanced Trade](docs/venue.md) — US spot only. No Robinhood, Phantom, or Bullpen in this repo.
 - **Signals v1:** keyword + mention-velocity only. No LLM (deferred to phase 2).
-- **Region/broker:** US -> Coinbase Advanced Trade spot.
 
 ## Two strategies, one capital pool
 
@@ -29,7 +29,7 @@ split (default 50/50) so you can compare which performs best over the soak:
 | Strategy | Hold | Take-profit | Stop-loss | Time-stop | Entry thresholds |
 |---|---|---|---|---|---|
 | `intraday` | hours-intraday | +6% | -3% | 6h | z>=2.5, >=2 sources, >=8 mentions, 30m x 8 buckets |
-| `swing` | 1-3 days | +15% | -7% | 48h (max 72h) | z>=3.0, >=3 sources, >=15 mentions, 120m x 12 buckets |
+| `swing` | 1-3 days | +15% | -7% | 48h (max 72h) | z>=3.0, >=2 sources, >=15 mentions, 120m x 12 buckets |
 
 Each strategy sizes off its **own** allocation half and enforces its **own**
 limits (max position %, max open, max trades/day, daily/weekly loss halts,
@@ -85,7 +85,9 @@ the `simulate` demo run with zero external accounts.
 No manual step is required; existing rows default to `intraday`. To start
 fresh in dev instead, delete `data/smt.sqlite`.
 
-## Going live (only after a clean paper soak)
+## Going live on Coinbase Advanced (only after a clean paper soak)
+
+Execution is **Coinbase Advanced Trade only** — see [docs/venue.md](docs/venue.md).
 
 Two independent latches must both be set, and the Coinbase key must pass the
 trade-only assertion:
@@ -142,5 +144,10 @@ src/smt/
   demo.py   deterministic seeding for simulate/tests
   run.py    orchestrator     cli.py  CLI
 config/     risk, strategies, universe, sources, security
-docs/       compromise-runbook.md
+docs/       venue.md, compromise-runbook.md
 ```
+
+## Roadmap
+
+1. **Now:** prove social-momentum on Coinbase spot (intraday + swing, paper then live).
+2. **Later (separate repo):** Solana meme-coin bot on-chain — different venue, wallet, and risk model; not mixed with this stack.

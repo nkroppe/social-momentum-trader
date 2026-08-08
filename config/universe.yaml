@@ -1,5 +1,6 @@
-# Tradeable universe: long-only USD spot pairs on Coinbase Advanced.
-# Only symbols on this allowlist can ever be traded. Start liquid.
+# Tradeable universe: long-only USD spot pairs on Coinbase Advanced Trade ONLY.
+# Product IDs must match Coinbase Advanced (e.g. BTC-USD). This bot does not
+# support other venues (Robinhood, Phantom, Bullpen, on-chain DEX).
 
 quote_currency: USD
 
