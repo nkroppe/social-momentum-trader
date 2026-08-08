@@ -13,16 +13,6 @@ reddit:
   # How many new posts/comments to pull per subreddit per poll.
   limit_per_subreddit: 50
 
-youtube:
-  enabled: true
-  # Channels and/or search queries to watch for new videos.
-  channels: []            # channel IDs
-  queries:
-    - "crypto news today"
-    - "solana price"
-  max_results_per_query: 10
-  fetch_transcripts: true
-
 x:
   enabled: false          # deferred until paper loop is stable + budget set
   watch_accounts: []      # e.g. ["someanalyst"]

@@ -79,15 +79,6 @@ def build_collectors(
         except Exception as exc:  # noqa: BLE001
             log.warning("Reddit collector unavailable: %s", exc)
 
-    if sources.youtube.enabled and settings.youtube_api_key:
-        try:
-            from .youtube import YouTubeCollector
-
-            collectors.append(YouTubeCollector(settings, sources.youtube, universe))
-            log.info("YouTube collector enabled")
-        except Exception as exc:  # noqa: BLE001
-            log.warning("YouTube collector unavailable: %s", exc)
-
     if sources.x.enabled and settings.x_bearer_token:
         try:
             from .x_stub import XCollector

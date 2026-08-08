@@ -37,7 +37,7 @@ class SocialEvent(Base):
     __table_args__ = (UniqueConstraint("source", "external_id", name="uq_source_extid"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    source: Mapped[str] = mapped_column(String(32), index=True)  # reddit/youtube/x/mock
+    source: Mapped[str] = mapped_column(String(32), index=True)  # reddit/x/mock
     external_id: Mapped[str] = mapped_column(String(128), index=True)
     ticker: Mapped[str] = mapped_column(String(16), index=True)
     author: Mapped[str] = mapped_column(String(128), default="")

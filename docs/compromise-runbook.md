@@ -16,7 +16,7 @@ If you suspect the VPS or the Coinbase API key is compromised, act from a
 
 ## Contain
 
-4. Rotate every other secret that lived on the host: Reddit/YouTube/X tokens,
+4. Rotate every other secret that lived on the host: Reddit/X tokens,
    SMTP/Telegram credentials, `POSTGRES_PASSWORD`.
 5. Rebuild the VPS from a clean image. Do not trust a compromised host.
 6. Re-provision with a fresh trade-only key + IP allowlist bound to the new IP.

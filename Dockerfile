@@ -6,7 +6,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Install with live extras so real Coinbase/Reddit/YouTube/Postgres drivers are present.
+# Install with live extras so real Coinbase/Reddit/Postgres drivers are present.
 COPY pyproject.toml README.md ./
 COPY src ./src
 RUN pip install --upgrade pip && pip install ".[live]"

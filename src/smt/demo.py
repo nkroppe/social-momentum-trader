@@ -14,9 +14,9 @@ from .config import StrategyConfig
 from .models import SocialEvent, utcnow
 from .store import Store
 
-# Three distinct sources so the strictest strategy's source-confirmation
-# requirement (swing: >= 3) is satisfied.
-_BURST_SOURCES = ("reddit", "youtube", "x")
+# Distinct sources so the strictest strategy's source-confirmation
+# requirement (>= 2) is satisfied.
+_BURST_SOURCES = ("reddit", "x", "mock")
 
 
 def seed_momentum(

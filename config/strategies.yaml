@@ -24,7 +24,7 @@ strategies:
     stop_loss_pct: 0.07
     time_stop_hours: 48          # configurable up to 72
     signal_min_zscore: 3.0
-    signal_min_distinct_sources: 3
+    signal_min_distinct_sources: 2
     signal_min_mentions: 15
     scorer_bucket_minutes: 120
     scorer_lookback_buckets: 12

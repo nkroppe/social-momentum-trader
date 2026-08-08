@@ -1,7 +1,7 @@
 # social-momentum-trader
 
 A 24/7, **long-only spot** crypto trader driven by **social-momentum** signals
-(Reddit + YouTube now; X deferred), with **hard risk limits** and layered
+(Reddit now; X deferred), with **hard risk limits** and layered
 **fund-protection guardrails**. Runs on a cloud VPS. Coinbase Advanced Trade is
 the broker. **Paper mode is the default**; live trading is gated behind explicit
 safety latches and a paper soak.
@@ -12,7 +12,7 @@ safety latches and a paper soak.
 ## What it does
 
 ```
-ingest (Reddit/YouTube/mock) -> normalize/dedupe -> velocity z-score
+ingest (Reddit/mock) -> normalize/dedupe -> velocity z-score
    -> per-strategy signal (multi-source confirmation) -> HARD RISK GATE (per strategy)
    -> paper/live executor (entry + TP/SL + time-stop) -> manage exits
 ```
@@ -65,7 +65,7 @@ the `simulate` demo run with zero external accounts.
 - `config/risk.yaml` - global hard caps / shared defaults (inherited by strategies)
 - `config/strategies.yaml` - per-strategy enabled flag, allocation, exit params, and signal thresholds; any omitted field inherits from `risk.yaml`
 - `config/universe.yaml` - tradeable USD spot pairs + mention aliases
-- `config/sources.yaml` - Reddit/YouTube/X polling + mock toggle
+- `config/sources.yaml` - Reddit/X polling + mock toggle
 - `config/security.yaml` - fund-protection controls
 - `.env` (copy from `.env.example`) - secrets + mode flags
 
@@ -127,7 +127,7 @@ smt compare             # per-strategy trades, win rate, PnL, avg hold
 
 ```
 src/smt/
-  ingest/   reddit, youtube, x (stub), mock + ticker extraction
+  ingest/   reddit, x (stub), mock + ticker extraction
   scorer/   mention-velocity z-score
   trader/   signals (per-strategy), risk gate (per-strategy), paper + coinbase brokers, trade manager
   ops/      alerts, kill switch

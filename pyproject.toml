@@ -17,7 +17,6 @@ dependencies = [
 # Live/real integrations are opt-in so the paper loop runs with zero external keys.
 live = [
     "praw>=7.7",                       # Reddit
-    "google-api-python-client>=2.130", # YouTube Data API
     "coinbase-advanced-py>=1.2",       # Coinbase Advanced Trade
     "psycopg[binary]>=3.2",            # Postgres driver
 ]

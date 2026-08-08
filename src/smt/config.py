@@ -41,9 +41,6 @@ class Settings(BaseSettings):
     reddit_client_secret: str = ""
     reddit_user_agent: str = "social-momentum-trader/0.1"
 
-    # YouTube
-    youtube_api_key: str = ""
-
     # X
     x_bearer_token: str = ""
     x_monthly_read_budget: int = 50_000
@@ -197,14 +194,6 @@ class RedditSource(BaseModel):
     limit_per_subreddit: int = 50
 
 
-class YouTubeSource(BaseModel):
-    enabled: bool = False
-    channels: list[str] = Field(default_factory=list)
-    queries: list[str] = Field(default_factory=list)
-    max_results_per_query: int = 10
-    fetch_transcripts: bool = True
-
-
 class XSource(BaseModel):
     enabled: bool = False
     watch_accounts: list[str] = Field(default_factory=list)
@@ -219,7 +208,6 @@ class MockSource(BaseModel):
 class SourcesConfig(BaseModel):
     poll_interval_seconds: int = 300
     reddit: RedditSource = Field(default_factory=RedditSource)
-    youtube: YouTubeSource = Field(default_factory=YouTubeSource)
     x: XSource = Field(default_factory=XSource)
     mock: MockSource = Field(default_factory=MockSource)
 

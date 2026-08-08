@@ -43,7 +43,7 @@ def test_velocity_signal_fires_on_burst(tmp_path):
             ]
         )
     # Burst now across two sources.
-    for src in ("reddit", "youtube"):
+    for src in ("reddit", "x"):
         store.add_events(
             [
                 SocialEvent(
