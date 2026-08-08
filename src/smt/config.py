@@ -59,7 +59,11 @@ class Settings(BaseSettings):
 
     # X
     x_bearer_token: str = ""
+    # Billable post reads per month. X dedupes repeat reads of the same post
+    # within a UTC day, so this counts distinct posts, not API responses.
     x_monthly_read_budget: int = 50_000
+    # X pay-per-use list price per post read; used to report spend in dollars.
+    x_read_cost_usd: float = 0.005
 
     # Alerts
     smtp_host: str = ""

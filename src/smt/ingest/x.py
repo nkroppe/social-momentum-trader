@@ -9,6 +9,7 @@ Requires `X_BEARER_TOKEN` and `x.enabled: true` in config/sources.yaml.
 from __future__ import annotations
 
 import json
+from calendar import monthrange
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -29,30 +30,75 @@ class ReadBudgetExhausted(Exception):
     """Raised when the monthly X read budget is exhausted."""
 
 
-class ReadBudget:
-    """Persist monthly tweet-read counts to a JSON file."""
+# Beyond this many distinct posts in a UTC day, stop tracking IDs individually
+# and bill every returned post. Overcounting is the safe direction for a spend
+# guard, and at any sane budget this ceiling is never reached.
+MAX_TRACKED_IDS_PER_DAY = 25_000
 
-    def __init__(self, path: Path, monthly_limit: int):
+
+class ReadBudget:
+    """Track billable X post reads against a monthly cap, paced daily.
+
+    X bills per post returned but deduplicates within a UTC day, so re-reading
+    the same post on overlapping polls is free. Counting every returned post
+    therefore overstates the bill badly -- measured at ~3.7x on a 5-minute poll
+    interval. This tracks distinct post IDs per UTC day instead, which mirrors
+    how the charge is actually assessed.
+
+    Spend is also paced: each day may use the remaining monthly allowance
+    divided by the days left. Without pacing a month's budget is consumed in
+    the first few days and the soak then collects nothing for three weeks.
+    """
+
+    def __init__(self, path: Path, monthly_limit: int, cost_per_read_usd: float = 0.005):
         self.path = path
         self.monthly_limit = monthly_limit
+        self.cost_per_read_usd = cost_per_read_usd
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
-    def _month_key(self) -> str:
-        return datetime.now(UTC).strftime("%Y-%m")
+    # ---- State --------------------------------------------------------------
 
-    def _load(self) -> dict:
+    @staticmethod
+    def _month_key(now: datetime | None = None) -> str:
+        return (now or datetime.now(UTC)).strftime("%Y-%m")
+
+    @staticmethod
+    def _day_key(now: datetime | None = None) -> str:
+        return (now or datetime.now(UTC)).strftime("%Y-%m-%d")
+
+    def _fresh(self, now: datetime | None = None) -> dict:
+        return {
+            "month": self._month_key(now),
+            "reads": 0,
+            "day": self._day_key(now),
+            "day_reads": 0,
+            "day_ids": [],
+        }
+
+    def _load(self, now: datetime | None = None) -> dict:
         if not self.path.exists():
-            return {"month": self._month_key(), "reads": 0}
+            return self._fresh(now)
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
-            return {"month": self._month_key(), "reads": 0}
-        if data.get("month") != self._month_key():
-            return {"month": self._month_key(), "reads": 0}
+            return self._fresh(now)
+
+        if data.get("month") != self._month_key(now):
+            return self._fresh(now)
+        if data.get("day") != self._day_key(now):
+            # New UTC day: X's dedupe window resets, so previous IDs would be
+            # billed again and must not suppress counting.
+            data["day"] = self._day_key(now)
+            data["day_reads"] = 0
+            data["day_ids"] = []
+        data.setdefault("day_ids", [])
+        data.setdefault("day_reads", 0)
         return data
 
     def _save(self, data: dict) -> None:
         self.path.write_text(json.dumps(data), encoding="utf-8")
+
+    # ---- Reporting ----------------------------------------------------------
 
     @property
     def reads_used(self) -> int:
@@ -61,6 +107,14 @@ class ReadBudget:
     @property
     def remaining(self) -> int:
         return max(0, self.monthly_limit - self.reads_used)
+
+    @property
+    def spend_usd(self) -> float:
+        return self.reads_used * self.cost_per_read_usd
+
+    @property
+    def budget_usd(self) -> float:
+        return self.monthly_limit * self.cost_per_read_usd
 
     @property
     def started_at(self) -> datetime | None:
@@ -79,13 +133,49 @@ class ReadBudget:
             return None
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
-    def consume(self, count: int) -> None:
-        if count <= 0:
-            return
-        data = self._load()
-        data["reads"] = int(data.get("reads", 0)) + count
-        data.setdefault("started_at", datetime.now(UTC).isoformat())
+    # ---- Daily pacing -------------------------------------------------------
+
+    def daily_allowance(self, now: datetime | None = None) -> int:
+        """Reads permitted today: what was left this morning, over the days left.
+
+        Today's own spending is added back so the allowance holds steady through
+        the day instead of shrinking as it is consumed. Self-correcting across
+        days -- an underspent day raises tomorrow's allowance.
+        """
+        now = now or datetime.now(UTC)
+        days_in_month = monthrange(now.year, now.month)[1]
+        days_left = max(days_in_month - now.day + 1, 1)
+        at_day_start = self.remaining + self.day_used(now)
+        return max(at_day_start // days_left, 0)
+
+    def day_used(self, now: datetime | None = None) -> int:
+        return int(self._load(now).get("day_reads", 0))
+
+    def day_remaining(self, now: datetime | None = None) -> int:
+        return max(self.daily_allowance(now) - self.day_used(now), 0)
+
+    # ---- Accounting ---------------------------------------------------------
+
+    def register(self, post_ids: list[str], now: datetime | None = None) -> int:
+        """Record returned posts and return how many were newly billable."""
+        if not post_ids:
+            return 0
+        data = self._load(now)
+        seen = set(data["day_ids"])
+
+        if len(seen) >= MAX_TRACKED_IDS_PER_DAY:
+            billed = len(post_ids)
+        else:
+            fresh = [pid for pid in post_ids if pid not in seen]
+            billed = len(fresh)
+            data["day_ids"] = list(seen | set(fresh))
+
+        if billed:
+            data["reads"] = int(data.get("reads", 0)) + billed
+            data["day_reads"] = int(data.get("day_reads", 0)) + billed
+            data.setdefault("started_at", (now or datetime.now(UTC)).isoformat())
         self._save(data)
+        return billed
 
     def check(self, needed: int = 1) -> None:
         if self.reads_used + needed > self.monthly_limit:
@@ -113,6 +203,7 @@ class XCollector:
         self.budget = ReadBudget(
             Path("./data/x_budget.json"),
             settings.x_monthly_read_budget,
+            settings.x_read_cost_usd,
         )
         self._client = httpx.Client(
             headers={"Authorization": f"Bearer {settings.x_bearer_token}"},
@@ -208,12 +299,13 @@ class XCollector:
 
         resp.raise_for_status()
         payload = resp.json()
-        tweet_count = len(payload.get("data") or [])
-        self.budget.consume(tweet_count)
+        tweets = payload.get("data") or []
+        billed = self.budget.register([t["id"] for t in tweets if t.get("id")])
         log.debug(
-            "x search %r -> %d tweets (%d/%d reads used this month)",
+            "x search %r -> %d tweets (%d newly billable; %d/%d this month)",
             query,
-            tweet_count,
+            len(tweets),
+            billed,
             self.budget.reads_used,
             self.settings.x_monthly_read_budget,
         )
@@ -222,9 +314,20 @@ class XCollector:
     def collect(self) -> list[SocialEvent]:
         if self.budget.remaining <= 0:
             log.warning(
-                "X monthly read budget exhausted (%d/%d); skipping poll",
+                "X monthly read budget exhausted (%d/%d, ~$%.2f); skipping poll",
                 self.budget.reads_used,
                 self.settings.x_monthly_read_budget,
+                self.budget.spend_usd,
+            )
+            return []
+
+        # Pace the month so the budget is not consumed in its first few days,
+        # which would leave the soak blind for the remaining three weeks.
+        if self.budget.day_remaining() <= 0:
+            log.info(
+                "X daily read pace reached (%d/%d today); skipping poll",
+                self.budget.day_used(),
+                self.budget.daily_allowance(),
             )
             return []
 
@@ -235,7 +338,7 @@ class XCollector:
 
         events: list[SocialEvent] = []
         for query in queries:
-            if self.budget.remaining <= 0:
+            if self.budget.remaining <= 0 or self.budget.day_remaining() <= 0:
                 break
             try:
                 events.extend(self._search(query))

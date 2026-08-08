@@ -21,9 +21,11 @@ x:
   # Accounts to watch (recent tweets from each). No @ prefix required.
   watch_accounts: []
   # Cashtag/keyword recent-search queries. Keep tight to control API spend.
+  # No $BTC or $ETH: both are `major` tier, which runs in trend mode and never
+  # consults the social gate. Their cashtags are also the highest-volume ones
+  # on the list, so paying to read posts the strategy discards is the single
+  # most expensive thing this file could do.
   keywords:
-    - "$BTC"
-    - "$ETH"
     - "$SOL"
     - "$LINK"
     - "$HYPE"

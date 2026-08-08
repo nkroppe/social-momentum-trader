@@ -106,12 +106,15 @@ def _x_budget_check(settings) -> CheckResult:
     from ..ingest.x import ReadBudget
 
     limit = settings.x_monthly_read_budget
-    budget = ReadBudget(Path("./data/x_budget.json"), limit)
+    budget = ReadBudget(Path("./data/x_budget.json"), limit, settings.x_read_cost_usd)
     used = budget.reads_used
     started = budget.started_at
 
+    spend = f"${budget.spend_usd:,.2f} of ${budget.budget_usd:,.2f}"
+    pace = f"today {budget.day_used():,}/{budget.daily_allowance():,}"
+
     if used == 0 or started is None:
-        return CheckResult("x_read_budget", True, f"{used:,}/{limit:,} used this month")
+        return CheckResult("x_read_budget", True, f"{spend} used this month | {pace}")
 
     now = datetime.now(UTC)
     # Floor the window so the first few minutes cannot imply an absurd rate.
@@ -125,8 +128,8 @@ def _x_budget_check(settings) -> CheckResult:
     return CheckResult(
         "x_read_budget",
         projected <= limit,
-        f"{used:,}/{limit:,} used over {hours:.1f}h "
-        f"(~{per_day:,.0f}/day, ~{projected:,.0f} by month end)",
+        f"{spend} over {hours:.1f}h | {pace} | unpaced trend "
+        f"~${projected * settings.x_read_cost_usd:,.0f}/mo",
     )
 
 

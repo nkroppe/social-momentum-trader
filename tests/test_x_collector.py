@@ -23,7 +23,7 @@ def test_read_budget_tracks_and_resets_month(tmp_path):
     path = tmp_path / "x_budget.json"
     budget = ReadBudget(path, monthly_limit=100)
     assert budget.remaining == 100
-    budget.consume(40)
+    budget.register([str(i) for i in range(40)])
     assert budget.reads_used == 40
     assert budget.remaining == 60
 
@@ -35,7 +35,7 @@ def test_read_budget_tracks_and_resets_month(tmp_path):
 
 def test_read_budget_exhausted(tmp_path):
     budget = ReadBudget(tmp_path / "b.json", 5)
-    budget.consume(5)
+    budget.register([str(i) for i in range(5)])
     with pytest.raises(ReadBudgetExhausted):
         budget.check(1)
 
