@@ -16,21 +16,18 @@ symbols:
   SOL:
     product_id: SOL-USD
     aliases: ["sol", "solana", "$sol"]
-  DOGE:
-    product_id: DOGE-USD
-    aliases: ["doge", "dogecoin", "$doge"]
-  XRP:
-    product_id: XRP-USD
-    aliases: ["xrp", "ripple", "$xrp"]
-  ADA:
-    product_id: ADA-USD
-    aliases: ["ada", "cardano", "$ada"]
-  AVAX:
-    product_id: AVAX-USD
-    aliases: ["avax", "avalanche", "$avax"]
   LINK:
     product_id: LINK-USD
     aliases: ["link", "chainlink", "$link"]
+  HYPE:
+    product_id: HYPE-USD
+    aliases: ["hype", "hyperliquid", "$hype"]
+  ZEC:
+    product_id: ZEC-USD
+    aliases: ["zec", "zcash", "z cash", "$zec"]
+  PUMP:
+    product_id: PUMP-USD
+    aliases: ["pump", "pumpfun", "pump.fun", "pump fun", "$pump"]
 
 # Symbols to never trade even if mentioned.
 denylist: []

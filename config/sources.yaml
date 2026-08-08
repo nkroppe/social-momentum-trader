@@ -22,11 +22,10 @@ x:
     - "$BTC"
     - "$ETH"
     - "$SOL"
-    - "$DOGE"
-    - "$XRP"
-    - "$ADA"
-    - "$AVAX"
     - "$LINK"
+    - "$HYPE"
+    - "$ZEC"
+    - "$PUMP"
   max_results_per_query: 10
   mention_weight: 2.0        # X mentions weighted higher than Reddit in scorer
 
