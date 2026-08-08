@@ -79,12 +79,17 @@ def build_collectors(
         except Exception as exc:  # noqa: BLE001
             log.warning("Reddit collector unavailable: %s", exc)
 
-    if sources.x.enabled and settings.x_bearer_token:
+    if sources.x.enabled:
         try:
-            from .x_stub import XCollector
+            from .x import XCollector
 
-            collectors.append(XCollector(settings, sources.x, universe))
-            log.info("X collector enabled")
+            x_collector = XCollector(settings, sources.x, universe)
+            collectors.append(x_collector)
+            log.info(
+                "X collector enabled (budget %d reads/mo, %d remaining)",
+                settings.x_monthly_read_budget,
+                x_collector.budget.remaining,
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("X collector unavailable: %s", exc)
 

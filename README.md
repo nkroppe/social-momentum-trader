@@ -1,7 +1,7 @@
 # social-momentum-trader
 
 A 24/7, **long-only spot** crypto trader driven by **social-momentum** signals
-(Reddit now; X deferred), with **hard risk limits** and layered
+(Reddit + X; mock fallback for local dev), with **hard risk limits** and layered
 **fund-protection guardrails**. Runs on a cloud VPS. Coinbase Advanced Trade is
 the broker. **Paper mode is the default**; live trading is gated behind explicit
 safety latches and a paper soak.
@@ -12,7 +12,7 @@ safety latches and a paper soak.
 ## What it does
 
 ```
-ingest (Reddit/mock) -> normalize/dedupe -> velocity z-score
+ingest (Reddit/X/mock) -> normalize/dedupe -> velocity z-score
    -> per-strategy signal (multi-source confirmation) -> HARD RISK GATE (per strategy)
    -> paper/live executor (entry + TP/SL + time-stop) -> manage exits
 ```
@@ -68,6 +68,14 @@ the `simulate` demo run with zero external accounts.
 - `config/sources.yaml` - Reddit/X polling + mock toggle
 - `config/security.yaml` - fund-protection controls
 - `.env` (copy from `.env.example`) - secrets + mode flags
+
+### X (Twitter) production setup
+
+1. Create an X developer app and generate a **Bearer Token** (pay-per-use API).
+2. Set `X_BEARER_TOKEN` and optionally `X_MONTHLY_READ_BUDGET` (default 50,000 reads/mo) in `.env`.
+3. `config/sources.yaml` has `x.enabled: true` with cashtag watchlist queries for the universe.
+4. Reads are tracked in `data/x_budget.json`; polling stops when the monthly cap is hit.
+5. On the VPS, set `mock.enabled: false` once Reddit + X credentials are configured.
 
 ### Schema migrations
 
@@ -127,7 +135,7 @@ smt compare             # per-strategy trades, win rate, PnL, avg hold
 
 ```
 src/smt/
-  ingest/   reddit, x (stub), mock + ticker extraction
+  ingest/   reddit, x, mock + ticker extraction
   scorer/   mention-velocity z-score
   trader/   signals (per-strategy), risk gate (per-strategy), paper + coinbase brokers, trade manager
   ops/      alerts, kill switch

@@ -198,6 +198,8 @@ class XSource(BaseModel):
     enabled: bool = False
     watch_accounts: list[str] = Field(default_factory=list)
     keywords: list[str] = Field(default_factory=list)
+    max_results_per_query: int = 10
+    mention_weight: float = 2.0
 
 
 class MockSource(BaseModel):

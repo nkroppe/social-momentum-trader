@@ -14,12 +14,24 @@ reddit:
   limit_per_subreddit: 50
 
 x:
-  enabled: false          # deferred until paper loop is stable + budget set
-  watch_accounts: []      # e.g. ["someanalyst"]
-  keywords: ["$BTC", "$ETH", "$SOL"]
+  enabled: true
+  # Accounts to watch (recent tweets from each). No @ prefix required.
+  watch_accounts: []
+  # Cashtag/keyword recent-search queries. Keep tight to control API spend.
+  keywords:
+    - "$BTC"
+    - "$ETH"
+    - "$SOL"
+    - "$DOGE"
+    - "$XRP"
+    - "$ADA"
+    - "$AVAX"
+    - "$LINK"
+  max_results_per_query: 10
+  mention_weight: 2.0        # X mentions weighted higher than Reddit in scorer
 
-# Mock source is used when a real source is disabled/unconfigured so the
-# paper loop always has data to run against.
+# Mock source fills the paper loop when no live credentials are configured.
+# Disable on the VPS once REDDIT_* and X_BEARER_TOKEN are set in .env.
 mock:
   enabled: true
   events_per_poll: 30
