@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from ..config import RedditSource, Settings, UniverseConfig
+from ..config import RedditSource, Settings, SignalsConfig, UniverseConfig, get_signals
 from ..logging_setup import get_logger
 from ..models import SocialEvent
 from .base import extract_tickers
+from .quality import QualityFilter
 
 log = get_logger("smt.ingest.reddit")
 
@@ -15,11 +16,18 @@ log = get_logger("smt.ingest.reddit")
 class RedditCollector:
     source_name = "reddit"
 
-    def __init__(self, settings: Settings, cfg: RedditSource, universe: UniverseConfig):
+    def __init__(
+        self,
+        settings: Settings,
+        cfg: RedditSource,
+        universe: UniverseConfig,
+        signals: SignalsConfig | None = None,
+    ):
         import praw  # imported lazily; only needed for live ingest
 
         self.cfg = cfg
         self.universe = universe
+        self.quality = QualityFilter(signals if signals is not None else get_signals())
         self.client = praw.Reddit(
             client_id=settings.reddit_client_id,
             client_secret=settings.reddit_client_secret,
@@ -34,6 +42,12 @@ class RedditCollector:
             try:
                 for post in self.client.subreddit(sub).new(limit=self.cfg.limit_per_subreddit):
                     text = f"{post.title}\n{getattr(post, 'selftext', '')}"
+                    author = str(post.author) if post.author else ""
+                    # Reddit does not expose a follower count, so the follower
+                    # threshold is skipped rather than failing every post.
+                    verdict = self.quality.evaluate(text, author=author, followers=None)
+                    if not verdict.keep:
+                        continue
                     created = datetime.fromtimestamp(post.created_utc, tz=UTC)
                     for ticker in extract_tickers(text, self.universe):
                         events.append(
@@ -41,10 +55,12 @@ class RedditCollector:
                                 source=self.source_name,
                                 external_id=str(post.id),
                                 ticker=ticker,
-                                author=str(post.author) if post.author else "",
+                                author=author,
                                 text=text[:2000],
                                 url=f"https://reddit.com{post.permalink}",
                                 weight=1.0,
+                                sentiment=verdict.sentiment,
+                                text_hash=verdict.fingerprint,
                                 created_at=created,
                             )
                         )

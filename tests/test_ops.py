@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from smt.config import get_sources
 from smt.ops.preflight import all_passed, run_preflight
 from smt.ops.soak import SoakTracker
 
@@ -31,8 +32,9 @@ def test_preflight_dev_passes():
 def test_preflight_production_flags_missing_env(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     results = {r.name: r for r in run_preflight("production")}
-    assert results["mock_disabled"].passed is False  # default sources has mock enabled
+    assert results["mock_disabled"].passed is not get_sources().mock.enabled
     assert results["alert_channel"].passed is False  # no alerts configured
+    assert results[".env file"].passed is False  # cwd has no .env
 
 
 def test_live_preflight_requires_soak(monkeypatch, tmp_path):

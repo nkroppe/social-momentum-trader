@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -15,6 +16,36 @@ from .logging_setup import get_logger
 from .models import Base, ExitReason, SecurityEvent, Signal, SocialEvent, Trade, TradeStatus, utcnow
 
 log = get_logger("smt.store")
+
+# Columns added after the initial schema; applied idempotently on init_db().
+_SOCIAL_EVENT_COLUMNS = (
+    ("sentiment", "FLOAT DEFAULT 0.0"),
+    ("author_followers", "INTEGER DEFAULT 0"),
+    ("text_hash", "VARCHAR(32) DEFAULT ''"),
+)
+_SIGNAL_COLUMNS = (
+    ("authors", "INTEGER DEFAULT 0"),
+    ("bullish_ratio", "FLOAT DEFAULT 0.0"),
+)
+
+
+@dataclass(frozen=True)
+class MentionStats:
+    mentions: int
+    sources: int
+    authors: int
+    weighted: float
+    bullish: int
+    bearish: int
+
+    @property
+    def directional(self) -> int:
+        return self.bullish + self.bearish
+
+    @property
+    def bullish_ratio(self) -> float:
+        """Share of directional posts that are bullish; 0.0 when none are."""
+        return (self.bullish / self.directional) if self.directional else 0.0
 
 
 class Store:
@@ -36,10 +67,28 @@ class Store:
         """Lightweight, idempotent schema migrations for existing dev DBs.
 
         create_all() only creates missing tables, not new columns on existing
-        ones. This adds the `strategy` column when upgrading a database created
-        before dual-strategy support.
+        ones, so each schema addition needs an explicit ALTER here.
         """
         self._ensure_trade_strategy_column()
+        self._ensure_columns("social_events", _SOCIAL_EVENT_COLUMNS)
+        self._ensure_columns("signals", _SIGNAL_COLUMNS)
+
+    def _ensure_columns(self, table: str, columns: tuple[tuple[str, str], ...]) -> None:
+        dialect = self.engine.dialect.name
+        with self.engine.begin() as conn:
+            if dialect == "sqlite":
+                existing = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
+                if not existing:
+                    return
+                for name, ddl in columns:
+                    if name not in existing:
+                        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+                        log.info("migrated: added %s.%s", table, name)
+            else:
+                for name, ddl in columns:
+                    conn.execute(
+                        text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {ddl}")
+                    )
 
     def _ensure_trade_strategy_column(self) -> None:
         dialect = self.engine.dialect.name
@@ -95,6 +144,9 @@ class Store:
                             text=e.text or "",
                             url=e.url or "",
                             weight=e.weight if e.weight is not None else 1.0,
+                            sentiment=e.sentiment if e.sentiment is not None else 0.0,
+                            author_followers=e.author_followers or 0,
+                            text_hash=e.text_hash or "",
                             created_at=e.created_at,
                             ingested_at=e.ingested_at or utcnow(),
                         )
@@ -114,55 +166,112 @@ class Store:
                 s.commit()
         return inserted
 
-    def count_mentions_since(self, ticker: str, since: datetime) -> tuple[int, int, float]:
-        """Return (mentions, distinct_sources, weighted_mentions) for a ticker."""
+    def mention_stats_since(self, ticker: str, since: datetime) -> MentionStats:
+        """Mention counts, distinct sources/authors, and sentiment split."""
         with self.session() as s:
-            mentions = (
+            scope = (SocialEvent.ticker == ticker, SocialEvent.created_at >= since)
+
+            def _count(*extra) -> int:
+                return int(
+                    s.scalar(select(func.count()).select_from(SocialEvent).where(*scope, *extra))
+                    or 0
+                )
+
+            mentions = _count()
+            sources = int(
                 s.scalar(
-                    select(func.count())
-                    .select_from(SocialEvent)
-                    .where(SocialEvent.ticker == ticker, SocialEvent.created_at >= since)
+                    select(func.count(func.distinct(SocialEvent.source))).where(*scope)
                 )
                 or 0
             )
-            sources = (
+            authors = int(
                 s.scalar(
-                    select(func.count(func.distinct(SocialEvent.source))).where(
-                        SocialEvent.ticker == ticker, SocialEvent.created_at >= since
+                    select(func.count(func.distinct(SocialEvent.author))).where(
+                        *scope, SocialEvent.author != ""
                     )
                 )
                 or 0
             )
-            weighted = (
+            weighted = float(
                 s.scalar(
-                    select(func.coalesce(func.sum(SocialEvent.weight), 0.0)).where(
-                        SocialEvent.ticker == ticker, SocialEvent.created_at >= since
-                    )
+                    select(func.coalesce(func.sum(SocialEvent.weight), 0.0)).where(*scope)
                 )
                 or 0.0
             )
-        return int(mentions), int(sources), float(weighted)
+            bullish = _count(SocialEvent.sentiment > 0)
+            bearish = _count(SocialEvent.sentiment < 0)
+
+        return MentionStats(
+            mentions=mentions,
+            sources=sources,
+            authors=authors,
+            weighted=weighted,
+            bullish=bullish,
+            bearish=bearish,
+        )
+
+    def count_mentions_since(self, ticker: str, since: datetime) -> tuple[int, int, float]:
+        """Return (mentions, distinct_sources, weighted_mentions) for a ticker."""
+        stats = self.mention_stats_since(ticker, since)
+        return stats.mentions, stats.sources, stats.weighted
+
+    def _weighted_between(self, s: Session, ticker: str, start: datetime, end: datetime) -> float:
+        return float(
+            s.scalar(
+                select(func.coalesce(func.sum(SocialEvent.weight), 0.0)).where(
+                    SocialEvent.ticker == ticker,
+                    SocialEvent.created_at >= start,
+                    SocialEvent.created_at < end,
+                )
+            )
+            or 0.0
+        )
 
     def mentions_per_bucket(self, ticker: str, bucket_minutes: int, buckets: int) -> list[float]:
         """Weighted mention counts for the last `buckets` windows (oldest first)."""
         now = utcnow()
-        result: list[float] = []
         with self.session() as s:
-            for i in range(buckets, 0, -1):
-                start = now - timedelta(minutes=bucket_minutes * i)
-                end = now - timedelta(minutes=bucket_minutes * (i - 1))
-                val = (
-                    s.scalar(
-                        select(func.coalesce(func.sum(SocialEvent.weight), 0.0)).where(
-                            SocialEvent.ticker == ticker,
-                            SocialEvent.created_at >= start,
-                            SocialEvent.created_at < end,
-                        )
-                    )
-                    or 0.0
+            return [
+                self._weighted_between(
+                    s,
+                    ticker,
+                    now - timedelta(minutes=bucket_minutes * i),
+                    now - timedelta(minutes=bucket_minutes * (i - 1)),
                 )
-                result.append(float(val))
-        return result
+                for i in range(buckets, 0, -1)
+            ]
+
+    def seasonal_buckets(self, ticker: str, bucket_minutes: int, days: int) -> list[float]:
+        """Weighted mentions in the same clock window on each of the last `days`.
+
+        Crypto Twitter has a strong daily cycle, so comparing the current bucket
+        against the trailing few hours mistakes the normal US-morning ramp for a
+        spike. Comparing against the same hour on previous days removes it.
+        """
+        now = utcnow()
+        with self.session() as s:
+            return [
+                self._weighted_between(
+                    s,
+                    ticker,
+                    now - timedelta(days=k) - timedelta(minutes=bucket_minutes),
+                    now - timedelta(days=k),
+                )
+                for k in range(days, 0, -1)
+            ]
+
+    def history_span_hours(self, ticker: str | None = None) -> float:
+        """Hours between the oldest stored event and now (0.0 when empty)."""
+        with self.session() as s:
+            stmt = select(func.min(SocialEvent.created_at))
+            if ticker is not None:
+                stmt = stmt.where(SocialEvent.ticker == ticker)
+            earliest = s.scalar(stmt)
+        if earliest is None:
+            return 0.0
+        if earliest.tzinfo is None:
+            earliest = earliest.replace(tzinfo=utcnow().tzinfo)
+        return max((utcnow() - earliest).total_seconds() / 3600.0, 0.0)
 
     # ---- Signals -----------------------------------------------------------
 

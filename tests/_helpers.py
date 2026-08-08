@@ -2,35 +2,31 @@
 
 from __future__ import annotations
 
-from smt.config import RiskConfig, StrategyConfig, UniverseConfig
+from smt.config import _INHERITED_FIELDS as _INHERIT
+from smt.config import MarketConfig, RiskConfig, StrategyConfig, UniverseConfig, get_market
 from smt.store import Store
 
-_INHERIT = (
-    "take_profit_pct",
-    "stop_loss_pct",
-    "time_stop_hours",
-    "signal_min_zscore",
-    "signal_min_distinct_sources",
-    "signal_min_mentions",
-    "scorer_bucket_minutes",
-    "scorer_lookback_buckets",
-    "max_position_pct",
-    "max_open_positions",
-    "max_trades_per_day",
-    "daily_loss_halt_pct",
-    "weekly_loss_halt_pct",
-    "cooldown_minutes_after_stop",
-    "min_order_notional_usd",
-    "assumed_fee_pct_per_side",
-)
+
+def social_only_market_cfg() -> MarketConfig:
+    """Market config with price gates off, for tests that isolate social logic.
+
+    Production always runs with these on; disabling them explicitly keeps the
+    intent visible instead of relying on a missing market provider.
+    """
+    cfg = get_market().model_copy(deep=True)
+    cfg.confirmation.enabled = False
+    cfg.confirmation.fail_closed = False
+    cfg.regime.enabled = False
+    return cfg
 
 
 def make_universe() -> UniverseConfig:
+    """Two mid-tier symbols, so the default hybrid signal profile applies."""
     return UniverseConfig(
         quote_currency="USD",
         symbols={
-            "SOL": {"product_id": "SOL-USD", "aliases": ["sol", "solana", "$sol"]},
-            "BTC": {"product_id": "BTC-USD", "aliases": ["btc", "bitcoin"]},
+            "SOL": {"product_id": "SOL-USD", "aliases": ["sol", "solana", "$sol"], "tier": "mid"},
+            "BTC": {"product_id": "BTC-USD", "aliases": ["btc", "bitcoin"], "tier": "mid"},
         },
     )
 

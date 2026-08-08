@@ -59,6 +59,17 @@ class SoakTracker:
         log.info("Paper soak started at %s", state.started_at.isoformat())
         return state
 
+    def restart(self, mode: str = "paper") -> SoakState:
+        """Reset the clock to now.
+
+        Used after a change to entry or exit logic: soak days accumulated under
+        different rules do not evidence the system that would go live.
+        """
+        state = SoakState(started_at=datetime.now(UTC), mode=mode)
+        self._save(state)
+        log.warning("Paper soak clock reset to %s", state.started_at.isoformat())
+        return state
+
     def days_elapsed(self) -> float:
         state = self._load()
         if state is None:

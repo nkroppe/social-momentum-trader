@@ -11,9 +11,10 @@ import random
 import uuid
 from datetime import timedelta
 
-from ..config import MockSource, UniverseConfig
+from ..config import MockSource, SignalsConfig, UniverseConfig, get_signals
 from ..logging_setup import get_logger
 from ..models import SocialEvent, utcnow
+from .quality import sentiment_score, text_fingerprint
 
 log = get_logger("smt.ingest.mock")
 
@@ -29,9 +30,15 @@ _TEMPLATES = [
 class MockCollector:
     source_name = "mock"
 
-    def __init__(self, cfg: MockSource, universe: UniverseConfig):
+    def __init__(
+        self,
+        cfg: MockSource,
+        universe: UniverseConfig,
+        signals: SignalsConfig | None = None,
+    ):
         self.cfg = cfg
         self.universe = universe
+        self.signals = signals if signals is not None else get_signals()
         self._tickers = list(universe.symbols.keys())
         # Randomly pick a "hot" ticker each cycle to create bursts.
         self._rng = random.Random()
@@ -57,6 +64,8 @@ class MockCollector:
                     text=text,
                     url="",
                     weight=1.0,
+                    sentiment=sentiment_score(text, self.signals),
+                    text_hash=text_fingerprint(text),
                     created_at=now - timedelta(seconds=self._rng.randint(0, 60)),
                 )
             )

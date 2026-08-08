@@ -1,0 +1,126 @@
+# Social signal quality: spam filtering, sentiment polarity, and tier profiles.
+
+default_tier: mid
+
+# Directional posts required before the bullish ratio is trusted as a gate.
+min_sentiment_posts: 5
+
+# Cashtag streams are heavily farmed. These run at ingest time, before events
+# ever reach the scorer, so mention counts reflect genuine attention.
+spam:
+  enabled: true
+  drop_retweets: true
+  max_cashtags_per_post: 4        # shotgun posts listing 10 tickers are noise
+  max_urls_per_post: 2
+  min_author_followers: 100
+  min_text_chars: 15
+  dedup_window_minutes: 120
+  max_posts_per_author_per_window: 3
+  blocklist_phrases:
+    - airdrop
+    - giveaway
+    - free crypto
+    - dm me
+    - join our
+    - signal group
+    - pump group
+    - not financial advice guaranteed
+    - 100x guaranteed
+    - click the link
+    - telegram channel
+
+# Lexicon-based polarity. Cheap, deterministic, and auditable; it separates
+# "breaking out" from "getting liquidated", which mention counting cannot.
+sentiment:
+  enabled: true
+  require_directional: false
+  # Quoted: YAML would otherwise read `no` as a boolean.
+  negations: ["not", "no", "never", "isnt", "aint", "dont", "wont", "cant"]
+  bullish_terms:
+    - bullish
+    - breakout
+    - breaking out
+    - moon
+    - mooning
+    - ath
+    - all time high
+    - accumulating
+    - accumulation
+    - long
+    - longing
+    - buying
+    - bought
+    - send it
+    - sending
+    - rally
+    - rallying
+    - pumping
+    - squeeze
+    - reclaim
+    - reclaimed
+    - support holding
+    - golden cross
+    - inflows
+    - strong
+    - undervalued
+  bearish_terms:
+    - bearish
+    - dump
+    - dumping
+    - dumped
+    - crash
+    - crashing
+    - rug
+    - rugged
+    - rekt
+    - liquidated
+    - liquidation
+    - short
+    - shorting
+    - selling
+    - sold
+    - exit liquidity
+    - dead cat
+    - breakdown
+    - breaking down
+    - lost support
+    - death cross
+    - outflows
+    - capitulation
+    - bleeding
+    - overvalued
+    - scam
+
+# Per-tier profiles, selected by each symbol's `tier` in universe.yaml.
+#
+# Research consistently finds social signals are far more predictive for small
+# caps than large: majors are efficient enough that attention spikes are weak
+# and frequently contrarian, so they trade on trend instead.
+tiers:
+  major:
+    signal_mode: trend           # BTC/ETH: price trend decides, social is ignored
+    zscore_mult: 2.0
+    min_mentions_mult: 2.0
+    min_trailing_return_pct: 0.01
+    max_position_pct_mult: 1.0
+
+  large:
+    signal_mode: hybrid          # needs BOTH a social spike and price confirmation
+    zscore_mult: 1.4
+    min_mentions_mult: 1.5
+    min_trailing_return_pct: 0.005
+    max_position_pct_mult: 1.0
+
+  mid:
+    signal_mode: hybrid
+    zscore_mult: 1.0
+    min_mentions_mult: 1.0
+    min_trailing_return_pct: 0.0
+    max_position_pct_mult: 0.8
+
+  micro:
+    signal_mode: social          # where social attention genuinely leads price
+    zscore_mult: 0.8
+    min_mentions_mult: 0.8
+    min_trailing_return_pct: 0.0
+    max_position_pct_mult: 0.5   # smallest slice: highest volatility and spread

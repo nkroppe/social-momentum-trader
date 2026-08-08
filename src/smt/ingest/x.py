@@ -14,10 +14,11 @@ from pathlib import Path
 
 import httpx
 
-from ..config import Settings, UniverseConfig, XSource
+from ..config import Settings, SignalsConfig, UniverseConfig, XSource, get_signals
 from ..logging_setup import get_logger
 from ..models import SocialEvent
 from .base import extract_tickers
+from .quality import QualityFilter
 
 log = get_logger("smt.ingest.x")
 
@@ -78,12 +79,19 @@ class ReadBudget:
 class XCollector:
     source_name = "x"
 
-    def __init__(self, settings: Settings, cfg: XSource, universe: UniverseConfig):
+    def __init__(
+        self,
+        settings: Settings,
+        cfg: XSource,
+        universe: UniverseConfig,
+        signals: SignalsConfig | None = None,
+    ):
         if not settings.x_bearer_token:
             raise ValueError("X_BEARER_TOKEN is required when the X collector is enabled")
         self.settings = settings
         self.cfg = cfg
         self.universe = universe
+        self.quality = QualityFilter(signals if signals is not None else get_signals())
         self.budget = ReadBudget(
             Path("./data/x_budget.json"),
             settings.x_monthly_read_budget,
@@ -94,11 +102,22 @@ class XCollector:
         )
 
     def _search_queries(self) -> list[str]:
-        queries = list(self.cfg.keywords)
+        """Build queries, excluding retweets/replies server-side where possible.
+
+        Filtering at the API means the read budget buys original posts instead
+        of amplification noise.
+        """
+        suffix = ""
+        if self.cfg.exclude_retweets:
+            suffix += " -is:retweet"
+        if self.cfg.exclude_replies:
+            suffix += " -is:reply"
+
+        queries = [f"{kw}{suffix}" for kw in self.cfg.keywords]
         for account in self.cfg.watch_accounts:
             handle = account.lstrip("@").strip()
             if handle:
-                queries.append(f"from:{handle}")
+                queries.append(f"from:{handle}{suffix}")
         return queries
 
     def _parse_tweets(self, payload: dict) -> list[SocialEvent]:
@@ -111,9 +130,24 @@ class XCollector:
             tickers = extract_tickers(text, self.universe)
             if not tickers:
                 continue
+
             author_id = tweet.get("author_id", "")
             user = users.get(author_id, {})
             username = user.get("username", author_id)
+            followers = (user.get("public_metrics") or {}).get("followers_count")
+            is_retweet = any(
+                ref.get("type") == "retweeted" for ref in (tweet.get("referenced_tweets") or [])
+            )
+
+            verdict = self.quality.evaluate(
+                text,
+                author=f"@{username}" if username else "",
+                followers=followers,
+                is_retweet=is_retweet,
+            )
+            if not verdict.keep:
+                continue
+
             created = datetime.fromisoformat(
                 tweet["created_at"].replace("Z", "+00:00")
             ).astimezone(UTC)
@@ -128,6 +162,9 @@ class XCollector:
                         text=text[:2000],
                         url=f"https://x.com/{username}/status/{tweet_id}",
                         weight=self.cfg.mention_weight,
+                        sentiment=verdict.sentiment,
+                        author_followers=int(followers or 0),
+                        text_hash=verdict.fingerprint,
                         created_at=created,
                     )
                 )
@@ -141,9 +178,9 @@ class XCollector:
         params = {
             "query": query,
             "max_results": max_results,
-            "tweet.fields": "created_at,author_id",
+            "tweet.fields": "created_at,author_id,referenced_tweets",
             "expansions": "author_id",
-            "user.fields": "username",
+            "user.fields": "username,public_metrics",
         }
         resp = self._client.get(f"{API_BASE}/tweets/search/recent", params=params)
 
@@ -191,6 +228,13 @@ class XCollector:
                 log.warning("x search HTTP error for %r: %s", query, exc)
             except Exception as exc:  # noqa: BLE001
                 log.warning("x search failed for %r: %s", query, exc)
+
+        if self.quality.dropped:
+            log.info(
+                "x quality filter: kept %d events, dropped %s",
+                len(events),
+                self.quality.summary(),
+            )
         return events
 
     def close(self) -> None:

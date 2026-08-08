@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import timedelta
 
-from _helpers import make_store, make_strategy, make_universe
+from _helpers import make_store, make_strategy, make_universe, social_only_market_cfg
 
 from smt.ingest.base import extract_tickers
 from smt.models import SocialEvent, TradeStatus, utcnow
@@ -36,13 +36,14 @@ def test_velocity_signal_fires_on_burst(tmp_path):
                     source="reddit",
                     external_id=uuid.uuid4().hex,
                     ticker="SOL",
+                    author=f"baseline{i}",
                     text="sol",
                     created_at=ts,
                     weight=1.0,
                 )
             ]
         )
-    # Burst now across two sources.
+    # Burst now across two sources, each post from its own bullish account.
     for src in ("reddit", "x"):
         store.add_events(
             [
@@ -50,11 +51,13 @@ def test_velocity_signal_fires_on_burst(tmp_path):
                     source=src,
                     external_id=uuid.uuid4().hex,
                     ticker="SOL",
-                    text="sol",
+                    author=f"{src}user{n}",
+                    text="sol breaking out",
+                    sentiment=1.0,
                     created_at=utcnow(),
                     weight=1.0,
                 )
-                for _ in range(12)
+                for n in range(12)
             ]
         )
 
@@ -62,10 +65,59 @@ def test_velocity_signal_fires_on_burst(tmp_path):
     result = scorer.score_ticker("SOL")
     assert result.zscore >= st.signal_min_zscore
     assert result.distinct_sources >= 2
+    assert result.distinct_authors >= st.signal_min_distinct_authors
+    assert result.bullish_ratio == 1.0
 
-    engine = SignalEngine(st, u)
+    # Price gates off so this exercises the social gate in isolation.
+    engine = SignalEngine(st, u, market_cfg=social_only_market_cfg())
     cands = engine.candidates(scorer.score_all())
     assert any(c.ticker == "SOL" for c in cands)
+
+
+def test_bearish_burst_is_rejected(tmp_path):
+    """A crash generates huge chatter; mention count alone would buy it."""
+    store = make_store(tmp_path)
+    u = make_universe()
+    st = make_strategy()
+
+    for i in range(st.scorer_lookback_buckets, 1, -1):
+        ts = utcnow() - timedelta(minutes=st.scorer_bucket_minutes * i - 1)
+        store.add_events(
+            [
+                SocialEvent(
+                    source="x",
+                    external_id=uuid.uuid4().hex,
+                    ticker="SOL",
+                    author=f"baseline{i}",
+                    text="sol",
+                    created_at=ts,
+                    weight=1.0,
+                )
+            ]
+        )
+    store.add_events(
+        [
+            SocialEvent(
+                source="x",
+                external_id=uuid.uuid4().hex,
+                ticker="SOL",
+                author=f"panic{n}",
+                text="sol getting liquidated, total capitulation",
+                sentiment=-1.0,
+                created_at=utcnow(),
+                weight=1.0,
+            )
+            for n in range(24)
+        ]
+    )
+
+    scorer = MomentumScorer(store, u, st.scorer_bucket_minutes, st.scorer_lookback_buckets)
+    result = scorer.score_ticker("SOL")
+    assert result.zscore >= st.signal_min_zscore  # attention really did spike
+    assert result.bullish_ratio == 0.0
+
+    engine = SignalEngine(st, u, market_cfg=social_only_market_cfg())
+    assert engine.candidates(scorer.score_all()) == []
 
 
 def test_risk_gate_blocks_over_limits(tmp_path):

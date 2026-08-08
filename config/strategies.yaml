@@ -1,30 +1,48 @@
 # Two trading methodologies running simultaneously with a capital split.
 # Any field omitted here inherits from config/risk.yaml (global defaults).
 # Enabled allocations must sum to <= 1.0. time_stop_hours is capped at 72.
+#
+# Exits are ATR-based: targets scale to each asset's own volatility AND to this
+# strategy's holding period, so the same multipliers work for a 6h BTC trade and
+# a 48h micro-cap swing. take_profit_pct and stop_loss_pct below are only the
+# fallback when exit_style is "fixed" or when no candle history is available.
 
 strategies:
-  # Existing hours-to-intraday behavior (matches pre-dual-strategy defaults).
+  # Hours-to-intraday horizon.
   intraday:
     enabled: true
     allocation: 0.5
+    exit_style: atr
+    atr_take_profit_mult: 2.0
+    atr_stop_loss_mult: 1.0
     take_profit_pct: 0.06
     stop_loss_pct: 0.03
     time_stop_hours: 6
     signal_min_zscore: 2.5
     signal_min_distinct_sources: 1   # X-only soak; raise to 2 when Reddit is added
+    signal_min_distinct_authors: 3   # real confirmation while running one source
     signal_min_mentions: 8
+    signal_min_bullish_ratio: 0.60
     scorer_bucket_minutes: 30
     scorer_lookback_buckets: 8
+    confirm_lookback_hours: 4
 
-  # New 1-3 day swing: longer hold, wider targets, stricter entry, longer lookback.
+  # 1-3 day swing: longer hold, wider targets, stricter entry, longer lookback.
   swing:
     enabled: true
     allocation: 0.5
+    exit_style: atr
+    # Same multipliers as intraday: the 48h horizon already widens the targets.
+    atr_take_profit_mult: 2.0
+    atr_stop_loss_mult: 1.0
     take_profit_pct: 0.15
     stop_loss_pct: 0.07
     time_stop_hours: 48          # configurable up to 72
     signal_min_zscore: 3.0
     signal_min_distinct_sources: 1   # X-only soak; raise to 2 when Reddit is added
+    signal_min_distinct_authors: 5
     signal_min_mentions: 15
+    signal_min_bullish_ratio: 0.65
     scorer_bucket_minutes: 120
     scorer_lookback_buckets: 12
+    confirm_lookback_hours: 24

@@ -1,7 +1,9 @@
-"""Paper broker: simulated prices and fills, no external calls.
+"""Paper broker: simulated fills against real market prices.
 
-Prices follow a per-product random walk seeded from a base price, so TP/SL/
-time-stop logic exercises realistically during a soak.
+When a MarketData provider is supplied, quotes come from Coinbase's public API
+so a soak measures the same price action the live path would trade. Without one
+(offline dev, `smt simulate`, unit tests) prices fall back to a per-product
+random walk.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import uuid
 
 from ..config import get_risk
 from ..logging_setup import get_logger
+from ..market import MarketData
 from .broker import Fill
 
 log = get_logger("smt.broker.paper")
@@ -31,15 +34,25 @@ class PaperBroker:
     name = "paper"
     server_side_brackets = False
 
-    def __init__(self, seed: int | None = None):
+    def __init__(self, seed: int | None = None, market: MarketData | None = None):
         self._rng = random.Random(seed)
         self._prices: dict[str, float] = dict(_BASE_PRICES)
+        self._pinned: dict[str, float] = {}
+        self._market = market
         self._fee_pct = get_risk().assumed_fee_pct_per_side
 
     def current_price(self, product_id: str) -> float:
-        price = self._prices.get(product_id)
-        if price is None:
-            price = 100.0
+        pinned = self._pinned.get(product_id)
+        if pinned is not None:
+            return pinned
+
+        if self._market is not None:
+            live = self._market.price(product_id)
+            if live is not None and live > 0:
+                self._prices[product_id] = live
+                return live
+
+        price = self._prices.get(product_id, 100.0)
         # Random walk: +/- up to ~1.5% per tick.
         drift = self._rng.uniform(-0.015, 0.015)
         price = max(price * (1 + drift), 1e-6)
@@ -70,6 +83,8 @@ class PaperBroker:
         log.info("[paper] SELL %s qty=%.8f @ %.6f", product_id, qty, price)
         return Fill(order_id=f"paper-{uuid.uuid4().hex[:12]}", price=price, qty=qty, fee=fee)
 
-    # Test/soak helper: force a price (used to trigger TP/SL deterministically).
+    # Test/simulate helper: pin a price so TP/SL trigger deterministically.
+    # A pinned product ignores both the market feed and the random walk.
     def set_price(self, product_id: str, price: float) -> None:
+        self._pinned[product_id] = price
         self._prices[product_id] = price

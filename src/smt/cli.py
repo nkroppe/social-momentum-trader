@@ -27,15 +27,43 @@ def _cmd_init_db(_args: argparse.Namespace) -> int:
 
 
 def _cmd_score(_args: argparse.Namespace) -> int:
+    """Ingest once, then show social scores next to the price gates."""
     from .run import Runner
 
     r = Runner()
     r.ingest()
-    print(f"{'TICKER':<8}{'ZSCORE':>10}{'RECENT':>10}{'BASE':>10}{'MENTIONS':>10}{'SRC':>6}")
+
+    if r.market is not None:
+        ok, detail = r.market.regime_ok()
+        print(f"Regime: {'RISK-ON' if ok else 'RISK-OFF'} ({detail})\n")
+
+    header = (
+        f"{'TICKER':<8}{'TIER':<8}{'MODE':<8}{'ZSCORE':>8}{'MENTIONS':>9}"
+        f"{'AUTHORS':>8}{'BULL%':>7}{'RET':>8}{'ATR%':>7}{'>SMA':>6}"
+    )
+    print(header)
+    print("-" * len(header))
+
     for s in r.scorer.score_all():
+        tier_name = r.universe.tier_of(s.ticker, r.signals.default_tier)
+        tier = r.signals.tier(tier_name)
+        ret = atr_pct = 0.0
+        above = "n/a"
+        if r.market is not None:
+            snap = r.market.snapshot(
+                r.universe.symbols[s.ticker].product_id,
+                sma_periods=r.market_cfg.confirmation.sma_periods,
+                lookback_periods=max(1, r.risk.confirm_lookback_hours),
+            )
+            if snap.ok:
+                ret, atr_pct = snap.trailing_return, snap.atr_pct
+                above = "yes" if snap.above_sma else "no"
+            else:
+                above = "err"
         print(
-            f"{s.ticker:<8}{s.zscore:>10.2f}{s.recent:>10.1f}"
-            f"{s.baseline_mean:>10.1f}{s.mentions_window:>10d}{s.distinct_sources:>6d}"
+            f"{s.ticker:<8}{tier_name:<8}{tier.signal_mode:<8}{s.zscore:>8.2f}"
+            f"{s.mentions_window:>9d}{s.distinct_authors:>8d}{s.bullish_ratio * 100:>7.0f}"
+            f"{ret * 100:>7.2f}%{atr_pct * 100:>6.2f}%{above:>6}"
         )
     return 0
 
@@ -145,6 +173,83 @@ def _cmd_soak_report(args: argparse.Namespace) -> int:
     return _cmd_compare(args)
 
 
+def _cmd_preview(_args: argparse.Namespace) -> int:
+    """Show the exit levels and position size each symbol would get right now.
+
+    Reads live volatility without placing anything, so you can sanity-check that
+    targets fit each asset before trusting a soak.
+    """
+    from .run import Runner
+    from .trader.signals import TradeCandidate
+
+    r = Runner()
+    if r.market is None:
+        print("Market data is disabled; nothing to preview.")
+        return 1
+
+    ok, detail = r.market.regime_ok()
+    print(f"Regime: {'RISK-ON' if ok else 'RISK-OFF'} ({detail})\n")
+
+    names = [st.name for st in r.strategies]
+    header = f"{'SYM':<6}{'TIER':<7}{'MODE':<8}{'ATR%/h':>8}  "
+    header += "".join(f"{n.upper() + ' tp/sl':<22}" for n in names)
+    header += f"{'SIZE$':>9}"
+    print(header)
+    print("-" * len(header))
+
+    for ticker, spec in r.universe.symbols.items():
+        tier = r.universe.tier_of(ticker, r.signals.default_tier)
+        snap = r.market.snapshot(
+            spec.product_id,
+            sma_periods=r.market_cfg.confirmation.sma_periods,
+            lookback_periods=max(1, r.risk.confirm_lookback_hours),
+        )
+        if not snap.ok:
+            print(f"{ticker:<6}{tier:<7}UNAVAILABLE: {snap.detail}")
+            continue
+
+        cand = TradeCandidate(
+            ticker, spec.product_id, 0.0, 0, 1, "preview", tier=tier, atr_pct=snap.atr_pct
+        )
+        cells = ""
+        for st in r.strategies:
+            tp, sl, _ = r.manager.exit_levels(100.0, cand, st)
+            cells += f"{f'+{tp - 100:.2f}% / -{100 - sl:.2f}%':<22}"
+
+        first = r.strategies[0]
+        notional, _ = r.risk_gate.size_position(
+            cand, first, r.manager.allocation_equity(first)
+        )
+        print(
+            f"{ticker:<6}{tier:<7}{r.signals.tier(tier).signal_mode:<8}"
+            f"{snap.atr_pct * 100:>7.2f}%  {cells}{notional:>9.2f}"
+        )
+    print(f"\nSIZE$ is for the '{r.strategies[0].name}' strategy at current allocation equity.")
+    return 0
+
+
+def _cmd_soak_reset(args: argparse.Namespace) -> int:
+    """Restart the soak clock after changing entry or exit logic."""
+    from pathlib import Path
+
+    from .config import get_ops, get_security
+    from .ops.soak import SoakTracker
+
+    tracker = SoakTracker(Path(get_ops().soak.state_file))
+    min_days = get_security().min_paper_soak_days
+    print(f"Current: {tracker.summary_line(min_days)}")
+
+    if not args.yes:
+        answer = input(f"Reset the soak clock to zero ({min_days}d required)? [y/N] ")
+        if answer.strip().lower() not in ("y", "yes"):
+            print("Aborted.")
+            return 1
+
+    state = tracker.restart("paper")
+    print(f"Soak clock reset. New start: {state.started_at.isoformat()}")
+    return 0
+
+
 def _cmd_simulate(args: argparse.Namespace) -> int:
     """Deterministic end-to-end demo exercising BOTH strategies.
 
@@ -156,7 +261,9 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
     from .demo import seed_momentum
     from .run import Runner
 
-    r = Runner()
+    # Offline so the demo stays deterministic and credential-free: real price
+    # gates would make the outcome depend on live market conditions.
+    r = Runner(offline=True)
     if r.broker.name != "paper":
         print("simulate requires PAPER mode (unset LIVE).")
         return 2
@@ -191,8 +298,9 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
                 f"tp={tr.take_profit:.6f} sl={tr.stop_loss:.6f}"
             )
 
-    # 4) Force price above the highest TP so every open position hits take-profit.
-    open_trades = r.store.open_trades()
+    # 4) Force price above this ticker's highest TP so its positions all exit.
+    #    Scoped to the product: other symbols' levels must not move it.
+    open_trades = [t for t in r.store.open_trades() if t.product_id == product_id]
     if open_trades:
         highest_tp = max(t.take_profit for t in open_trades)
         r.broker.set_price(product_id, highest_tp * 1.05)  # type: ignore[attr-defined]
@@ -248,6 +356,16 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "soak-report", help="Paper soak progress + strategy comparison"
     ).set_defaults(func=_cmd_soak_report)
+
+    sub.add_parser(
+        "preview", help="Show live exit levels and position sizes per symbol"
+    ).set_defaults(func=_cmd_preview)
+
+    reset = sub.add_parser(
+        "soak-reset", help="Restart the paper soak clock (after a signal change)"
+    )
+    reset.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
+    reset.set_defaults(func=_cmd_soak_reset)
 
     sim = sub.add_parser("simulate", help="Deterministic end-to-end paper demo")
     sim.add_argument("--ticker", default="SOL")

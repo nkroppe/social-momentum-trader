@@ -13,8 +13,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import timedelta
 
-from ..config import StrategyConfig
+from ..config import MarketConfig, SignalsConfig, StrategyConfig, get_market, get_signals
 from ..logging_setup import get_logger
+from ..market import horizon_volatility
 from ..models import utcnow
 from ..store import Store
 from .signals import TradeCandidate
@@ -30,8 +31,50 @@ class RiskDecision:
 
 
 class RiskGate:
-    def __init__(self, store: Store):
+    def __init__(
+        self,
+        store: Store,
+        signals: SignalsConfig | None = None,
+        market_cfg: MarketConfig | None = None,
+    ):
         self.store = store
+        self.signals = signals if signals is not None else get_signals()
+        self.market_cfg = market_cfg if market_cfg is not None else get_market()
+
+    def size_position(
+        self, candidate: TradeCandidate, strategy: StrategyConfig, equity_alloc: float
+    ) -> tuple[float, str]:
+        """Notional for this entry, reduced for tier and asset volatility.
+
+        Both adjustments are multiplicative and capped at 1.0, so sizing can
+        only ever come in under the hard max_position_pct limit. Without this a
+        fixed 10% notional puts many times more risk into a sub-cent token than
+        into BTC.
+        """
+        base = equity_alloc * strategy.max_position_pct
+        notes: list[str] = []
+
+        tier = self.signals.tier(candidate.tier)
+        tier_mult = max(0.0, min(tier.max_position_pct_mult, 1.0))
+        if tier_mult != 1.0:
+            notes.append(f"tier[{candidate.tier}]x{tier_mult:.2f}")
+
+        sizing = self.market_cfg.sizing
+        vol_mult = 1.0
+        if sizing.enabled and candidate.atr_pct > 0:
+            # Compare volatility over the same holding period the exits use, so
+            # both scale together rather than against different horizons.
+            hvol = horizon_volatility(
+                candidate.atr_pct,
+                strategy.time_stop_hours,
+                self.market_cfg.candle_granularity_seconds,
+            )
+            vol_mult = sizing.target_atr_pct / hvol
+            vol_mult = max(sizing.min_scale, min(vol_mult, sizing.max_scale))
+            notes.append(f"vol[{hvol:.2%}/{strategy.time_stop_hours}h]x{vol_mult:.2f}")
+
+        notional = round(base * tier_mult * vol_mult, 2)
+        return notional, " ".join(notes) if notes else "unscaled"
 
     def portfolio_halted(
         self, strategy: StrategyConfig, start_equity: float
@@ -86,12 +129,13 @@ class RiskGate:
             if utcnow() - last_stop_utc < timedelta(minutes=st.cooldown_minutes_after_stop):
                 return RiskDecision(False, 0.0, "within cooldown after recent stop-out")
 
-        notional = round(equity_alloc * st.max_position_pct, 2)
+        notional, sizing_note = self.size_position(candidate, st, equity_alloc)
         if notional < st.min_order_notional_usd:
             return RiskDecision(
                 False,
                 0.0,
-                f"position notional ${notional:.2f} < min ${st.min_order_notional_usd:.2f}",
+                f"position notional ${notional:.2f} < min ${st.min_order_notional_usd:.2f} "
+                f"({sizing_note})",
             )
 
-        return RiskDecision(True, notional, "approved")
+        return RiskDecision(True, notional, f"approved ({sizing_note})")

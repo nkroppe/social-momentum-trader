@@ -25,6 +25,12 @@ def setup_logging(level: int = logging.INFO, log_dir: str = "./logs") -> None:
         pass
 
     logging.basicConfig(level=level, format=fmt, handlers=handlers)
+
+    # httpx logs every request at INFO. Market data polls several products per
+    # loop, which would bury the trading log in HTTP noise.
+    for noisy in ("httpx", "httpcore", "urllib3"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
     _CONFIGURED = True
 
 

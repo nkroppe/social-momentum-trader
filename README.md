@@ -12,14 +12,40 @@ safety latches and a paper soak.
 ## What it does
 
 ```
-ingest (Reddit/X/mock) -> normalize/dedupe -> velocity z-score
-   -> per-strategy signal (multi-source confirmation) -> HARD RISK GATE (per strategy)
-   -> paper/live executor (entry + TP/SL + time-stop) -> manage exits
+ingest (Reddit/X/mock) -> spam filter + sentiment -> velocity z-score (seasonal baseline)
+   -> per-strategy signal (tiered social + price confirmation) -> HARD RISK GATE (per strategy)
+   -> paper/live executor (ATR entry + TP/SL + time-stop) -> manage exits
 ```
 
 - **Direction:** long-only spot (USD pairs on an allowlist).
 - **Execution venue (locked):** [Coinbase Advanced Trade](docs/venue.md) — US spot only. No Robinhood, Phantom, or Bullpen in this repo.
-- **Signals v1:** keyword + mention-velocity only. No LLM (deferred to phase 2).
+- **Signals:** keyword velocity, lexicon sentiment, and price/volume confirmation. No LLM (deferred to phase 2).
+
+## How entries are gated
+
+Social attention alone is a weak signal, and it gets weaker as market cap rises:
+published studies find crowd trading signals roughly twice as predictive for
+low-cap coins as for high-cap ones, and attention spikes on majors are often
+*contrarian*. So each symbol carries a `tier` in `config/universe.yaml` that
+selects which gates must pass:
+
+| Tier | Signal mode | Social gate | Trend gate | Direction gate |
+|---|---|---|---|---|
+| `major` (BTC, ETH) | `trend` | ignored | required | required |
+| `large` / `mid` | `hybrid` | required | required | required |
+| `micro` (PUMP) | `social` | required | ignored | required |
+
+- **Social gate** — velocity z-score, raw mentions, distinct *accounts*, and a
+  bullish-vs-bearish ratio. Distinct authors matter most when running a single
+  source: it stops one loud account manufacturing a signal.
+- **Trend gate** — price above its moving average with volume participation.
+- **Direction gate** — positive trailing return over the strategy's window. This
+  always applies. Buying an attention spike caused by a crash is the most
+  damaging failure mode of a pure mention count.
+
+A benchmark regime filter (BTC vs its 50-day average) blocks *all* new entries
+in a broad downtrend. Every price gate is **fail-closed**: no market data means
+no entry.
 
 ## Two strategies, one capital pool
 
@@ -28,8 +54,18 @@ split (default 50/50) so you can compare which performs best over the soak:
 
 | Strategy | Hold | Take-profit | Stop-loss | Time-stop | Entry thresholds |
 |---|---|---|---|---|---|
-| `intraday` | hours-intraday | +6% | -3% | 6h | z>=2.5, >=2 sources, >=8 mentions, 30m x 8 buckets |
-| `swing` | 1-3 days | +15% | -7% | 48h (max 72h) | z>=3.0, >=2 sources, >=15 mentions, 120m x 12 buckets |
+| `intraday` | hours-intraday | 2x ATR | 1x ATR | 6h | z>=2.5, >=3 authors, >=8 mentions, >=60% bullish, 30m x 8 buckets |
+| `swing` | 1-3 days | 2x ATR | 1x ATR | 48h (max 72h) | z>=3.0, >=5 authors, >=15 mentions, >=65% bullish, 120m x 12 buckets |
+
+Exits are **volatility-scaled**, not fixed percentages. ATR is scaled to each
+strategy's holding period (volatility grows with the square root of time), so
+one rule fits a universe spanning BTC and a sub-cent token. A fixed +6%/-3%
+makes BTC targets unreachable within 6 hours — nearly every trade would end on
+the time stop at a random price — while sitting inside a micro cap's noise band.
+Run `smt preview` to see the live levels per symbol. Position size is scaled the
+same way, so a high-volatility asset risks the same dollars as a calm one.
+
+Take-profit is never allowed inside round-trip fees.
 
 Each strategy sizes off its **own** allocation half and enforces its **own**
 limits (max position %, max open, max trades/day, daily/weekly loss halts,
@@ -68,6 +104,8 @@ the `simulate` demo run with zero external accounts.
 - `config/sources.yaml` - Reddit/X polling + mock toggle
 - `config/security.yaml` - fund-protection controls
 - `config/ops.yaml` - soak tracking, digest interval, preflight requirements
+- `config/market.yaml` - price confirmation, regime filter, volatility sizing
+- `config/signals.yaml` - spam filters, sentiment lexicon, per-tier signal profiles
 - `.env` (copy from `.env.example`) - secrets + mode flags
 - `.env.production.example` - VPS production template (Postgres, alerts, no mock)
 
@@ -136,7 +174,12 @@ smt doctor --dev        # minimal config checks for local dev
 smt doctor --live       # go-live checks (Coinbase key, soak duration, LIVE flags)
 smt test-alerts         # send a test alert to configured channels
 smt soak-report         # soak progress + strategy comparison
+smt preview             # live exit levels + position size per symbol
+smt soak-reset          # restart the soak clock after changing signal logic
 ```
+
+Reset the soak clock whenever entry or exit logic changes. Days accumulated
+under different rules do not evidence the system that would go live.
 
 Before enabling live trading, complete [docs/go-live-checklist.md](docs/go-live-checklist.md)
 and run `smt doctor --live` until all checks pass.
@@ -160,13 +203,14 @@ smt compare             # per-strategy trades, win rate, PnL, avg hold
 
 ```
 src/smt/
-  ingest/   reddit, x, mock + ticker extraction
-  scorer/   mention-velocity z-score
+  ingest/   reddit, x, mock + ticker extraction, spam/sentiment quality filter
+  scorer/   mention-velocity z-score with a seasonal baseline
+  market/   Coinbase candles, ATR/SMA/volume indicators, regime filter
   trader/   signals (per-strategy), risk gate (per-strategy), paper + coinbase brokers, trade manager
   ops/      alerts, kill switch, soak tracker, preflight (doctor)
   demo.py   deterministic seeding for simulate/tests
   run.py    orchestrator     cli.py  CLI
-config/     risk, strategies, universe, sources, security, ops
+config/     risk, strategies, universe, sources, security, ops, market, signals
 docs/       venue.md, deploy-vps.md, go-live-checklist.md, compromise-runbook.md
 ```
 

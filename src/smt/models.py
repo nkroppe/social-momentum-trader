@@ -40,10 +40,15 @@ class SocialEvent(Base):
     source: Mapped[str] = mapped_column(String(32), index=True)  # reddit/x/mock
     external_id: Mapped[str] = mapped_column(String(128), index=True)
     ticker: Mapped[str] = mapped_column(String(16), index=True)
-    author: Mapped[str] = mapped_column(String(128), default="")
+    author: Mapped[str] = mapped_column(String(128), default="", index=True)
     text: Mapped[str] = mapped_column(Text, default="")
     url: Mapped[str] = mapped_column(String(512), default="")
     weight: Mapped[float] = mapped_column(Float, default=1.0)  # source credibility weight
+    # Lexicon polarity in [-1, 1]; 0.0 means no directional language.
+    sentiment: Mapped[float] = mapped_column(Float, default=0.0)
+    author_followers: Mapped[int] = mapped_column(Integer, default=0)
+    # Hash of normalized text, for cross-poll duplicate detection.
+    text_hash: Mapped[str] = mapped_column(String(32), default="", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -58,6 +63,8 @@ class Signal(Base):
     score: Mapped[float] = mapped_column(Float)  # z-score of velocity
     mentions: Mapped[int] = mapped_column(Integer, default=0)
     sources: Mapped[int] = mapped_column(Integer, default=0)  # distinct sources
+    authors: Mapped[int] = mapped_column(Integer, default=0)  # distinct accounts
+    bullish_ratio: Mapped[float] = mapped_column(Float, default=0.0)
     reason: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True

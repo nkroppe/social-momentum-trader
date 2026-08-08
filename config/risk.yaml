@@ -20,7 +20,16 @@ weekly_loss_halt_pct: -0.12
 # After a stop-out on a symbol, ignore new signals for it for this many minutes.
 cooldown_minutes_after_stop: 120
 
-# Exit parameters (defaults; tuned during paper soak).
+# Exit sizing. "atr" scales targets to each asset's own volatility, so one rule
+# fits both BTC (~2% daily range) and a sub-cent token (~15%+). Under "fixed",
+# the flat percentages below are used instead.
+exit_style: atr
+atr_take_profit_mult: 2.0  # TP = entry + 2 x ATR
+atr_stop_loss_mult: 1.0    # SL = entry - 1 x ATR
+atr_min_stop_pct: 0.008    # floor: never stop tighter than 0.8% (fee-dominated)
+atr_max_stop_pct: 0.15     # ceiling: never risk more than 15% on one entry
+
+# Fallback exit parameters, used when exit_style is "fixed" or ATR is unavailable.
 take_profit_pct: 0.06      # +6% target
 stop_loss_pct: 0.03        # -3% stop
 time_stop_hours: 6         # flatten if neither TP nor SL hits within N hours
@@ -35,9 +44,21 @@ assumed_fee_pct_per_side: 0.006
 # Velocity z-score required to consider an entry.
 signal_min_zscore: 2.5
 # Require confirmation across at least this many distinct sources.
-signal_min_distinct_sources: 2
+signal_min_distinct_sources: 1
+# Require this many distinct accounts. With a single source this is the real
+# manipulation guard: one loud account cannot manufacture a signal.
+signal_min_distinct_authors: 3
 # Require at least this many raw mentions over the lookback window.
 signal_min_mentions: 8
+# Fraction of directional posts that must be bullish. Mention counts alone
+# treat "getting liquidated" as a buy signal; this filters that out.
+signal_min_bullish_ratio: 0.60
 # Scorer bucketing.
 scorer_bucket_minutes: 30
 scorer_lookback_buckets: 8
+
+# --- Price confirmation ---
+# Trailing return window (hours) that must be positive before a social spike
+# counts as an entry. See config/market.yaml for the rest of the gate.
+confirm_lookback_hours: 4
+confirm_min_return_pct: 0.0

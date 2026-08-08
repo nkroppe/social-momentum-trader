@@ -111,4 +111,60 @@ def test_x_collector_builds_from_watch_accounts(tmp_path, monkeypatch):
     with patch("httpx.Client.get", return_value=mock_response) as mock_get:
         XCollector(settings, cfg, _universe()).collect()
         assert mock_get.call_count == 1
-        assert mock_get.call_args.kwargs["params"]["query"] == "from:elonmusk"
+        # Retweets and replies are excluded server-side so the read budget
+        # buys original posts.
+        assert (
+            mock_get.call_args.kwargs["params"]["query"]
+            == "from:elonmusk -is:retweet -is:reply"
+        )
+
+
+def test_x_collector_drops_spam_and_scores_sentiment(tmp_path, monkeypatch):
+    """Farmed posts never reach the store; kept posts carry a polarity."""
+    monkeypatch.chdir(tmp_path)
+    settings = Settings(x_bearer_token="test-token", x_monthly_read_budget=1000)
+    cfg = XSource(enabled=True, keywords=["$SOL"], mention_weight=2.0)
+
+    payload = {
+        "data": [
+            {
+                "id": "1",
+                "text": "$SOL is breaking out of this range, bullish continuation",
+                "created_at": "2026-08-08T12:00:00Z",
+                "author_id": "10",
+            },
+            {
+                "id": "2",
+                "text": "free crypto giveaway! dm me for your $SOL allocation right now",
+                "created_at": "2026-08-08T12:01:00Z",
+                "author_id": "11",
+            },
+            {
+                "id": "3",
+                "text": "$SOL looking great here, strong breakout forming today",
+                "created_at": "2026-08-08T12:02:00Z",
+                "author_id": "12",
+            },
+        ],
+        "includes": {
+            "users": [
+                {"id": "10", "username": "real", "public_metrics": {"followers_count": 9000}},
+                {"id": "11", "username": "spammer", "public_metrics": {"followers_count": 9000}},
+                {"id": "12", "username": "tiny", "public_metrics": {"followers_count": 4}},
+            ]
+        },
+    }
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = payload
+    mock_response.raise_for_status = MagicMock()
+
+    with patch("httpx.Client.get", return_value=mock_response):
+        events = XCollector(settings, cfg, _universe()).collect()
+
+    # Only the genuine post from an account above the follower floor survives.
+    assert [e.external_id for e in events] == ["1"]
+    assert events[0].sentiment > 0
+    assert events[0].author_followers == 9000
+    assert events[0].text_hash

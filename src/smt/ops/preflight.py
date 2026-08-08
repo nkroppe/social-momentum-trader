@@ -24,6 +24,8 @@ REQUIRED_CONFIGS = (
     "universe.yaml",
     "sources.yaml",
     "security.yaml",
+    "market.yaml",
+    "signals.yaml",
 )
 
 
@@ -39,6 +41,50 @@ def _alert_channel_configured(settings: Settings) -> bool:
     tg = settings.telegram_bot_token and settings.telegram_chat_id
     push = bool(settings.ntfy_topic_url or tg)
     return email or push
+
+
+def _market_data_checks() -> list[CheckResult]:
+    """Verify every universe product resolves to Coinbase market data.
+
+    A symbol Coinbase does not list will silently never trade under a
+    fail-closed price gate, so surface it here rather than in the logs.
+    """
+    from ..config import get_market, get_universe
+    from ..market import MarketData
+
+    results: list[CheckResult] = []
+    market = MarketData(get_market())
+    universe = get_universe()
+    try:
+        missing: list[str] = []
+        thin: list[str] = []
+        for ticker, spec in universe.symbols.items():
+            candles = market.candles(spec.product_id)
+            if not candles:
+                missing.append(f"{ticker} ({spec.product_id})")
+            elif len(candles) < get_market().confirmation.sma_periods:
+                thin.append(f"{ticker}:{len(candles)}")
+
+        detail = "all universe products resolve on Coinbase"
+        if missing:
+            detail = "not listed on Coinbase: " + ", ".join(missing)
+        elif thin:
+            detail = "listed but thin history: " + ", ".join(thin)
+        results.append(CheckResult("market_data_products", not missing, detail))
+
+        regime_ok, regime_detail = market.regime_ok()
+        results.append(
+            CheckResult(
+                "regime_benchmark",
+                # The benchmark only needs to be readable here; RISK-OFF is a
+                # valid market state, not a configuration failure.
+                "candles" not in regime_detail or regime_ok,
+                f"{'RISK-ON' if regime_ok else 'RISK-OFF'} - {regime_detail}",
+            )
+        )
+    finally:
+        market.close()
+    return results
 
 
 def run_preflight(profile: str = "production") -> list[CheckResult]:
@@ -138,6 +184,8 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
             str(control.resolve()) if control.exists() else "mkdir control/",
         )
     )
+
+    results.extend(_market_data_checks())
 
     if profile != "live":
         return results

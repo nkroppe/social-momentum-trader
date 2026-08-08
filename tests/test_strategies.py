@@ -5,9 +5,9 @@ from __future__ import annotations
 import uuid
 
 import pytest
-from _helpers import make_store, make_strategy, make_universe
+from _helpers import make_store, make_strategy, make_universe, social_only_market_cfg
 
-from smt.config import Settings, StrategiesConfig, get_strategies
+from smt.config import Settings, StrategiesConfig, get_signals, get_strategies
 from smt.demo import seed_momentum
 from smt.models import ExitReason, Trade, TradeStatus, utcnow
 from smt.scorer import MomentumScorer
@@ -39,9 +39,24 @@ def test_per_strategy_allocation_sizing(tmp_path):
     d_intra = gate.evaluate(cand, intraday, manager.allocation_equity(intraday), 2500.0)
     d_swing = gate.evaluate(cand, swing, manager.allocation_equity(swing), 1500.0)
 
-    # 10% of each strategy's own half.
-    assert d_intra.notional_usd == pytest.approx(250.0)
-    assert d_swing.notional_usd == pytest.approx(150.0)
+    # 10% of each strategy's own half, times the mid-tier position multiplier.
+    mid_mult = get_signals().tier("mid").max_position_pct_mult
+    assert d_intra.notional_usd == pytest.approx(2500.0 * 0.10 * mid_mult)
+    assert d_swing.notional_usd == pytest.approx(1500.0 * 0.10 * mid_mult)
+
+
+def test_volatility_scaling_shrinks_high_vol_positions(tmp_path):
+    """A high-ATR asset gets a smaller notional than a calm one."""
+    store = make_store(tmp_path)
+    gate = RiskGate(store)
+    st = make_strategy("intraday", max_position_pct=0.10)
+
+    calm = TradeCandidate("BTC", "BTC-USD", 5.0, 20, 3, "x", "intraday", atr_pct=0.02)
+    wild = TradeCandidate("PUMP", "PUMP-USD", 5.0, 20, 3, "x", "intraday", atr_pct=0.16)
+
+    calm_notional, _ = gate.size_position(calm, st, 2500.0)
+    wild_notional, _ = gate.size_position(wild, st, 2500.0)
+    assert wild_notional < calm_notional
 
 
 def test_independent_limits(tmp_path):
@@ -125,7 +140,8 @@ def test_both_strategies_simulate_end_to_end(tmp_path):
         s.name: MomentumScorer(store, universe, s.scorer_bucket_minutes, s.scorer_lookback_buckets)
         for s in strategies
     }
-    engines = {s.name: SignalEngine(s, universe) for s in strategies}
+    market_cfg = social_only_market_cfg()
+    engines = {s.name: SignalEngine(s, universe, market_cfg=market_cfg) for s in strategies}
 
     for st in strategies:
         equity_alloc = manager.allocation_equity(st)

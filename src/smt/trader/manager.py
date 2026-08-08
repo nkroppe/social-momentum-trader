@@ -9,8 +9,9 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from ..config import Settings, StrategyConfig, UniverseConfig
+from ..config import MarketConfig, Settings, StrategyConfig, UniverseConfig, get_market
 from ..logging_setup import get_logger
+from ..market import MarketData, atr, horizon_volatility
 from ..models import ExitReason, Trade, TradeStatus, utcnow
 from ..store import Store
 from .broker import Broker
@@ -26,11 +27,15 @@ class TradeManager:
         universe: UniverseConfig,
         store: Store,
         broker: Broker,
+        market: MarketData | None = None,
+        market_cfg: MarketConfig | None = None,
     ):
         self.settings = settings
         self.universe = universe
         self.store = store
         self.broker = broker
+        self.market = market
+        self.market_cfg = market_cfg if market_cfg is not None else get_market()
 
     # ---- Equity ------------------------------------------------------------
 
@@ -76,12 +81,63 @@ class TradeManager:
 
     # ---- Entry -------------------------------------------------------------
 
+    def _atr_pct(self, product_id: str, price: float) -> float:
+        if self.market is None or price <= 0:
+            return 0.0
+        candles = self.market.candles(product_id)
+        if len(candles) < 2:
+            return 0.0
+        return atr(candles, self.market_cfg.atr_periods) / price
+
+    def horizon_volatility(self, atr_pct: float, strategy: StrategyConfig) -> float:
+        return horizon_volatility(
+            atr_pct, strategy.time_stop_hours, self.market_cfg.candle_granularity_seconds
+        )
+
+    def exit_levels(
+        self, entry_price: float, candidate: TradeCandidate, strategy: StrategyConfig
+    ) -> tuple[float, float, str]:
+        """Take-profit and stop-loss prices for this entry.
+
+        Under ATR sizing the targets track each asset's own volatility over this
+        strategy's holding period. A single fixed percentage cannot fit a
+        universe spanning BTC and a sub-cent token: it makes BTC exits
+        unreachable (so nearly every trade ends on the time stop at a random
+        price) while sitting inside the noise band of the micro cap (so it stops
+        out on nothing).
+        """
+        tp_pct = strategy.take_profit_pct
+        sl_pct = strategy.stop_loss_pct
+        note = "fixed"
+
+        if strategy.exit_style == "atr":
+            atr_pct = candidate.atr_pct or self._atr_pct(candidate.product_id, entry_price)
+            if atr_pct > 0:
+                horizon_vol = self.horizon_volatility(atr_pct, strategy)
+                sl_pct = horizon_vol * strategy.atr_stop_loss_mult
+                sl_pct = max(strategy.atr_min_stop_pct, min(sl_pct, strategy.atr_max_stop_pct))
+                # Derive TP from the clamped stop so the reward:risk ratio holds.
+                rr = strategy.atr_take_profit_mult / max(strategy.atr_stop_loss_mult, 1e-9)
+                tp_pct = sl_pct * rr
+                note = f"atr={atr_pct:.2%}/bar horizon={horizon_vol:.2%}"
+            else:
+                note = "fixed (no ATR history)"
+
+        # A target inside round-trip costs is not a trade worth taking.
+        min_tp = 3.0 * strategy.assumed_fee_pct_per_side
+        if tp_pct < min_tp:
+            tp_pct = min_tp
+            note += " tp raised to fee floor"
+
+        tp = round(entry_price * (1 + tp_pct), 8)
+        sl = round(entry_price * (1 - sl_pct), 8)
+        return tp, sl, f"{note} tp={tp_pct:.2%} sl={sl_pct:.2%}"
+
     def open_position(
         self, candidate: TradeCandidate, notional_usd: float, strategy: StrategyConfig
     ) -> Trade:
         entry_price = self.broker.current_price(candidate.product_id)
-        tp = round(entry_price * (1 + strategy.take_profit_pct), 8)
-        sl = round(entry_price * (1 - strategy.stop_loss_pct), 8)
+        tp, sl, exit_note = self.exit_levels(entry_price, candidate, strategy)
 
         fill = self.broker.open_long(candidate.product_id, notional_usd, tp, sl)
         trade = Trade(
@@ -101,7 +157,7 @@ class TradeManager:
         )
         trade = self.store.add_trade(trade)
         log.info(
-            "OPENED[%s] %s qty=%.8f entry=%.6f tp=%.6f sl=%.6f notional=$%.2f",
+            "OPENED[%s] %s qty=%.8f entry=%.6f tp=%.6f sl=%.6f notional=$%.2f (%s)",
             strategy.name,
             trade.ticker,
             trade.qty,
@@ -109,6 +165,7 @@ class TradeManager:
             tp,
             sl,
             notional_usd,
+            exit_note,
         )
         return trade
 

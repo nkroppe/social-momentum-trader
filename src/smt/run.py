@@ -8,16 +8,19 @@ from pathlib import Path
 from .config import (
     CONFIG_DIR,
     LIVE_ACK_PHRASE,
+    get_market,
     get_ops,
     get_risk,
     get_security,
     get_settings,
+    get_signals,
     get_sources,
     get_strategies,
     get_universe,
 )
 from .ingest import build_collectors
 from .logging_setup import get_logger
+from .market import MarketData
 from .ops import Alerter, KillSwitch
 from .ops.soak import SoakTracker
 from .scorer import MomentumScorer
@@ -31,14 +34,33 @@ log = get_logger("smt.run")
 
 
 class Runner:
-    def __init__(self):
+    """Orchestrates the trading loop.
+
+    `offline=True` disables all market data, which makes `smt simulate` and
+    offline dev deterministic and credential-free at the cost of skipping every
+    price gate. Never use it for a soak.
+    """
+
+    def __init__(self, offline: bool = False):
         self.settings = get_settings()
         self.risk = get_risk()
         self.universe = get_universe()
         self.sources = get_sources()
         self.security = get_security()
         self.ops = get_ops()
+        self.signals = get_signals()
         self.strategies = get_strategies().enabled()
+        self.offline = offline
+
+        self.market_cfg = get_market()
+        if offline:
+            # Make the absence of price gating explicit rather than relying on
+            # a None provider slipping past them.
+            self.market_cfg = self.market_cfg.model_copy(deep=True)
+            self.market_cfg.confirmation.enabled = False
+            self.market_cfg.confirmation.fail_closed = False
+            self.market_cfg.regime.enabled = False
+            self.market_cfg.sizing.enabled = False
 
         self._enforce_live_latches()
 
@@ -56,6 +78,8 @@ class Runner:
         self.kill = KillSwitch(self.settings.kill_file)
         self.collectors = build_collectors(self.settings, self.sources, self.universe)
 
+        self.market = None if offline else MarketData(self.market_cfg)
+
         # One scorer + signal engine per strategy (own bucket/lookback + thresholds).
         self.scorers = {
             st.name: MomentumScorer(
@@ -63,21 +87,38 @@ class Runner:
                 self.universe,
                 bucket_minutes=st.scorer_bucket_minutes,
                 lookback_buckets=st.scorer_lookback_buckets,
+                seasonal_days=st.scorer_seasonal_days,
+                seasonal_min_history_hours=st.scorer_seasonal_min_history_hours,
             )
             for st in self.strategies
         }
-        self.signal_engines = {st.name: SignalEngine(st, self.universe) for st in self.strategies}
+        self.signal_engines = {
+            st.name: SignalEngine(
+                st, self.universe, self.signals, self.market, self.market_cfg
+            )
+            for st in self.strategies
+        }
         # A general-purpose scorer (global defaults) for the `score` CLI/demos.
         self.scorer = MomentumScorer(
             self.store,
             self.universe,
             bucket_minutes=self.risk.scorer_bucket_minutes,
             lookback_buckets=self.risk.scorer_lookback_buckets,
+            seasonal_days=self.risk.scorer_seasonal_days,
+            seasonal_min_history_hours=self.risk.scorer_seasonal_min_history_hours,
         )
 
-        self.broker = build_broker(self.settings)
-        self.risk_gate = RiskGate(self.store)
-        self.manager = TradeManager(self.settings, self.universe, self.store, self.broker)
+        paper_market = self.market if self.market_cfg.paper_use_real_prices else None
+        self.broker = build_broker(self.settings, paper_market)
+        self.risk_gate = RiskGate(self.store, self.signals, self.market_cfg)
+        self.manager = TradeManager(
+            self.settings,
+            self.universe,
+            self.store,
+            self.broker,
+            self.market,
+            self.market_cfg,
+        )
         self.soak = SoakTracker(Path(self.ops.soak.state_file))
         self._last_ingest = 0.0
         self._last_digest = 0.0
@@ -97,6 +138,16 @@ class Runner:
             self.sources.x.enabled,
             self.sources.mock.enabled,
         )
+        if self.market is None:
+            log.warning("OFFLINE: price confirmation, regime filter, and ATR exits are disabled")
+        else:
+            regime_ok, regime_detail = self.market.regime_ok()
+            log.info("Regime: %s (%s)", "RISK-ON" if regime_ok else "RISK-OFF", regime_detail)
+            tiers = ", ".join(
+                f"{t}={self.universe.tier_of(t, self.signals.default_tier)}"
+                for t in self.universe.symbols
+            )
+            log.info("Universe tiers: %s", tiers)
         log.info(
             "Runner ready in %s mode (broker=%s) strategies=[%s]",
             mode,

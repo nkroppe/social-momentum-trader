@@ -26,8 +26,12 @@ x:
     - "$HYPE"
     - "$ZEC"
     - "$PUMP"
-  max_results_per_query: 10
+  # 100 is the API max. A z-score computed on 10 samples is mostly noise, and
+  # the monthly read budget is nowhere near binding at this poll interval.
+  max_results_per_query: 100
   mention_weight: 2.0        # X mentions weighted higher than Reddit in scorer
+  exclude_retweets: true     # spend budget on original posts, not amplification
+  exclude_replies: true
 
 # Mock off for VPS paper soak — X-only. Set enabled: true for local dev without API keys.
 mock:

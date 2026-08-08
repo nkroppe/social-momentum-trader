@@ -7,6 +7,7 @@ from typing import Protocol, runtime_checkable
 
 from ..config import Settings, get_security
 from ..logging_setup import get_logger
+from ..market import MarketData
 
 log = get_logger("smt.broker")
 
@@ -35,11 +36,12 @@ class Broker(Protocol):
     def close_long(self, product_id: str, qty: float) -> Fill: ...
 
 
-def build_broker(settings: Settings) -> Broker:
+def build_broker(settings: Settings, market: MarketData | None = None) -> Broker:
     """Return a live Coinbase broker if LIVE and fully configured, else paper.
 
     The live path enforces the trade-only-key guardrails on construction and
-    will raise if the API key can transfer funds.
+    will raise if the API key can transfer funds. `market` lets the paper broker
+    quote real prices so soak results reflect the live market.
     """
     if settings.live and settings.coinbase_configured:
         from .coinbase import CoinbaseBroker
@@ -52,5 +54,6 @@ def build_broker(settings: Settings) -> Broker:
 
     from .paper import PaperBroker
 
-    log.info("PAPER mode: constructing simulated broker")
-    return PaperBroker()
+    source = "real Coinbase quotes" if market is not None else "simulated random walk"
+    log.info("PAPER mode: constructing simulated broker (%s)", source)
+    return PaperBroker(market=market)

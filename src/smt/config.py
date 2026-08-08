@@ -93,12 +93,39 @@ class RiskConfig(BaseModel):
     time_stop_hours: int = 6
     min_order_notional_usd: float = 25
     assumed_fee_pct_per_side: float = 0.006
+
+    # Exit sizing. "atr" scales targets to each asset's own volatility so one
+    # rule fits both BTC and a sub-cent token; "fixed" uses the flat pcts above.
+    exit_style: str = "atr"
+    atr_take_profit_mult: float = 2.0
+    atr_stop_loss_mult: float = 1.0
+    atr_min_stop_pct: float = 0.008
+    atr_max_stop_pct: float = 0.15
+
     # Signal entry thresholds
     signal_min_zscore: float = 2.5
-    signal_min_distinct_sources: int = 2
+    signal_min_distinct_sources: int = 1
+    signal_min_distinct_authors: int = 3
     signal_min_mentions: int = 8
+    signal_min_bullish_ratio: float = 0.60
     scorer_bucket_minutes: int = 30
     scorer_lookback_buckets: int = 8
+    # Baseline the current bucket against the same clock window on prior days
+    # once this much history exists, removing the daily social cycle.
+    scorer_seasonal_days: int = 7
+    scorer_seasonal_min_history_hours: int = 48
+
+    # Price confirmation: hours of trailing return required to be positive
+    # before a social spike is treated as an entry.
+    confirm_lookback_hours: int = 4
+    confirm_min_return_pct: float = 0.0
+
+    @field_validator("exit_style")
+    @classmethod
+    def _valid_exit_style(cls, v: str) -> str:
+        if v not in ("atr", "fixed"):
+            raise ValueError("exit_style must be 'atr' or 'fixed'")
+        return v
 
 
 # Maximum allowed hold before a time-stop, across any strategy.
@@ -109,11 +136,22 @@ _INHERITED_FIELDS = (
     "take_profit_pct",
     "stop_loss_pct",
     "time_stop_hours",
+    "exit_style",
+    "atr_take_profit_mult",
+    "atr_stop_loss_mult",
+    "atr_min_stop_pct",
+    "atr_max_stop_pct",
     "signal_min_zscore",
     "signal_min_distinct_sources",
+    "signal_min_distinct_authors",
     "signal_min_mentions",
+    "signal_min_bullish_ratio",
     "scorer_bucket_minutes",
     "scorer_lookback_buckets",
+    "scorer_seasonal_days",
+    "scorer_seasonal_min_history_hours",
+    "confirm_lookback_hours",
+    "confirm_min_return_pct",
     "max_position_pct",
     "max_open_positions",
     "max_trades_per_day",
@@ -140,13 +178,26 @@ class StrategyConfig(BaseModel):
     take_profit_pct: float
     stop_loss_pct: float
     time_stop_hours: int
+    exit_style: str
+    atr_take_profit_mult: float
+    atr_stop_loss_mult: float
+    atr_min_stop_pct: float
+    atr_max_stop_pct: float
 
     # Signal thresholds + scorer windowing
     signal_min_zscore: float
     signal_min_distinct_sources: int
+    signal_min_distinct_authors: int
     signal_min_mentions: int
+    signal_min_bullish_ratio: float
     scorer_bucket_minutes: int
     scorer_lookback_buckets: int
+    scorer_seasonal_days: int
+    scorer_seasonal_min_history_hours: int
+
+    # Price confirmation window
+    confirm_lookback_hours: int
+    confirm_min_return_pct: float
 
     # Per-strategy hard limits (independent of the other strategy)
     max_position_pct: float
@@ -172,6 +223,13 @@ class StrategyConfig(BaseModel):
             raise ValueError("allocation must be within 0.0..1.0")
         return v
 
+    @field_validator("exit_style")
+    @classmethod
+    def _valid_strategy_exit_style(cls, v: str) -> str:
+        if v not in ("atr", "fixed"):
+            raise ValueError("exit_style must be 'atr' or 'fixed'")
+        return v
+
 
 class StrategiesConfig(BaseModel):
     strategies: dict[str, StrategyConfig] = Field(default_factory=dict)
@@ -193,6 +251,8 @@ class StrategiesConfig(BaseModel):
 class SymbolSpec(BaseModel):
     product_id: str
     aliases: list[str] = Field(default_factory=list)
+    # Liquidity/market-cap bucket; selects a tier profile from signals.yaml.
+    tier: str = "mid"
 
 
 class UniverseConfig(BaseModel):
@@ -202,6 +262,10 @@ class UniverseConfig(BaseModel):
 
     def tradeable(self, ticker: str) -> bool:
         return ticker in self.symbols and ticker not in self.denylist
+
+    def tier_of(self, ticker: str, default: str = "mid") -> str:
+        spec = self.symbols.get(ticker)
+        return spec.tier if spec else default
 
 
 class RedditSource(BaseModel):
@@ -214,8 +278,18 @@ class XSource(BaseModel):
     enabled: bool = False
     watch_accounts: list[str] = Field(default_factory=list)
     keywords: list[str] = Field(default_factory=list)
-    max_results_per_query: int = 10
+    max_results_per_query: int = 100
     mention_weight: float = 2.0
+    # Ask X to exclude retweets/replies server-side so budget is spent on
+    # original posts rather than amplification noise.
+    exclude_retweets: bool = True
+    exclude_replies: bool = True
+
+    @field_validator("max_results_per_query")
+    @classmethod
+    def _valid_max_results(cls, v: int) -> int:
+        # X recent-search accepts 10..100.
+        return max(10, min(v, 100))
 
 
 class MockSource(BaseModel):
@@ -262,6 +336,125 @@ class OpsConfig(BaseModel):
     preflight: PreflightConfig = Field(default_factory=PreflightConfig)
 
 
+# ----------------------------------------------------------------------------
+# Market data / price confirmation
+# ----------------------------------------------------------------------------
+
+
+class ConfirmationConfig(BaseModel):
+    """Price + volume confirmation applied on top of a social signal."""
+
+    enabled: bool = True
+    # No market data -> no entry. Social attention alone is not evidence.
+    fail_closed: bool = True
+    require_above_sma: bool = True
+    sma_periods: int = 24
+    require_positive_return: bool = True
+    min_volume_zscore: float = 0.0
+    volume_periods: int = 24
+
+
+class RegimeConfig(BaseModel):
+    """Benchmark trend filter: block new longs in a broad downtrend."""
+
+    enabled: bool = True
+    benchmark_product_id: str = "BTC-USD"
+    granularity_seconds: int = 86_400
+    sma_periods: int = 50
+    fail_closed: bool = True
+
+
+class VolSizingConfig(BaseModel):
+    """Scale notional down for high-volatility assets.
+
+    Scale is capped at 1.0 so this can only ever reduce exposure below the hard
+    max_position_pct limit, never raise it.
+    """
+
+    enabled: bool = True
+    target_atr_pct: float = 0.02
+    min_scale: float = 0.25
+    max_scale: float = 1.0
+
+
+class MarketConfig(BaseModel):
+    candle_granularity_seconds: int = 3_600
+    atr_periods: int = 14
+    cache_ttl_seconds: int = 300
+    price_cache_ttl_seconds: int = 20
+    request_timeout_seconds: float = 15.0
+    unavailable_retry_seconds: int = 900
+    # Paper fills price off real Coinbase quotes so soak results reflect the
+    # same market the live path would trade.
+    paper_use_real_prices: bool = True
+    confirmation: ConfirmationConfig = Field(default_factory=ConfirmationConfig)
+    regime: RegimeConfig = Field(default_factory=RegimeConfig)
+    sizing: VolSizingConfig = Field(default_factory=VolSizingConfig)
+
+
+# ----------------------------------------------------------------------------
+# Social signal quality
+# ----------------------------------------------------------------------------
+
+
+class SpamFilterConfig(BaseModel):
+    enabled: bool = True
+    drop_retweets: bool = True
+    max_cashtags_per_post: int = 4
+    max_urls_per_post: int = 2
+    min_author_followers: int = 100
+    min_text_chars: int = 15
+    dedup_window_minutes: int = 120
+    max_posts_per_author_per_window: int = 3
+    blocklist_phrases: list[str] = Field(default_factory=list)
+
+
+class SentimentConfig(BaseModel):
+    enabled: bool = True
+    bullish_terms: list[str] = Field(default_factory=list)
+    bearish_terms: list[str] = Field(default_factory=list)
+    negations: list[str] = Field(default_factory=lambda: ["not", "no", "never", "isnt", "aint"])
+    # Drop posts with no directional language at all.
+    require_directional: bool = False
+
+
+SIGNAL_MODES = ("social", "trend", "hybrid")
+
+
+class TierConfig(BaseModel):
+    """Per-liquidity-tier overrides.
+
+    Majors are efficient enough that raw attention is weak and often contrarian,
+    so they default to `trend`; micro-caps are where social genuinely leads.
+    """
+
+    signal_mode: str = "hybrid"
+    zscore_mult: float = 1.0
+    min_mentions_mult: float = 1.0
+    min_trailing_return_pct: float = 0.0
+    max_position_pct_mult: float = 1.0
+
+    @field_validator("signal_mode")
+    @classmethod
+    def _valid_mode(cls, v: str) -> str:
+        if v not in SIGNAL_MODES:
+            raise ValueError(f"signal_mode must be one of {SIGNAL_MODES}")
+        return v
+
+
+class SignalsConfig(BaseModel):
+    default_tier: str = "mid"
+    # Minimum posts carrying directional language before the bullish ratio is
+    # trusted; below this the ratio is too noisy to gate on.
+    min_sentiment_posts: int = 5
+    spam: SpamFilterConfig = Field(default_factory=SpamFilterConfig)
+    sentiment: SentimentConfig = Field(default_factory=SentimentConfig)
+    tiers: dict[str, TierConfig] = Field(default_factory=dict)
+
+    def tier(self, name: str) -> TierConfig:
+        return self.tiers.get(name) or self.tiers.get(self.default_tier) or TierConfig()
+
+
 # Must match LIVE_ACK env value for live trading.
 LIVE_ACK_PHRASE = "I_UNDERSTAND_LIVE_RISK"
 
@@ -302,6 +495,16 @@ def get_security() -> SecurityConfig:
 @lru_cache(maxsize=1)
 def get_ops() -> OpsConfig:
     return OpsConfig(**_load_yaml("ops.yaml"))
+
+
+@lru_cache(maxsize=1)
+def get_market() -> MarketConfig:
+    return MarketConfig(**_load_yaml("market.yaml"))
+
+
+@lru_cache(maxsize=1)
+def get_signals() -> SignalsConfig:
+    return SignalsConfig(**_load_yaml("signals.yaml"))
 
 
 @lru_cache(maxsize=1)
