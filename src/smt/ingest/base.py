@@ -21,15 +21,21 @@ class Collector(Protocol):
 
 
 def _build_alias_index(universe: UniverseConfig) -> tuple[dict[str, str], set[str]]:
-    """Map lowercased alias -> ticker, plus the aliases that require a `$`."""
+    """Map lowercased alias -> ticker, plus the aliases that require a `$`.
+
+    `require_cashtag` constrains the ticker symbol itself, which is the form that
+    collides with ordinary words. Descriptive aliases ("pumpfun") are unambiguous
+    and keep matching as plain text.
+    """
     index: dict[str, str] = {}
     cashtag_only: set[str] = set()
     for ticker, spec in universe.symbols.items():
-        aliases = {ticker.lower()} | {a.lower().lstrip("$") for a in spec.aliases}
+        symbol = ticker.lower()
+        aliases = {symbol} | {a.lower().lstrip("$") for a in spec.aliases}
         aliases.discard("")
         for alias in aliases:
             index[alias] = ticker
-            if spec.require_cashtag:
+            if spec.require_cashtag and alias == symbol:
                 cashtag_only.add(alias)
     return index, cashtag_only
 

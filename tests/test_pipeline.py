@@ -28,6 +28,11 @@ def _cashtag_universe() -> UniverseConfig:
         quote_currency="USD",
         symbols={
             "CAP": {"product_id": "CAP-USD", "aliases": ["$cap"], "require_cashtag": True},
+            "PUMP": {
+                "product_id": "PUMP-USD",
+                "aliases": ["pumpfun", "pump.fun", "$pump"],
+                "require_cashtag": True,
+            },
             "SOL": {"product_id": "SOL-USD", "aliases": ["sol", "solana"]},
         },
     )
@@ -46,6 +51,16 @@ def test_cashtag_only_ticker_still_matches_the_cashtag():
     assert extract_tickers("accumulating $CAP here", u) == {"CAP"}
     # Mixed post: the cashtag rule must not suppress ordinary aliases.
     assert extract_tickers("$CAP and solana both bid", u) == {"CAP", "SOL"}
+
+
+def test_cashtag_rule_applies_to_the_symbol_not_descriptive_aliases():
+    """"pump" is ambiguous; "pumpfun" is not, so only the symbol needs the $."""
+    u = _cashtag_universe()
+    assert extract_tickers("classic pump and dump", u) == set()
+    assert extract_tickers("pumpfun volume is climbing", u) == {"PUMP"}
+    assert extract_tickers("$PUMP breaking out", u) == {"PUMP"}
+    # Word boundaries already handled the inflected forms.
+    assert extract_tickers("this thing is pumping", u) == set()
 
 
 def test_velocity_signal_fires_on_burst(tmp_path):

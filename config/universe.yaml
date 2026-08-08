@@ -38,7 +38,10 @@ symbols:
   PUMP:
     product_id: PUMP-USD
     tier: micro
-    aliases: ["pump", "pumpfun", "pump.fun", "pump fun", "$pump"]
+    # "pump and dump" / "this is a pump" are not mentions of the token, so the
+    # bare symbol needs the $ form. The pumpfun spellings stay unambiguous.
+    require_cashtag: true
+    aliases: ["pumpfun", "pump.fun", "pump fun", "$pump"]
   BICO:
     product_id: BICO-USD
     tier: micro

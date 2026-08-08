@@ -87,6 +87,34 @@ def _market_data_checks() -> list[CheckResult]:
     return results
 
 
+def _x_budget_check(settings) -> CheckResult:
+    """Project this month's X read burn against the configured budget.
+
+    Reads are billed per tweet returned, so a short poll interval across many
+    cashtags burns budget far faster than the interval alone suggests. An
+    exhausted budget silently stops ingest, which would leave a soak collecting
+    nothing, so surface the trajectory before that happens.
+    """
+    from calendar import monthrange
+    from datetime import UTC, datetime
+
+    from ..ingest.x import ReadBudget
+
+    limit = settings.x_monthly_read_budget
+    used = ReadBudget(Path("./data/x_budget.json"), limit).reads_used
+
+    now = datetime.now(UTC)
+    days_in_month = monthrange(now.year, now.month)[1]
+    # Elapsed fraction of the month, floored so day 1 does not divide by ~0.
+    elapsed = max((now.day - 1) + now.hour / 24.0, 0.25)
+    projected = int(used / elapsed * days_in_month)
+
+    detail = f"{used:,}/{limit:,} used, on track for ~{projected:,} by month end"
+    if used == 0:
+        return CheckResult("x_read_budget", True, f"{used:,}/{limit:,} used this month")
+    return CheckResult("x_read_budget", projected <= limit, detail)
+
+
 def run_preflight(profile: str = "production") -> list[CheckResult]:
     """Run checks for dev, production (VPS paper), or live profiles."""
     settings = get_settings()
@@ -165,6 +193,8 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
                 "configured" if x_ok else "set X_BEARER_TOKEN",
             )
         )
+        if x_ok:
+            results.append(_x_budget_check(settings))
 
     if ops.preflight.require_alert_channel:
         alerts = _alert_channel_configured(settings)
