@@ -229,6 +229,27 @@ class SecurityConfig(BaseModel):
     min_paper_soak_days: int = 14
 
 
+class SoakOpsConfig(BaseModel):
+    state_file: str = "./data/soak.json"
+    digest_interval_hours: int = 24
+
+
+class PreflightConfig(BaseModel):
+    require_reddit: bool = True
+    require_x: bool = True
+    require_alert_channel: bool = True
+    require_postgres: bool = True
+
+
+class OpsConfig(BaseModel):
+    soak: SoakOpsConfig = Field(default_factory=SoakOpsConfig)
+    preflight: PreflightConfig = Field(default_factory=PreflightConfig)
+
+
+# Must match LIVE_ACK env value for live trading.
+LIVE_ACK_PHRASE = "I_UNDERSTAND_LIVE_RISK"
+
+
 def _load_yaml(name: str) -> dict:
     path = CONFIG_DIR / name
     if not path.exists():
@@ -260,6 +281,11 @@ def get_sources() -> SourcesConfig:
 @lru_cache(maxsize=1)
 def get_security() -> SecurityConfig:
     return SecurityConfig(**_load_yaml("security.yaml"))
+
+
+@lru_cache(maxsize=1)
+def get_ops() -> OpsConfig:
+    return OpsConfig(**_load_yaml("ops.yaml"))
 
 
 @lru_cache(maxsize=1)

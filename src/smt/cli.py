@@ -102,6 +102,49 @@ def _cmd_clear_kill(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    from .ops.preflight import all_passed, run_preflight
+
+    if args.live:
+        profile = "live"
+    elif args.dev:
+        profile = "dev"
+    else:
+        profile = "production"
+    results = run_preflight(profile)
+    print(f"Preflight profile: {profile}\n")
+    for r in results:
+        mark = "PASS" if r.passed else "FAIL"
+        print(f"[{mark}] {r.name}: {r.detail}")
+    if all_passed(results):
+        print("\nAll checks passed.")
+        return 0
+    print("\nOne or more checks failed.")
+    return 1
+
+
+def _cmd_test_alerts(_args: argparse.Namespace) -> int:
+    from .config import get_settings
+    from .ops import Alerter
+
+    Alerter(get_settings()).notify(
+        "SMT test alert",
+        "If you received this, alert channels are working.",
+        critical=True,
+    )
+    print("Test alert dispatched (check email / ntfy / Telegram).")
+    return 0
+
+
+def _cmd_soak_report(args: argparse.Namespace) -> int:
+    from .run import Runner
+
+    r = Runner()
+    print(r.soak.summary_line(r.security.min_paper_soak_days))
+    print()
+    return _cmd_compare(args)
+
+
 def _cmd_simulate(args: argparse.Namespace) -> int:
     """Deterministic end-to-end demo exercising BOTH strategies.
 
@@ -193,6 +236,18 @@ def build_parser() -> argparse.ArgumentParser:
     k.set_defaults(func=_cmd_kill)
 
     sub.add_parser("clear-kill", help="Clear the kill switch").set_defaults(func=_cmd_clear_kill)
+
+    doc = sub.add_parser("doctor", help="Run deployment / go-live preflight checks")
+    doc.add_argument("--dev", action="store_true", help="Minimal dev checks only")
+    doc.add_argument("--live", action="store_true", help="Include Coinbase go-live checks")
+    doc.set_defaults(func=_cmd_doctor)
+
+    sub.add_parser("test-alerts", help="Send a test alert to configured channels").set_defaults(
+        func=_cmd_test_alerts
+    )
+    sub.add_parser(
+        "soak-report", help="Paper soak progress + strategy comparison"
+    ).set_defaults(func=_cmd_soak_report)
 
     sim = sub.add_parser("simulate", help="Deterministic end-to-end paper demo")
     sim.add_argument("--ticker", default="SOL")

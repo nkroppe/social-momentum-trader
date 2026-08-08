@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 from .config import (
+    LIVE_ACK_PHRASE,
+    get_ops,
     get_risk,
     get_security,
     get_settings,
@@ -15,6 +18,7 @@ from .config import (
 from .ingest import build_collectors
 from .logging_setup import get_logger
 from .ops import Alerter, KillSwitch
+from .ops.soak import SoakTracker
 from .scorer import MomentumScorer
 from .store import Store
 from .trader.broker import build_broker
@@ -24,8 +28,6 @@ from .trader.signals import SignalEngine
 
 log = get_logger("smt.run")
 
-LIVE_ACK_PHRASE = "I_UNDERSTAND_LIVE_RISK"
-
 
 class Runner:
     def __init__(self):
@@ -34,6 +36,7 @@ class Runner:
         self.universe = get_universe()
         self.sources = get_sources()
         self.security = get_security()
+        self.ops = get_ops()
         self.strategies = get_strategies().enabled()
 
         self._enforce_live_latches()
@@ -67,8 +70,15 @@ class Runner:
         self.broker = build_broker(self.settings)
         self.risk_gate = RiskGate(self.store)
         self.manager = TradeManager(self.settings, self.universe, self.store, self.broker)
+        self.soak = SoakTracker(Path(self.ops.soak.state_file))
         self._last_ingest = 0.0
+        self._last_digest = 0.0
+        self._digest_interval_s = self.ops.soak.digest_interval_hours * 3600
         self._killed_notified = False
+        self._halt_notified: set[str] = set()
+
+        if self.broker.name == "paper":
+            self.soak.ensure_started("paper")
 
         mode = "LIVE" if self.broker.name == "coinbase" else "PAPER"
         names = ", ".join(f"{st.name}({st.allocation:.0%})" for st in self.strategies)
@@ -89,8 +99,19 @@ class Runner:
                 "LIVE=true but LIVE_ACK != %s -> forcing PAPER mode for safety.",
                 LIVE_ACK_PHRASE,
             )
-            # Mutate the cached settings object so downstream build_broker sees paper.
             self.settings.live = False
+            return
+
+        if self.settings.live:
+            tracker = SoakTracker(Path(self.ops.soak.state_file))
+            min_days = self.security.min_paper_soak_days
+            if not tracker.meets_minimum(min_days):
+                log.critical(
+                    "LIVE=true but paper soak only %.1f days (need %d) -> forcing PAPER.",
+                    tracker.days_elapsed(),
+                    min_days,
+                )
+                self.settings.live = False
 
     # ---- one iteration -----------------------------------------------------
 
@@ -111,8 +132,21 @@ class Runner:
     def evaluate_and_trade(self) -> None:
         """Evaluate each strategy independently against its own allocation."""
         for st in self.strategies:
-            equity_alloc = self.manager.allocation_equity(st)
             start_alloc = self.manager.allocation_start_equity(st)
+            halted, why = self.risk_gate.portfolio_halted(st, start_alloc)
+            if halted:
+                if st.name not in self._halt_notified:
+                    self.alerter.notify(
+                        f"Loss halt [{st.name}]",
+                        why,
+                        critical=True,
+                    )
+                    self.store.add_security_event("loss_halt", f"{st.name}: {why}", "WARNING")
+                    self._halt_notified.add(st.name)
+                continue
+            self._halt_notified.discard(st.name)
+
+            equity_alloc = self.manager.allocation_equity(st)
             scores = self.scorers[st.name].score_all()
             candidates = self.signal_engines[st.name].candidates(scores)
             for cand in candidates:
@@ -121,7 +155,26 @@ class Runner:
                     log.info("REJECT[%s] %s: %s", st.name, cand.ticker, decision.reason)
                     continue
                 self.manager.open_position(cand, decision.notional_usd, st)
-                equity_alloc = self.manager.allocation_equity(st)  # refresh after deploying
+                equity_alloc = self.manager.allocation_equity(st)
+
+    def _send_digest(self) -> None:
+        """Periodic soak summary to configured alert channels (non-critical)."""
+        lines = [
+            self.soak.summary_line(self.security.min_paper_soak_days),
+            f"Mode: {'LIVE' if self.broker.name == 'coinbase' else 'PAPER'}",
+            "",
+        ]
+        for st in self.strategies:
+            s = self.store.strategy_stats(st.name)
+            alloc_eq = self.manager.allocation_equity(st)
+            lines.append(
+                f"[{st.name}] alloc_eq=${alloc_eq:.2f} open={s['open_positions']} "
+                f"closed={s['closed_trades']} win={s['win_rate']:.0%} "
+                f"pnl=${s['total_pnl']:.2f} pnl_24h=${s['day_pnl']:.2f}"
+            )
+        body = "\n".join(lines)
+        self.alerter.notify("Daily soak digest", body, critical=False)
+        log.info("Sent soak digest")
 
     def step(self) -> None:
         # 1) Kill switch: flatten and block entries.
@@ -152,12 +205,15 @@ class Runner:
 
     def run_forever(self) -> None:
         log.info("Starting main loop (interval=%ds)", self.settings.loop_interval_seconds)
-        # Prime with an initial ingest so scores have data.
         self.ingest()
         self._last_ingest = time.monotonic()
+        self._last_digest = time.monotonic()
         while True:
             try:
                 self.step()
+                if time.monotonic() - self._last_digest >= self._digest_interval_s:
+                    self._send_digest()
+                    self._last_digest = time.monotonic()
             except Exception as exc:  # noqa: BLE001
                 log.exception("loop error: %s", exc)
                 self.alerter.notify("Loop error", str(exc))

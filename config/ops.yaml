@@ -1,0 +1,12 @@
+# Ops: soak tracking, periodic digests, and deployment preflight checks.
+
+soak:
+  state_file: ./data/soak.json
+  digest_interval_hours: 24
+
+preflight:
+  # Production VPS profile requires real Reddit + X (mock disabled in sources.yaml).
+  require_reddit: true
+  require_x: true
+  require_alert_channel: true
+  require_postgres: true

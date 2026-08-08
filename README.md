@@ -67,7 +67,9 @@ the `simulate` demo run with zero external accounts.
 - `config/universe.yaml` - tradeable USD spot pairs + mention aliases
 - `config/sources.yaml` - Reddit/X polling + mock toggle
 - `config/security.yaml` - fund-protection controls
+- `config/ops.yaml` - soak tracking, digest interval, preflight requirements
 - `.env` (copy from `.env.example`) - secrets + mode flags
+- `.env.production.example` - VPS production template (Postgres, alerts, no mock)
 
 ### X (Twitter) production setup
 
@@ -112,11 +114,32 @@ See `docs/compromise-runbook.md` and the fund-protection layers below.
 
 ## Deploy on the VPS
 
+See [docs/deploy-vps.md](docs/deploy-vps.md) for the full guide. Quick path:
+
 ```bash
-cp .env.example .env    # fill in secrets; set DATABASE_URL to Postgres
+sudo bash scripts/vps-setup.sh          # once, as root
+cp .env.production.example .env         # fill Reddit, X, Postgres, alerts
+# set mock.enabled: false in config/sources.yaml
 docker compose up -d --build
+docker compose exec trader smt doctor     # verify VPS paper config
 docker compose logs -f trader
 ```
+
+During the paper soak, the bot tracks elapsed days in `data/soak.json`, sends
+daily digest alerts, and blocks live mode until the minimum soak is met.
+
+## Ops commands
+
+```bash
+smt doctor              # production preflight (VPS paper profile)
+smt doctor --dev        # minimal config checks for local dev
+smt doctor --live       # go-live checks (Coinbase key, soak duration, LIVE flags)
+smt test-alerts         # send a test alert to configured channels
+smt soak-report         # soak progress + strategy comparison
+```
+
+Before enabling live trading, complete [docs/go-live-checklist.md](docs/go-live-checklist.md)
+and run `smt doctor --live` until all checks pass.
 
 ## Kill switch
 
@@ -140,11 +163,11 @@ src/smt/
   ingest/   reddit, x, mock + ticker extraction
   scorer/   mention-velocity z-score
   trader/   signals (per-strategy), risk gate (per-strategy), paper + coinbase brokers, trade manager
-  ops/      alerts, kill switch
+  ops/      alerts, kill switch, soak tracker, preflight (doctor)
   demo.py   deterministic seeding for simulate/tests
   run.py    orchestrator     cli.py  CLI
-config/     risk, strategies, universe, sources, security
-docs/       venue.md, compromise-runbook.md
+config/     risk, strategies, universe, sources, security, ops
+docs/       venue.md, deploy-vps.md, go-live-checklist.md, compromise-runbook.md
 ```
 
 ## Roadmap
