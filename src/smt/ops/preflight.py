@@ -94,6 +94,11 @@ def _x_budget_check(settings) -> CheckResult:
     cashtags burns budget far faster than the interval alone suggests. An
     exhausted budget silently stops ingest, which would leave a soak collecting
     nothing, so surface the trajectory before that happens.
+
+    The rate is measured against time spent polling, not the elapsed month: a
+    bot started on the 8th has spent nothing on the first seven days, and
+    averaging over them would report a comfortable burn while the budget is
+    hours from running out.
     """
     from calendar import monthrange
     from datetime import UTC, datetime
@@ -101,18 +106,28 @@ def _x_budget_check(settings) -> CheckResult:
     from ..ingest.x import ReadBudget
 
     limit = settings.x_monthly_read_budget
-    used = ReadBudget(Path("./data/x_budget.json"), limit).reads_used
+    budget = ReadBudget(Path("./data/x_budget.json"), limit)
+    used = budget.reads_used
+    started = budget.started_at
+
+    if used == 0 or started is None:
+        return CheckResult("x_read_budget", True, f"{used:,}/{limit:,} used this month")
 
     now = datetime.now(UTC)
-    days_in_month = monthrange(now.year, now.month)[1]
-    # Elapsed fraction of the month, floored so day 1 does not divide by ~0.
-    elapsed = max((now.day - 1) + now.hour / 24.0, 0.25)
-    projected = int(used / elapsed * days_in_month)
+    # Floor the window so the first few minutes cannot imply an absurd rate.
+    hours = max((now - started).total_seconds() / 3600.0, 0.5)
+    per_day = used / hours * 24.0
 
-    detail = f"{used:,}/{limit:,} used, on track for ~{projected:,} by month end"
-    if used == 0:
-        return CheckResult("x_read_budget", True, f"{used:,}/{limit:,} used this month")
-    return CheckResult("x_read_budget", projected <= limit, detail)
+    days_in_month = monthrange(now.year, now.month)[1]
+    days_left = max(days_in_month - ((now.day - 1) + now.hour / 24.0), 0.0)
+    projected = used + per_day * days_left
+
+    return CheckResult(
+        "x_read_budget",
+        projected <= limit,
+        f"{used:,}/{limit:,} used over {hours:.1f}h "
+        f"(~{per_day:,.0f}/day, ~{projected:,.0f} by month end)",
+    )
 
 
 def run_preflight(profile: str = "production") -> list[CheckResult]:

@@ -62,11 +62,29 @@ class ReadBudget:
     def remaining(self) -> int:
         return max(0, self.monthly_limit - self.reads_used)
 
+    @property
+    def started_at(self) -> datetime | None:
+        """When this month's first read was recorded.
+
+        A burn rate has to be measured against time actually spent polling. A
+        bot started mid-month has spent nothing on the days before it existed,
+        so dividing by the elapsed month understates the real rate badly.
+        """
+        raw = self._load().get("started_at")
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
     def consume(self, count: int) -> None:
         if count <= 0:
             return
         data = self._load()
         data["reads"] = int(data.get("reads", 0)) + count
+        data.setdefault("started_at", datetime.now(UTC).isoformat())
         self._save(data)
 
     def check(self, needed: int = 1) -> None:
