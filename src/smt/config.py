@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -11,7 +12,22 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Repo root = two levels up from this file (src/smt/config.py -> repo root).
 REPO_ROOT = Path(__file__).resolve().parents[2]
-CONFIG_DIR = REPO_ROOT / "config"
+
+
+def _resolve_config_dir() -> Path:
+    """Find config/ for dev (repo), editable installs, and Docker (/app/config)."""
+    if override := os.environ.get("SMT_CONFIG_DIR"):
+        return Path(override)
+    container = Path("/app/config")
+    if (container / "sources.yaml").exists():
+        return container
+    local = REPO_ROOT / "config"
+    if (local / "sources.yaml").exists():
+        return local
+    return local
+
+
+CONFIG_DIR = _resolve_config_dir()
 
 
 class Settings(BaseSettings):

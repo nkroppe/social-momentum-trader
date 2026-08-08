@@ -26,12 +26,14 @@ services:
     env_file:
       - .env
     environment:
+      SMT_CONFIG_DIR: /app/config
       # Inside compose, reach Postgres by service name.
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://smt:${POSTGRES_PASSWORD:-smt}@postgres:5432/smt}
       # Kill switch lives in a bind-mounted control dir: `touch control/KILL`
       # on the host to stop trading without SSH into the container.
       KILL_FILE: /app/control/KILL
     volumes:
+      - ./config:/app/config:ro
       - ./data:/app/data
       - ./logs:/app/logs
       - ./control:/app/control
