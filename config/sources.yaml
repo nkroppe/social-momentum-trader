@@ -1,6 +1,9 @@
 # Social sources config. Ingest polls on a schedule (hours->intraday horizon).
 
-poll_interval_seconds: 300   # 5 min
+# X bills per tweet returned, so the poll interval is the main cost lever.
+# 15 min is well inside the 6h intraday hold: social momentum does not decay
+# fast enough for 5-minute resolution to buy anything the strategy can use.
+poll_interval_seconds: 900   # 15 min
 
 reddit:
   enabled: false   # enable when REDDIT_* creds are approved
@@ -28,9 +31,10 @@ x:
     - "$PUMP"
     - "$BICO"
     - "$CAP"
-  # 100 is the API max. A z-score computed on 10 samples is mostly noise, and
-  # the monthly read budget is nowhere near binding at this poll interval.
-  max_results_per_query: 100
+  # 100 is the API max, but the budget binds hard: measured burn at 100 was
+  # ~42k reads/day against a 50k monthly cap. This clips the busiest cashtags
+  # (which are also the spammiest) while leaving the quiet ones untouched.
+  max_results_per_query: 25
   mention_weight: 2.0        # X mentions weighted higher than Reddit in scorer
   exclude_retweets: true     # spend budget on original posts, not amplification
   exclude_replies: true
