@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from .config import (
+    CONFIG_DIR,
     LIVE_ACK_PHRASE,
     get_ops,
     get_risk,
@@ -40,6 +41,13 @@ class Runner:
         self.strategies = get_strategies().enabled()
 
         self._enforce_live_latches()
+
+        sources_path = CONFIG_DIR / "sources.yaml"
+        if not sources_path.exists():
+            raise FileNotFoundError(
+                f"Missing {sources_path}. Restore config/ from git "
+                f"(git checkout config/) and ensure docker mounts ./config to /app/config."
+            )
 
         self.store = Store(self.settings.database_url)
         self.store.init_db()
@@ -82,6 +90,13 @@ class Runner:
 
         mode = "LIVE" if self.broker.name == "coinbase" else "PAPER"
         names = ", ".join(f"{st.name}({st.allocation:.0%})" for st in self.strategies)
+        log.info(
+            "Config dir=%s | reddit=%s x=%s mock=%s",
+            CONFIG_DIR,
+            self.sources.reddit.enabled,
+            self.sources.x.enabled,
+            self.sources.mock.enabled,
+        )
         log.info(
             "Runner ready in %s mode (broker=%s) strategies=[%s]",
             mode,
