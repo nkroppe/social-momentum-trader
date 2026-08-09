@@ -163,6 +163,18 @@ def test_weekly_report_caps_the_trade_list(tmp_path):
     assert "... and 6 more" in body
 
 
+def test_weekly_report_counts_breakeven_separately(tmp_path):
+    store = make_store(tmp_path)
+    end = datetime(2026, 8, 16, 20, tzinfo=UTC)
+    start = end - timedelta(days=7)
+    _closed_trade(store, "SOL", 10.0, closed_at=end - timedelta(hours=2))
+    _closed_trade(store, "BTC", -5.0, closed_at=end - timedelta(hours=3))
+    _closed_trade(store, "ETH", 0.0, closed_at=end - timedelta(hours=4))
+
+    _, body = build_weekly_report(store, ["intraday"], start, end, UTC)
+    assert "1W / 1L / 1BE" in body
+
+
 # ---- Trade notifications ----------------------------------------------------
 
 

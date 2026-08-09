@@ -111,6 +111,18 @@ def test_start_time_is_not_pushed_forward_by_later_reads(tmp_path):
 # ---- Resilience -------------------------------------------------------------
 
 
+def test_a_new_month_seeds_opening_reads_from_the_console(tmp_path):
+    path = tmp_path / "x_budget.json"
+    old = (datetime.now(UTC) - timedelta(days=40)).strftime("%Y-%m")
+    path.write_text(
+        json.dumps({"month": old, "reads": 19_000, "started_at": "2020-01-01T00:00:00+00:00"}),
+        encoding="utf-8",
+    )
+    b = ReadBudget(path, 20_000, opening_reads=500)
+    assert b.reads_used == 500
+    assert b.started_at is not None
+
+
 def test_a_new_month_resets_usage_and_the_clock(tmp_path):
     path = tmp_path / "x_budget.json"
     path.write_text(
@@ -126,7 +138,7 @@ def test_a_new_month_resets_usage_and_the_clock(tmp_path):
         ),
         encoding="utf-8",
     )
-    b = ReadBudget(path, 20_000)
+    b = ReadBudget(path, 20_000, opening_reads=0)
     assert b.reads_used == 0
     assert b.started_at is None
     assert b.register(["1"], now=AUG_8) == 1

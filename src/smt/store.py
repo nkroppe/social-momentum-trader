@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import create_engine, func, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -70,8 +71,52 @@ class Store:
         ones, so each schema addition needs an explicit ALTER here.
         """
         self._ensure_trade_strategy_column()
+        self._ensure_social_event_dedup_key()
         self._ensure_columns("social_events", _SOCIAL_EVENT_COLUMNS)
         self._ensure_columns("signals", _SIGNAL_COLUMNS)
+
+    def _ensure_social_event_dedup_key(self) -> None:
+        """Move dedup from (source, external_id) to (source, external_id, ticker).
+
+        A single post can tag multiple symbols; the old key kept only the first
+        ticker and, on Postgres, a duplicate in the same batch rolled back the
+        whole batch.
+        """
+        dialect = self.engine.dialect.name
+        with self.engine.begin() as conn:
+            if dialect == "sqlite":
+                indexes = {
+                    row[1] for row in conn.execute(text("PRAGMA index_list(social_events)"))
+                }
+                if "uq_source_extid_ticker" in indexes:
+                    return
+                conn.execute(text("DROP INDEX IF EXISTS uq_source_extid"))
+                conn.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS uq_source_extid_ticker "
+                        "ON social_events (source, external_id, ticker)"
+                    )
+                )
+                log.info("migrated: social_events dedup key now includes ticker (sqlite)")
+            elif dialect == "postgresql":
+                has_new = conn.execute(
+                    text(
+                        "SELECT 1 FROM pg_constraint "
+                        "WHERE conname = 'uq_source_extid_ticker'"
+                    )
+                ).fetchone()
+                if has_new:
+                    return
+                conn.execute(
+                    text("ALTER TABLE social_events DROP CONSTRAINT IF EXISTS uq_source_extid")
+                )
+                conn.execute(
+                    text(
+                        "ALTER TABLE social_events ADD CONSTRAINT uq_source_extid_ticker "
+                        "UNIQUE (source, external_id, ticker)"
+                    )
+                )
+                log.info("migrated: social_events dedup key now includes ticker (postgres)")
 
     def _ensure_columns(self, table: str, columns: tuple[tuple[str, str], ...]) -> None:
         dialect = self.engine.dialect.name
@@ -121,49 +166,50 @@ class Store:
     # ---- Social events -----------------------------------------------------
 
     def add_events(self, events: Iterable[SocialEvent]) -> int:
-        """Insert events, skipping duplicates on (source, external_id).
-
-        Uses a portable upsert-ignore for SQLite; falls back to per-row
-        insert-with-rollback for other backends.
-        """
+        """Insert events, skipping duplicates on (source, external_id, ticker)."""
         events = list(events)
         if not events:
             return 0
+
+        def _values(e: SocialEvent) -> dict:
+            return {
+                "source": e.source,
+                "external_id": e.external_id,
+                "ticker": e.ticker,
+                "author": e.author or "",
+                "text": e.text or "",
+                "url": e.url or "",
+                "weight": e.weight if e.weight is not None else 1.0,
+                "sentiment": e.sentiment if e.sentiment is not None else 0.0,
+                "author_followers": e.author_followers or 0,
+                "text_hash": e.text_hash or "",
+                "created_at": e.created_at,
+                "ingested_at": e.ingested_at or utcnow(),
+            }
+
         inserted = 0
+        dialect = self.engine.dialect.name
         with self.session() as s:
-            if self.engine.dialect.name == "sqlite":
-                for e in events:
-                    # Core insert bypasses ORM column defaults, so coalesce here.
+            for e in events:
+                if dialect == "sqlite":
                     stmt = (
                         sqlite_insert(SocialEvent)
-                        .values(
-                            source=e.source,
-                            external_id=e.external_id,
-                            ticker=e.ticker,
-                            author=e.author or "",
-                            text=e.text or "",
-                            url=e.url or "",
-                            weight=e.weight if e.weight is not None else 1.0,
-                            sentiment=e.sentiment if e.sentiment is not None else 0.0,
-                            author_followers=e.author_followers or 0,
-                            text_hash=e.text_hash or "",
-                            created_at=e.created_at,
-                            ingested_at=e.ingested_at or utcnow(),
+                        .values(**_values(e))
+                        .on_conflict_do_nothing(
+                            index_elements=["source", "external_id", "ticker"]
                         )
-                        .on_conflict_do_nothing(index_elements=["source", "external_id"])
                     )
-                    res = s.execute(stmt)
-                    inserted += res.rowcount or 0
-                s.commit()
-            else:
-                for e in events:
-                    try:
-                        with s.begin_nested():
-                            s.add(e)
-                        inserted += 1
-                    except Exception:
-                        s.rollback()
-                s.commit()
+                else:
+                    stmt = (
+                        pg_insert(SocialEvent)
+                        .values(**_values(e))
+                        .on_conflict_do_nothing(
+                            index_elements=["source", "external_id", "ticker"]
+                        )
+                    )
+                res = s.execute(stmt)
+                inserted += res.rowcount or 0
+            s.commit()
         return inserted
 
     def mention_stats_since(self, ticker: str, since: datetime) -> MentionStats:

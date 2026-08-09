@@ -201,3 +201,18 @@ def test_unique_external_id_dedup(tmp_path):
         source="reddit", external_id=ext, ticker="SOL", created_at=utcnow(), weight=1.0
     )
     assert store.add_events([ev2]) == 0
+
+
+def test_same_post_can_mention_multiple_tickers(tmp_path):
+    """Each ticker from one post gets its own row; dedup is per ticker."""
+    store = make_store(tmp_path)
+    from smt.models import SocialEvent
+
+    ext = uuid.uuid4().hex
+    now = utcnow()
+    batch = [
+        SocialEvent(source="x", external_id=ext, ticker="SOL", created_at=now, weight=2.0),
+        SocialEvent(source="x", external_id=ext, ticker="LINK", created_at=now, weight=2.0),
+    ]
+    assert store.add_events(batch) == 2
+    assert store.add_events(batch) == 0

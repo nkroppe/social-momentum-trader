@@ -50,10 +50,17 @@ class ReadBudget:
     the first few days and the soak then collects nothing for three weeks.
     """
 
-    def __init__(self, path: Path, monthly_limit: int, cost_per_read_usd: float = 0.005):
+    def __init__(
+        self,
+        path: Path,
+        monthly_limit: int,
+        cost_per_read_usd: float = 0.005,
+        opening_reads: int = 0,
+    ):
         self.path = path
         self.monthly_limit = monthly_limit
         self.cost_per_read_usd = cost_per_read_usd
+        self.opening_reads = max(opening_reads, 0)
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     # ---- State --------------------------------------------------------------
@@ -84,7 +91,17 @@ class ReadBudget:
             return self._fresh(now)
 
         if data.get("month") != self._month_key(now):
-            return self._fresh(now)
+            log.info(
+                "X read budget: new billing month %s; seeding with %d opening reads "
+                "(set X_BUDGET_OPENING_READS from the X console if needed)",
+                self._month_key(now),
+                self.opening_reads,
+            )
+            fresh = self._fresh(now)
+            if self.opening_reads:
+                fresh["reads"] = self.opening_reads
+                fresh["started_at"] = (now or datetime.now(UTC)).isoformat()
+            return fresh
         if data.get("day") != self._day_key(now):
             # New UTC day: X's dedupe window resets, so previous IDs would be
             # billed again and must not suppress counting.
@@ -204,6 +221,7 @@ class XCollector:
             Path("./data/x_budget.json"),
             settings.x_monthly_read_budget,
             settings.x_read_cost_usd,
+            settings.x_budget_opening_reads,
         )
         self._client = httpx.Client(
             headers={"Authorization": f"Bearer {settings.x_bearer_token}"},
@@ -312,6 +330,8 @@ class XCollector:
         return self._parse_tweets(payload)
 
     def collect(self) -> list[SocialEvent]:
+        self.quality.reset_dropped()
+
         if self.budget.remaining <= 0:
             log.warning(
                 "X monthly read budget exhausted (%d/%d, ~$%.2f); skipping poll",

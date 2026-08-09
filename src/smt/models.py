@@ -34,7 +34,11 @@ class SocialEvent(Base):
     """A normalized, deduped mention from a social source."""
 
     __tablename__ = "social_events"
-    __table_args__ = (UniqueConstraint("source", "external_id", name="uq_source_extid"),)
+    # One row per (source, post, ticker): a single tweet can mention several
+    # symbols and each needs its own mention for scoring.
+    __table_args__ = (
+        UniqueConstraint("source", "external_id", "ticker", name="uq_source_extid_ticker"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     source: Mapped[str] = mapped_column(String(32), index=True)  # reddit/x/mock

@@ -95,6 +95,8 @@ def build_weekly_report(
     opened = store.count_trades_opened_between(start, end)
     net = sum(t.realized_pnl for t in closed)
     wins = sum(1 for t in closed if t.realized_pnl > 0)
+    losses = sum(1 for t in closed if t.realized_pnl < 0)
+    breakeven = len(closed) - wins - losses
     fees = sum(t.fees_paid for t in closed)
 
     # A window ending in the future is the week currently in progress, which the
@@ -110,7 +112,8 @@ def build_weekly_report(
         f"Trades opened:  {opened}",
         f"Trades closed:  {len(closed)}",
         f"Win rate:       {(wins / len(closed)) if closed else 0:.0%} "
-        f"({wins}W / {len(closed) - wins}L)",
+        f"({wins}W / {losses}L"
+        f"{f' / {breakeven}BE' if breakeven else ''})",
         f"Fees paid:      ${fees:,.2f}",
         f"NET P/L:        ${net:+,.2f}",
     ]

@@ -198,8 +198,12 @@ def _cmd_weekly_report(args: argparse.Namespace) -> int:
     print(f"Next due:  {r.weekly.next_occurrence().isoformat()}")
 
     if args.send:
-        r.alerter.notify(subject, body, critical=False)
-        print("\nReport dispatched to configured alert channels.")
+        if r.alerter.notify(subject, body, critical=False):
+            r.weekly.mark_sent(occurrence)
+            print("\nReport dispatched to configured alert channels.")
+        else:
+            print("\nReport delivery failed; state not updated (retry with --send).")
+            return 1
     return 0
 
 

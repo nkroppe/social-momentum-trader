@@ -268,8 +268,12 @@ class Runner:
         if occurrence is None:
             return
         subject, body = self.weekly_report(occurrence)
-        self.alerter.notify(subject, body, critical=False)
-        # Only mark after a successful build+send so a crash retries next loop.
+        if not self.alerter.notify(subject, body, critical=False):
+            log.warning(
+                "Weekly report for %s was not delivered; will retry next loop",
+                occurrence.isoformat(),
+            )
+            return
         self.weekly.mark_sent(occurrence)
         log.info("Sent weekly report for week ending %s", occurrence.isoformat())
 

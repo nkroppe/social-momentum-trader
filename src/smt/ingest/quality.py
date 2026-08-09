@@ -141,6 +141,10 @@ class QualityFilter:
                 pruned[author] = keep
         self._author_posts = pruned
 
+    def reset_dropped(self) -> None:
+        """Clear per-poll drop tallies so logs compare kept vs dropped fairly."""
+        self.dropped.clear()
+
     def _drop(self, reason: str) -> Verdict:
         self.dropped[reason] = self.dropped.get(reason, 0) + 1
         return Verdict(keep=False, reason=reason)

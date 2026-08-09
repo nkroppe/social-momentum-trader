@@ -105,7 +105,12 @@ def _x_budget_check(settings) -> CheckResult:
     from ..ingest.x import ReadBudget
 
     limit = settings.x_monthly_read_budget
-    budget = ReadBudget(Path("./data/x_budget.json"), limit, settings.x_read_cost_usd)
+    budget = ReadBudget(
+        Path("./data/x_budget.json"),
+        limit,
+        settings.x_read_cost_usd,
+        settings.x_budget_opening_reads,
+    )
     used = budget.reads_used
     started = budget.started_at
 
@@ -173,9 +178,19 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
         return results
 
     # --- production (VPS paper soak) ---
-    env_path = REPO_ROOT / ".env"
-    env_detail = str(env_path) if env_path.exists() else "copy from .env.production.example"
-    results.append(CheckResult(".env file", env_path.exists(), env_detail))
+    env_candidates = (REPO_ROOT / ".env", Path("/app/.env"), Path.cwd() / ".env")
+    env_path = next((p for p in env_candidates if p.exists()), None)
+    if env_path is not None:
+        results.append(CheckResult(".env file", True, str(env_path)))
+    elif settings.x_bearer_token or settings.database_url.startswith("postgresql"):
+        # Compose injects env vars without mounting .env into the container.
+        results.append(
+            CheckResult(".env file", True, "environment variables loaded (no .env in container)")
+        )
+    else:
+        results.append(
+            CheckResult(".env file", False, "copy from .env.production.example")
+        )
 
     if ops.preflight.require_postgres:
         pg = settings.database_url.startswith("postgresql")

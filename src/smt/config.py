@@ -64,6 +64,9 @@ class Settings(BaseSettings):
     x_monthly_read_budget: int = 50_000
     # X pay-per-use list price per post read; used to report spend in dollars.
     x_read_cost_usd: float = 0.005
+    # Reads already billed this month per the X console; applied when a new
+    # billing month starts so the local cap stays aligned with reality.
+    x_budget_opening_reads: int = 0
 
     # Alerts
     smtp_host: str = ""
