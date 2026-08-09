@@ -130,7 +130,7 @@ def test_weekly_report_totals_only_the_window(tmp_path):
     _closed_trade(store, "BTC", -8.10, strategy="swing", closed_at=end - timedelta(days=2))
     # Outside the window on both sides.
     _closed_trade(store, "ETH", 999.0, closed_at=start - timedelta(hours=1))
-    _closed_trade(store, "LINK", 999.0, closed_at=end + timedelta(hours=1))
+    _closed_trade(store, "HYPE", 999.0, closed_at=end + timedelta(hours=1))
 
     subject, body = build_weekly_report(
         store, ["intraday", "swing"], start, end, UTC, mode="PAPER"

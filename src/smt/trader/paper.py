@@ -26,7 +26,6 @@ _BASE_PRICES = {
     "XRP-USD": 0.55,
     "ADA-USD": 0.45,
     "AVAX-USD": 35.0,
-    "LINK-USD": 15.0,
 }
 
 

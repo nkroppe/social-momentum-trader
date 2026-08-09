@@ -23,10 +23,6 @@ symbols:
     product_id: SOL-USD
     tier: large
     aliases: ["sol", "solana", "$sol"]
-  LINK:
-    product_id: LINK-USD
-    tier: mid
-    aliases: ["link", "chainlink", "$link"]
   HYPE:
     product_id: HYPE-USD
     tier: mid

@@ -1,7 +1,7 @@
 # Social sources config. Ingest polls on a schedule (hours->intraday horizon).
 
 # Sized to the read budget rather than to what the strategy would prefer. At
-# $100/mo (20k distinct posts) the daily pace is ~780 posts; seven queries
+# $100/mo (20k distinct posts) the daily pace is ~780 posts; six queries
 # returning the API's 10-post minimum costs ~70 per poll, so ~11 polls/day is
 # the most that fits. Two hours also matches the swing bucket width, which is
 # the timeframe this much data can actually support.
@@ -29,7 +29,6 @@ x:
   # most expensive thing this file could do.
   keywords:
     - "$SOL"
-    - "$LINK"
     - "$HYPE"
     - "$ZEC"
     - "$PUMP"

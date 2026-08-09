@@ -212,7 +212,7 @@ def test_same_post_can_mention_multiple_tickers(tmp_path):
     now = utcnow()
     batch = [
         SocialEvent(source="x", external_id=ext, ticker="SOL", created_at=now, weight=2.0),
-        SocialEvent(source="x", external_id=ext, ticker="LINK", created_at=now, weight=2.0),
+        SocialEvent(source="x", external_id=ext, ticker="HYPE", created_at=now, weight=2.0),
     ]
     assert store.add_events(batch) == 2
     assert store.add_events(batch) == 0
