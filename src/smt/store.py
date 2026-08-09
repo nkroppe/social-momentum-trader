@@ -208,7 +208,9 @@ class Store:
                         )
                     )
                 res = s.execute(stmt)
-                inserted += res.rowcount or 0
+                # Psycopg can return -1 when rowcount is unavailable; treat as zero.
+                if res.rowcount and res.rowcount > 0:
+                    inserted += res.rowcount
             s.commit()
         return inserted
 
