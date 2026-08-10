@@ -10,7 +10,9 @@ tier; it can never create a candidate without the price setup.
 from __future__ import annotations
 
 import hashlib
+import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 from ..config import (
     EntryRulesConfig,
@@ -84,6 +86,7 @@ class TradeCandidate:
     llm_score: float = 0.0
     llm_veto: bool = False
     llm_reason: str = ""
+    opportunity_key: str = ""
 
     @property
     def decision_key(self) -> str:
@@ -103,6 +106,63 @@ class PriceSetup:
     atr_pct: float
     conviction: float
     metadata: dict[str, str | float | bool]
+
+
+@dataclass(frozen=True)
+class _PriceSetupResult:
+    setup: PriceSetup | None
+    evaluated: bool
+    detail: str
+    trigger_ts: int = 0
+    trigger_close: float = 0.0
+    features: dict[str, str | float | bool] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SignalEvaluation:
+    """Prospective outcome for one symbol at one closed trigger candle."""
+
+    ticker: str
+    product_id: str
+    strategy: str
+    tier: str
+    trigger_granularity_seconds: int
+    trigger_candle_ts: int
+    trigger_closed_at: datetime
+    outcome_status: str
+    outcome_reason: str
+    regime_status: str
+    regime_reason: str
+    price_status: str
+    price_reason: str
+    setup_status: str
+    setup_name: str
+    setup_reason: str
+    confirmation_status: str
+    confirmation_reason: str
+    social_status: str
+    social_reason: str
+    feature_snapshot: dict[str, str | float | bool]
+    candidate: TradeCandidate | None = None
+
+
+_SETUP_QUALITY = {
+    "breakout_retest": 3,
+    "vwap_pullback": 2,
+    "breakout_close": 1,
+}
+
+
+def _candidate_rank(candidate: TradeCandidate) -> tuple[float | str, ...]:
+    """Rank only on deterministic price evidence; social fields are audit-only."""
+    price_conviction = float(candidate.setup_metadata.get("price_conviction", 0.0))
+    relative_volume = float(candidate.setup_metadata.get("relative_volume", 0.0))
+    return (
+        -_SETUP_QUALITY.get(candidate.setup, 0),
+        -price_conviction,
+        -relative_volume,
+        candidate.ticker,
+    )
 
 
 def _ema_stack(candles: list[Candle]) -> tuple[bool, tuple[float, float, float]]:
@@ -192,11 +252,7 @@ def detect_price_setup(
     ):
         setup_name = "breakout_close"
         stop_reference = min(low, latest.low)
-    elif (
-        strategy_name == "intraday"
-        and rules.allow_vwap_pullback
-        and tier.allow_vwap_pullback
-    ):
+    elif strategy_name == "intraday" and rules.allow_vwap_pullback and tier.allow_vwap_pullback:
         vwap = rolling_vwap(trigger, rules.vwap_periods)
         tolerance = vwap * rules.retest_tolerance_pct
         if (
@@ -316,8 +372,10 @@ class SignalEngine:
 
     def _trend_ok(self, snap: TechnicalSnapshot | None) -> GateResult:
         conf = self.market_cfg.confirmation
-        if snap is None or not conf.enabled:
+        if not conf.enabled:
             return GateResult(True, "trend gate not evaluated", evaluated=False)
+        if snap is None:
+            return GateResult(not conf.fail_closed, "no market snapshot", evaluated=False)
         if not snap.ok:
             return GateResult(
                 not conf.fail_closed, f"no market data ({snap.detail})", evaluated=False
@@ -329,16 +387,16 @@ class SignalEngine:
             )
 
         if snap.volume_z < conf.min_volume_zscore:
-            return GateResult(
-                False, f"volume z={snap.volume_z:.2f} < {conf.min_volume_zscore:.2f}"
-            )
+            return GateResult(False, f"volume z={snap.volume_z:.2f} < {conf.min_volume_zscore:.2f}")
 
         return GateResult(True, "trend confirmed")
 
     def _direction_ok(self, snap: TechnicalSnapshot | None, tier: TierConfig) -> GateResult:
         conf = self.market_cfg.confirmation
-        if snap is None or not conf.enabled or not conf.require_positive_return:
+        if not conf.enabled or not conf.require_positive_return:
             return GateResult(True, "direction gate not evaluated", evaluated=False)
+        if snap is None:
+            return GateResult(not conf.fail_closed, "no market snapshot", evaluated=False)
         if not snap.ok:
             return GateResult(
                 not conf.fail_closed, f"no market data ({snap.detail})", evaluated=False
@@ -373,15 +431,63 @@ class SignalEngine:
             return True, "regime not evaluated"
         return self.market.regime_ok()
 
-    def _price_setup(self, product_id: str, tier: TierConfig) -> PriceSetup | None:
-        if not self.market_cfg.price_action_enabled:
-            return None
-        if self.market is None:
-            return None
+    def _price_setup(self, product_id: str, tier: TierConfig) -> _PriceSetupResult:
         rules = self.strategy.entry
+        granularity = rules.trigger_granularity_seconds
+        fallback_ts = int(time.time()) // granularity * granularity - granularity
+        if not self.market_cfg.price_action_enabled:
+            return _PriceSetupResult(
+                None,
+                False,
+                "price action disabled",
+                trigger_ts=fallback_ts,
+            )
+        if self.market is None:
+            return _PriceSetupResult(
+                None,
+                False,
+                "market provider unavailable",
+                trigger_ts=fallback_ts,
+            )
         trigger = self.market.candles(product_id, rules.trigger_granularity_seconds)
         bias = self.market.candles(product_id, rules.bias_granularity_seconds)
-        return detect_price_setup(trigger, bias, rules, tier, self.strategy.name)
+        latest = trigger[-1] if trigger else None
+        trigger_ts = latest.ts if latest is not None else fallback_ts
+        features: dict[str, str | float | bool] = {
+            "trigger_candles": len(trigger),
+            "bias_candles": len(bias),
+        }
+        if latest is not None:
+            features.update(
+                {
+                    "trigger_open": latest.open,
+                    "trigger_high": latest.high,
+                    "trigger_low": latest.low,
+                    "trigger_close": latest.close,
+                    "trigger_volume": latest.volume,
+                }
+            )
+        needed = max(51, rules.breakout_lookback + rules.retest_window + 2)
+        if len(trigger) < needed or len(bias) < 50:
+            return _PriceSetupResult(
+                None,
+                False,
+                f"insufficient setup data (trigger={len(trigger)}, bias={len(bias)})",
+                trigger_ts=trigger_ts,
+                trigger_close=latest.close if latest is not None else 0.0,
+                features=features,
+            )
+        setup = detect_price_setup(trigger, bias, rules, tier, self.strategy.name)
+        if setup is not None:
+            features.update(setup.metadata)
+        return _PriceSetupResult(
+            setup,
+            True,
+            "setup evaluated",
+            trigger_ts=trigger_ts,
+            trigger_close=latest.close if latest is not None else 0.0,
+            features=features,
+        )
 
     # ---- Entry point --------------------------------------------------------
 
@@ -392,38 +498,229 @@ class SignalEngine:
             return []
 
         out: list[TradeCandidate] = []
-        for s in scores:
-            cand = self._evaluate(s)
-            if cand is not None:
-                out.append(cand)
+        self._candidate_regime = (regime_ok, regime_detail)
+        try:
+            for s in scores:
+                cand = self._evaluate(s)
+                if cand is not None:
+                    out.append(cand)
+        finally:
+            del self._candidate_regime
+        if self.market_cfg.price_action_enabled:
+            out.sort(key=_candidate_rank)
         return out
 
     def _evaluate(self, s: ScoreResult) -> TradeCandidate | None:
-        if not self.universe.tradeable(s.ticker):
-            return None
+        cached_regime = vars(self).get("_candidate_regime")
+        regime_ok, regime_detail = cached_regime if cached_regime is not None else self._regime()
+        return self._evaluate_with_audit(s, regime_ok, regime_detail).candidate
 
+    def evaluations(self, scores: list[ScoreResult]) -> list[SignalEvaluation]:
+        """Evaluate every scored symbol, including all non-candidate outcomes."""
+        regime_ok, regime_detail = self._regime()
+        rows = [self._evaluate_with_audit(score, regime_ok, regime_detail) for score in scores]
+        return rows
+
+    def ranked_candidates(self, evaluations: list[SignalEvaluation]) -> list[TradeCandidate]:
+        candidates = [
+            evaluation.candidate for evaluation in evaluations if evaluation.candidate is not None
+        ]
+        if self.market_cfg.price_action_enabled:
+            candidates.sort(key=_candidate_rank)
+        return candidates
+
+    def _evaluate_with_audit(
+        self,
+        s: ScoreResult,
+        regime_ok: bool,
+        regime_detail: str,
+    ) -> SignalEvaluation:
         st = self.strategy
+        granularity = st.entry.trigger_granularity_seconds
+        fallback_ts = int(time.time()) // granularity * granularity - granularity
         tier_name = self.universe.tier_of(s.ticker, self.signals.default_tier)
         tier = self.signals.tier(tier_name)
-        spec = self.universe.symbols[s.ticker]
+        spec = self.universe.symbols.get(s.ticker)
+        product_id = spec.product_id if spec is not None else ""
+        score_features: dict[str, str | float | bool] = {
+            "zscore": s.zscore,
+            "recent_social_volume": s.recent,
+            "social_baseline_mean": s.baseline_mean,
+            "mentions_window": s.mentions_window,
+            "distinct_sources": s.distinct_sources,
+            "distinct_authors": s.distinct_authors,
+            "bullish_ratio": s.bullish_ratio,
+            "directional_posts": s.directional_posts,
+            "social_engagement": s.engagement_total,
+            "social_baseline_kind": s.baseline_kind,
+        }
 
-        # Production is price-action-first: every tier, including social-led
-        # micro caps, must have a deterministic trigger before social is read.
-        price_setup = self._price_setup(spec.product_id, tier)
+        def result(
+            *,
+            price_result: _PriceSetupResult | None,
+            outcome_status: str,
+            outcome_reason: str,
+            price_status: str = "not_evaluated",
+            price_reason: str = "",
+            setup_status: str = "not_evaluated",
+            setup_name: str = "",
+            setup_reason: str = "",
+            confirmation_status: str = "not_evaluated",
+            confirmation_reason: str = "",
+            social_status: str = "not_evaluated",
+            social_reason: str = "",
+            candidate: TradeCandidate | None = None,
+            extra_features: dict[str, str | float | bool] | None = None,
+        ) -> SignalEvaluation:
+            price_fields = vars(price_result) if price_result is not None else {}
+            trigger_ts = (
+                int(price_fields.get("trigger_ts", 0))
+                if int(price_fields.get("trigger_ts", 0)) > 0
+                else fallback_ts
+            )
+            features = dict(score_features)
+            if price_result is not None:
+                features.update(price_fields.get("features", {}))
+            if extra_features:
+                features.update(extra_features)
+            return SignalEvaluation(
+                ticker=s.ticker,
+                product_id=product_id,
+                strategy=st.name,
+                tier=tier_name,
+                trigger_granularity_seconds=granularity,
+                trigger_candle_ts=trigger_ts,
+                trigger_closed_at=datetime.fromtimestamp(trigger_ts + granularity, tz=UTC),
+                outcome_status=outcome_status,
+                outcome_reason=outcome_reason,
+                regime_status="passed" if regime_ok else "blocked",
+                regime_reason=regime_detail,
+                price_status=price_status,
+                price_reason=price_reason,
+                setup_status=setup_status,
+                setup_name=setup_name,
+                setup_reason=setup_reason,
+                confirmation_status=confirmation_status,
+                confirmation_reason=confirmation_reason,
+                social_status=social_status,
+                social_reason=social_reason,
+                feature_snapshot=features,
+                candidate=candidate,
+            )
+
+        if spec is None or not self.universe.tradeable(s.ticker):
+            return result(
+                price_result=None,
+                outcome_status="insufficient_data",
+                outcome_reason="symbol is not tradeable",
+                price_status="unavailable",
+                price_reason="symbol is not tradeable",
+            )
+
+        # Fetch the trigger identity even during a regime block so every symbol
+        # gets exactly one prospective row for that closed candle.
+        price_result = self._price_setup(product_id, tier)
+        price_setup = price_result.setup
+        if not regime_ok:
+            return result(
+                price_result=price_result,
+                outcome_status="regime_blocked",
+                outcome_reason=regime_detail,
+                price_status="available" if price_result.trigger_close > 0 else "unavailable",
+                price_reason=price_result.detail,
+                setup_status="not_evaluated",
+                setup_reason="regime blocked before setup decision",
+            )
+
         if self.market_cfg.price_action_enabled and price_setup is None:
-            log.debug("[%s] %s rejected: no qualifying price setup", st.name, s.ticker)
-            return None
+            if price_result.evaluated:
+                log.debug("[%s] %s rejected: no qualifying price setup", st.name, s.ticker)
+                return result(
+                    price_result=price_result,
+                    outcome_status="no_setup",
+                    outcome_reason="no qualifying price setup",
+                    price_status="available",
+                    price_reason=price_result.detail,
+                    setup_status="rejected",
+                    setup_reason="no qualifying price setup",
+                )
+            if self.market_cfg.price_action_fail_closed:
+                log.warning(
+                    "[%s] %s rejected: price setup unavailable (%s)",
+                    st.name,
+                    s.ticker,
+                    price_result.detail,
+                )
+                return result(
+                    price_result=price_result,
+                    outcome_status="insufficient_data",
+                    outcome_reason=price_result.detail,
+                    price_status="unavailable",
+                    price_reason=price_result.detail,
+                    setup_status="not_evaluated",
+                    setup_reason=price_result.detail,
+                )
+
+        snap = None
+        trend = GateResult(True, "trend not required", evaluated=False)
+        direction = GateResult(True, "price action confirmed")
+        confirmation_features: dict[str, str | float | bool] = {}
+        if self.market_cfg.price_action_enabled:
+            snap = self._snapshot(product_id)
+            trend = self._trend_ok(snap)
+            if snap is not None:
+                snapshot_fields = vars(snap)
+                confirmation_features.update(
+                    {
+                        "snapshot_ok": snap.ok,
+                        "snapshot_price": snap.price,
+                        "snapshot_sma": snap.sma,
+                        "snapshot_volume_z": snap.volume_z,
+                        "snapshot_trailing_return": snap.trailing_return,
+                        "snapshot_atr_pct": float(snapshot_fields.get("atr_pct", 0.0)),
+                    }
+                )
+            if not trend.passed:
+                log.debug("[%s] %s rejected: %s", st.name, s.ticker, trend.why)
+                return result(
+                    price_result=price_result,
+                    outcome_status="confirmation_reject",
+                    outcome_reason=trend.why,
+                    price_status="available",
+                    price_reason=price_result.detail,
+                    setup_status="passed",
+                    setup_name=price_setup.name if price_setup else "",
+                    setup_reason="qualifying setup",
+                    confirmation_status="rejected",
+                    confirmation_reason=trend.why,
+                    extra_features=confirmation_features,
+                )
+            direction = self._direction_ok(snap, tier)
+            if not direction.passed:
+                log.debug("[%s] %s rejected: %s", st.name, s.ticker, direction.why)
+                return result(
+                    price_result=price_result,
+                    outcome_status="confirmation_reject",
+                    outcome_reason=direction.why,
+                    price_status="available",
+                    price_reason=price_result.detail,
+                    setup_status="passed",
+                    setup_name=price_setup.name if price_setup else "",
+                    setup_reason="qualifying setup",
+                    confirmation_status="rejected",
+                    confirmation_reason=f"{trend.why}; {direction.why}",
+                    extra_features=confirmation_features,
+                )
 
         social = GateResult(True, "social ignored", evaluated=False)
         size_multiplier = price_setup.conviction if price_setup else 1.0
         social_decision = "ignored"
         shadow = self.signals.social_decision_mode == "shadow"
+        social_rejected = False
         if tier.social_policy in ("required", "catalyst"):
             social = self._social_ok(s, tier)
             social_decision = "would_pass" if social.passed else "would_reject"
-            if not social.passed and not shadow:
-                log.debug("[%s] %s rejected: %s", st.name, s.ticker, social.why)
-                return None
+            social_rejected = not social.passed and not shadow
         elif tier.social_policy == "optional":
             if (
                 s.directional_posts >= self.signals.min_sentiment_posts
@@ -431,9 +728,7 @@ class SignalEngine:
             ):
                 social = GateResult(False, "bearish social veto")
                 social_decision = "would_reject"
-                if not shadow:
-                    log.info("[%s] %s vetoed by bearish social confirmation", st.name, s.ticker)
-                    return None
+                social_rejected = not shadow
             else:
                 social = self._social_ok(s, tier)
                 social_decision = "would_boost" if social.passed else "would_pass"
@@ -442,24 +737,65 @@ class SignalEngine:
 
         # Explicit price-action-disabled mode exists only for deterministic
         # offline simulation and focused social unit tests.
-        snap = None
-        direction = GateResult(True, "price action confirmed")
         if not self.market_cfg.price_action_enabled:
             needs_social = tier.signal_mode in ("social", "hybrid")
             needs_trend = tier.signal_mode in ("trend", "hybrid")
             if needs_social and tier.social_policy == "ignored":
                 social = self._social_ok(s, tier)
                 social_decision = "would_pass" if social.passed else "would_reject"
-                if not social.passed and not shadow:
-                    return None
-            snap = self._snapshot(spec.product_id)
+                social_rejected = not social.passed and not shadow
+            snap = self._snapshot(product_id)
             if needs_trend:
                 trend = self._trend_ok(snap)
                 if not trend.passed or (tier.signal_mode == "trend" and not trend.evaluated):
-                    return None
+                    return result(
+                        price_result=price_result,
+                        outcome_status="confirmation_reject",
+                        outcome_reason=trend.why,
+                        price_status="disabled",
+                        price_reason=price_result.detail,
+                        setup_status="disabled",
+                        setup_name="offline_social",
+                        setup_reason="price action disabled",
+                        confirmation_status="rejected",
+                        confirmation_reason=trend.why,
+                    )
             direction = self._direction_ok(snap, tier)
             if not direction.passed:
-                return None
+                return result(
+                    price_result=price_result,
+                    outcome_status="confirmation_reject",
+                    outcome_reason=direction.why,
+                    price_status="disabled",
+                    price_reason=price_result.detail,
+                    setup_status="disabled",
+                    setup_name="offline_social",
+                    setup_reason="price action disabled",
+                    confirmation_status="rejected",
+                    confirmation_reason=direction.why,
+                )
+
+        if social_rejected:
+            log.debug("[%s] %s rejected: %s", st.name, s.ticker, social.why)
+            return result(
+                price_result=price_result,
+                outcome_status="confirmation_reject",
+                outcome_reason=social.why,
+                price_status=("available" if self.market_cfg.price_action_enabled else "disabled"),
+                price_reason=price_result.detail,
+                setup_status=("passed" if self.market_cfg.price_action_enabled else "disabled"),
+                setup_name=price_setup.name if price_setup else "offline_social",
+                setup_reason=(
+                    "qualifying setup"
+                    if self.market_cfg.price_action_enabled
+                    else "price action disabled"
+                ),
+                confirmation_status="rejected",
+                confirmation_reason=social.why,
+                social_status="rejected",
+                social_reason=social.why,
+                extra_features=confirmation_features,
+            )
 
         reason = (
             f"[{tier_name}/{tier.social_policy}] "
@@ -484,9 +820,12 @@ class SignalEngine:
             s.distinct_authors,
             s.bullish_ratio * 100,
         )
-        return TradeCandidate(
+        setup_metadata = dict(price_setup.metadata) if price_setup else {}
+        if price_setup:
+            setup_metadata["price_conviction"] = price_setup.conviction
+        candidate = TradeCandidate(
             ticker=s.ticker,
-            product_id=spec.product_id,
+            product_id=product_id,
             zscore=s.zscore,
             mentions=s.mentions_window,
             sources=s.distinct_sources,
@@ -496,9 +835,7 @@ class SignalEngine:
             bullish_ratio=s.bullish_ratio,
             tier=tier_name,
             atr_pct=(
-                price_setup.atr_pct
-                if price_setup
-                else (snap.atr_pct if snap and snap.ok else 0.0)
+                price_setup.atr_pct if price_setup else (snap.atr_pct if snap and snap.ok else 0.0)
             ),
             trailing_return=snap.trailing_return if snap and snap.ok else 0.0,
             setup=price_setup.name if price_setup else "offline_social",
@@ -507,10 +844,32 @@ class SignalEngine:
             stop_pct=price_setup.stop_pct if price_setup else 0.0,
             conviction=size_multiplier,
             size_multiplier=size_multiplier,
-            setup_metadata=price_setup.metadata if price_setup else {},
+            setup_metadata=setup_metadata,
             count_volume=s.mentions_window,
             engagement=s.engagement_total,
             decision_mode=self.signals.social_decision_mode,
             social_decision=social_decision,
             social_reason=social.why,
+        )
+        return result(
+            price_result=price_result,
+            outcome_status="candidate",
+            outcome_reason=reason,
+            price_status=("available" if self.market_cfg.price_action_enabled else "disabled"),
+            price_reason=price_result.detail,
+            setup_status=("passed" if self.market_cfg.price_action_enabled else "disabled"),
+            setup_name=candidate.setup,
+            setup_reason=(
+                "qualifying setup"
+                if self.market_cfg.price_action_enabled
+                else "price action disabled"
+            ),
+            confirmation_status="passed",
+            confirmation_reason=f"{trend.why}; {direction.why}",
+            social_status=(
+                "passed" if social.passed else ("shadow_reject" if shadow else "rejected")
+            ),
+            social_reason=social.why,
+            candidate=candidate,
+            extra_features=confirmation_features,
         )

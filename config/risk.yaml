@@ -8,6 +8,13 @@ max_position_pct: 0.10
 # distance, then all exposure caps below can only reduce it.
 risk_per_trade_pct: 0.005
 
+# Global caps span every strategy. Same-symbol positions remain permitted across
+# strategies, but their combined marked exposure must fit the symbol cap.
+max_aggregate_open_heat_pct: 0.02
+max_gross_exposure_pct: 0.50
+max_combined_symbol_exposure_pct: 0.10
+max_micro_exposure_pct: 0.15
+
 # Max simultaneous open positions.
 max_open_positions: 3
 

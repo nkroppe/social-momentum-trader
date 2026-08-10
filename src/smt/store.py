@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -14,9 +15,11 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from .logging_setup import get_logger
+from .market import Candle
 from .models import (
     Base,
     ExitReason,
+    OpportunityDecision,
     RiskEquitySnapshot,
     SecurityEvent,
     ShadowDecision,
@@ -57,6 +60,7 @@ _SIGNAL_COLUMNS = (
 _SHADOW_DECISION_COLUMNS = (
     ("trade_id", "INTEGER DEFAULT 0"),
     ("llm_completed_at", "TIMESTAMP"),
+    ("opportunity_key", "VARCHAR(64) DEFAULT ''"),
 )
 _TRADE_COLUMNS = (
     ("original_qty", "FLOAT DEFAULT 0.0"),
@@ -67,7 +71,38 @@ _TRADE_COLUMNS = (
     ("trailing_stop", "FLOAT DEFAULT 0.0"),
     ("entry_fee_paid", "FLOAT DEFAULT 0.0"),
     ("setup", "VARCHAR(64) DEFAULT ''"),
+    ("last_processed_paper_bar_ts", "BIGINT DEFAULT 0"),
 )
+
+OPPORTUNITY_LEDGER_VERSION = 1
+_OUTCOME_HOURS = (1, 4, 24, 72)
+
+
+def stable_config_fingerprint(value: str | None = None) -> str:
+    """Return the canonical policy hash, or normalize an explicit test identity."""
+    if value is None or not value.strip():
+        from .policy import trading_policy_identity
+
+        return trading_policy_identity().fingerprint
+    normalized = value.strip()
+    if len(normalized) == 64 and all(char in "0123456789abcdefABCDEF" for char in normalized):
+        return normalized.lower()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def opportunity_key(
+    *,
+    config_fingerprint: str,
+    run_id: str,
+    strategy: str,
+    ticker: str,
+    trigger_candle_ts: int,
+    ledger_version: int = OPPORTUNITY_LEDGER_VERSION,
+) -> str:
+    stable = (
+        f"{ledger_version}|{config_fingerprint}|{run_id}|{strategy}|{ticker}|{trigger_candle_ts}"
+    )
+    return hashlib.sha256(stable.encode("utf-8")).hexdigest()[:40]
 
 
 @dataclass(frozen=True)
@@ -130,6 +165,7 @@ class Store:
         self._ensure_columns("shadow_decisions", _SHADOW_DECISION_COLUMNS)
         self._ensure_columns("trades", _TRADE_COLUMNS)
         self._ensure_shadow_trade_index()
+        self._ensure_opportunity_indexes()
         self._backfill_advanced_exit_fields()
 
     def _ensure_shadow_trade_index(self) -> None:
@@ -138,6 +174,24 @@ class Store:
                 text(
                     "CREATE INDEX IF NOT EXISTS ix_shadow_decisions_trade_id "
                     "ON shadow_decisions (trade_id)"
+                )
+            )
+
+    def _ensure_opportunity_indexes(self) -> None:
+        """Install linkage indexes for old and newly-created ledgers."""
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_shadow_decisions_opportunity_key "
+                    "ON shadow_decisions (opportunity_key)"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_opportunity_evaluation "
+                    "ON opportunity_decisions "
+                    "(ledger_version, config_fingerprint, run_id, strategy, ticker, "
+                    "trigger_candle_ts)"
                 )
             )
 
@@ -238,10 +292,7 @@ class Store:
                 log.info("migrated: social_events dedup key now includes ticker (sqlite)")
             elif dialect == "postgresql":
                 has_new = conn.execute(
-                    text(
-                        "SELECT 1 FROM pg_constraint "
-                        "WHERE conname = 'uq_source_extid_ticker'"
-                    )
+                    text("SELECT 1 FROM pg_constraint WHERE conname = 'uq_source_extid_ticker'")
                 ).fetchone()
                 if has_new:
                     return
@@ -269,9 +320,7 @@ class Store:
                         log.info("migrated: added %s.%s", table, name)
             else:
                 for name, ddl in columns:
-                    conn.execute(
-                        text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {ddl}")
-                    )
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {ddl}"))
 
     def _ensure_trade_strategy_column(self) -> None:
         dialect = self.engine.dialect.name
@@ -281,8 +330,7 @@ class Store:
                 if "trades" in Base.metadata.tables and "strategy" not in cols and cols:
                     conn.execute(
                         text(
-                            "ALTER TABLE trades ADD COLUMN "
-                            "strategy VARCHAR(16) DEFAULT 'intraday'"
+                            "ALTER TABLE trades ADD COLUMN strategy VARCHAR(16) DEFAULT 'intraday'"
                         )
                     )
                     conn.execute(
@@ -347,17 +395,13 @@ class Store:
                     stmt = (
                         sqlite_insert(SocialEvent)
                         .values(**_values(e))
-                        .on_conflict_do_nothing(
-                            index_elements=["source", "external_id", "ticker"]
-                        )
+                        .on_conflict_do_nothing(index_elements=["source", "external_id", "ticker"])
                     )
                 else:
                     stmt = (
                         pg_insert(SocialEvent)
                         .values(**_values(e))
-                        .on_conflict_do_nothing(
-                            index_elements=["source", "external_id", "ticker"]
-                        )
+                        .on_conflict_do_nothing(index_elements=["source", "external_id", "ticker"])
                     )
                 res = s.execute(stmt)
                 # Psycopg can return -1 when rowcount is unavailable; treat as zero.
@@ -379,10 +423,7 @@ class Store:
 
             mentions = _count()
             sources = int(
-                s.scalar(
-                    select(func.count(func.distinct(SocialEvent.source))).where(*scope)
-                )
-                or 0
+                s.scalar(select(func.count(func.distinct(SocialEvent.source))).where(*scope)) or 0
             )
             authors = int(
                 s.scalar(
@@ -393,9 +434,7 @@ class Store:
                 or 0
             )
             weighted = float(
-                s.scalar(
-                    select(func.coalesce(func.sum(SocialEvent.weight), 0.0)).where(*scope)
-                )
+                s.scalar(select(func.coalesce(func.sum(SocialEvent.weight), 0.0)).where(*scope))
                 or 0.0
             )
             bullish = _count(SocialEvent.sentiment > 0)
@@ -527,9 +566,7 @@ class Store:
                 stmt = (
                     insert(SocialCount)
                     .values(**values)
-                    .on_conflict_do_nothing(
-                        index_elements=["source", "ticker", "window_end"]
-                    )
+                    .on_conflict_do_nothing(index_elements=["source", "ticker", "window_end"])
                 )
                 result = s.execute(stmt)
                 if result.rowcount and result.rowcount > 0:
@@ -552,9 +589,7 @@ class Store:
             stmt = stmt.order_by(SocialCount.window_end.desc()).limit(max(limit, 0))
             return list(s.scalars(stmt))
 
-    def social_count_at(
-        self, source: str, ticker: str, window_end: datetime
-    ) -> SocialCount | None:
+    def social_count_at(self, source: str, ticker: str, window_end: datetime) -> SocialCount | None:
         """Return the exact aligned observation, if this window is already paid for."""
         with self.session() as s:
             return s.scalar(
@@ -614,8 +649,7 @@ class Store:
             covered = {
                 self._aware(row.window_end)
                 for row in rows
-                if self._aware(row.window_end) > left
-                and self._aware(row.window_end) <= right
+                if self._aware(row.window_end) > left and self._aware(row.window_end) <= right
             }
             if len(covered) != expected_windows:
                 values.append(None)
@@ -690,6 +724,222 @@ class Store:
             s.add(signal)
             s.commit()
 
+    @staticmethod
+    def _bounded_reason(value: object, limit: int = 1_000) -> str:
+        """Keep audit reasons useful without allowing unbounded text storage."""
+        return str(value or "")[:limit]
+
+    def upsert_opportunity(self, **values) -> OpportunityDecision:
+        """Insert one candle evaluation or refresh only its deterministic evidence."""
+        values = dict(values)
+        for name in (
+            "outcome_reason",
+            "regime_reason",
+            "price_reason",
+            "setup_reason",
+            "confirmation_reason",
+            "social_reason",
+        ):
+            if name in values:
+                values[name] = self._bounded_reason(values[name])
+        values["updated_at"] = utcnow()
+        dialect = self.engine.dialect.name
+        insert = sqlite_insert if dialect == "sqlite" else pg_insert
+        stmt = insert(OpportunityDecision).values(**values)
+        evaluation_fields = {
+            "product_id",
+            "tier",
+            "trigger_granularity_seconds",
+            "trigger_closed_at",
+            "outcome_status",
+            "outcome_reason",
+            "regime_status",
+            "regime_reason",
+            "price_status",
+            "price_reason",
+            "setup_status",
+            "setup_name",
+            "setup_reason",
+            "confirmation_status",
+            "confirmation_reason",
+            "social_status",
+            "social_reason",
+            "feature_snapshot",
+            "proposed_entry_price",
+            "proposed_stop_price",
+            "updated_at",
+        }
+        update_values = {
+            name: getattr(stmt.excluded, name)
+            for name in evaluation_fields
+            if name in values
+            and not (
+                name in {"proposed_entry_price", "proposed_stop_price"} and values[name] is None
+            )
+        }
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[
+                "ledger_version",
+                "config_fingerprint",
+                "run_id",
+                "strategy",
+                "ticker",
+                "trigger_candle_ts",
+            ],
+            set_=update_values,
+        )
+        with self.session() as s:
+            s.execute(stmt)
+            s.commit()
+            row = s.scalar(
+                select(OpportunityDecision).where(
+                    OpportunityDecision.ledger_version == values["ledger_version"],
+                    OpportunityDecision.config_fingerprint == values["config_fingerprint"],
+                    OpportunityDecision.run_id == values["run_id"],
+                    OpportunityDecision.strategy == values["strategy"],
+                    OpportunityDecision.ticker == values["ticker"],
+                    OpportunityDecision.trigger_candle_ts == values["trigger_candle_ts"],
+                )
+            )
+            if row is None:
+                raise RuntimeError("opportunity upsert did not produce a row")
+            return row
+
+    def opportunity(self, key: str) -> OpportunityDecision | None:
+        with self.session() as s:
+            return s.scalar(
+                select(OpportunityDecision).where(OpportunityDecision.opportunity_key == key)
+            )
+
+    def opportunities(self) -> Sequence[OpportunityDecision]:
+        with self.session() as s:
+            return list(
+                s.scalars(
+                    select(OpportunityDecision).order_by(
+                        OpportunityDecision.evaluated_at,
+                        OpportunityDecision.id,
+                    )
+                )
+            )
+
+    def enrich_opportunity(self, key: str, **values) -> bool:
+        """Monotonically add downstream LLM, risk, execution, and linkage facts."""
+        allowed = {
+            "llm_status",
+            "llm_score",
+            "llm_veto",
+            "llm_reason",
+            "risk_status",
+            "risk_reason",
+            "execution_status",
+            "execution_reason",
+            "proposed_entry_price",
+            "proposed_stop_price",
+            "proposed_notional_usd",
+            "proposed_risk_usd",
+            "portfolio_equity",
+            "portfolio_existing_heat",
+            "portfolio_proposed_heat",
+            "portfolio_gross_exposure",
+            "portfolio_symbol_exposure",
+            "portfolio_micro_exposure",
+            "shadow_decision_key",
+            "trade_id",
+        }
+        updates = {name: value for name, value in values.items() if name in allowed}
+        for name in (
+            "llm_reason",
+            "risk_reason",
+            "execution_reason",
+        ):
+            if name in updates:
+                updates[name] = self._bounded_reason(updates[name])
+        if not updates:
+            return False
+        updates["updated_at"] = utcnow()
+        with self.session() as s:
+            result = s.execute(
+                update(OpportunityDecision)
+                .where(OpportunityDecision.opportunity_key == key)
+                .values(**updates)
+            )
+            s.commit()
+            return bool(result.rowcount and result.rowcount > 0)
+
+    def pending_opportunity_maturations(self) -> Sequence[OpportunityDecision]:
+        """Rows with at least one prospective horizon still unlabeled."""
+        with self.session() as s:
+            return list(
+                s.scalars(
+                    select(OpportunityDecision).where(
+                        (OpportunityDecision.outcome_1h_at.is_(None))
+                        | (OpportunityDecision.outcome_4h_at.is_(None))
+                        | (OpportunityDecision.outcome_24h_at.is_(None))
+                        | (OpportunityDecision.outcome_72h_at.is_(None))
+                    )
+                )
+            )
+
+    def mature_opportunity(
+        self,
+        key: str,
+        candles: Sequence[Candle],
+        *,
+        as_of: datetime | None = None,
+    ) -> bool:
+        """Label due horizons from candles that begin strictly after evaluation."""
+        row = self.opportunity(key)
+        if row is None:
+            return False
+        now = self._aware(as_of or utcnow())
+        evaluated = self._aware(row.evaluated_at)
+        granularity = int(row.trigger_granularity_seconds)
+        if granularity <= 0:
+            return False
+        first_post_evaluation_ts = (int(evaluated.timestamp()) // granularity + 1) * granularity
+        reference = float(row.proposed_entry_price or 0.0)
+        if reference <= 0:
+            reference = float((row.feature_snapshot or {}).get("trigger_close", 0.0))
+        if reference <= 0:
+            return False
+
+        updates: dict[str, object] = {}
+        for hours in _OUTCOME_HOURS:
+            at_name = f"outcome_{hours}h_at"
+            if getattr(row, at_name) is not None:
+                continue
+            target = evaluated + timedelta(hours=hours)
+            if now < target:
+                continue
+            eligible = [
+                candle
+                for candle in candles
+                if int(candle.ts) >= first_post_evaluation_ts
+                and int(candle.ts) + granularity <= int(target.timestamp())
+            ]
+            if not eligible:
+                continue
+            last = max(eligible, key=lambda candle: int(candle.ts))
+            updates[f"return_{hours}h"] = float(last.close) / reference - 1.0
+            updates[f"mae_{hours}h"] = (
+                min(float(candle.low) for candle in eligible) / reference - 1.0
+            )
+            updates[f"mfe_{hours}h"] = (
+                max(float(candle.high) for candle in eligible) / reference - 1.0
+            )
+            updates[at_name] = now
+        if not updates:
+            return False
+        updates["updated_at"] = utcnow()
+        with self.session() as s:
+            result = s.execute(
+                update(OpportunityDecision)
+                .where(OpportunityDecision.opportunity_key == key)
+                .values(**updates)
+            )
+            s.commit()
+            return bool(result.rowcount and result.rowcount > 0)
+
     def upsert_shadow_decision(self, **values) -> None:
         """Create or refresh one stable setup audit without duplicate spam."""
         values = {**values, "updated_at": utcnow()}
@@ -701,6 +951,7 @@ class Store:
             for key in values
             if key not in {"decision_key", "first_evaluated_at"}
             and not (key == "trade_id" and not int(values.get("trade_id") or 0))
+            and not (key == "opportunity_key" and not str(values.get("opportunity_key") or ""))
         }
         preserve_approved = and_(
             func.coalesce(ShadowDecision.trade_id, 0) > 0,
@@ -730,9 +981,7 @@ class Store:
                 select(ShadowDecision).where(ShadowDecision.decision_key == decision_key)
             )
 
-    def shadow_decisions_between(
-        self, start: datetime, end: datetime
-    ) -> Sequence[ShadowDecision]:
+    def shadow_decisions_between(self, start: datetime, end: datetime) -> Sequence[ShadowDecision]:
         """Audited setups first observed in the half-open UTC window."""
         with self.session() as s:
             return list(
@@ -760,6 +1009,11 @@ class Store:
         if trade_id <= 0:
             return False
         with self.session() as s:
+            opportunity = s.scalar(
+                select(ShadowDecision.opportunity_key).where(
+                    ShadowDecision.decision_key == decision_key
+                )
+            )
             result = s.execute(
                 update(ShadowDecision)
                 .where(
@@ -769,7 +1023,10 @@ class Store:
                 .values(trade_id=trade_id, updated_at=utcnow())
             )
             s.commit()
-            return bool(result.rowcount and result.rowcount > 0)
+            linked = bool(result.rowcount and result.rowcount > 0)
+        if opportunity:
+            self.enrich_opportunity(str(opportunity), trade_id=trade_id)
+        return linked
 
     def count_coverage(
         self,
@@ -804,9 +1061,7 @@ class Store:
         observed = {self._aware(value) for value in rows} & expected_ends
         return CountCoverage(ticker, len(expected_ends), len(observed))
 
-    def count_observation_days(
-        self, tickers: Iterable[str], start: datetime, end: datetime
-    ) -> int:
+    def count_observation_days(self, tickers: Iterable[str], start: datetime, end: datetime) -> int:
         names = set(tickers)
         if not names:
             return 0
@@ -834,6 +1089,11 @@ class Store:
     ) -> bool:
         """Update only asynchronous LLM fields on an existing setup audit."""
         with self.session() as s:
+            opportunity = s.scalar(
+                select(ShadowDecision.opportunity_key).where(
+                    ShadowDecision.decision_key == decision_key
+                )
+            )
             result = s.execute(
                 update(ShadowDecision)
                 .where(ShadowDecision.decision_key == decision_key)
@@ -847,7 +1107,16 @@ class Store:
                 )
             )
             s.commit()
-            return bool(result.rowcount and result.rowcount > 0)
+            updated = bool(result.rowcount and result.rowcount > 0)
+        if opportunity:
+            self.enrich_opportunity(
+                str(opportunity),
+                llm_status=status,
+                llm_score=score,
+                llm_veto=veto,
+                llm_reason=reason,
+            )
+        return updated
 
     # ---- Trades ------------------------------------------------------------
     #
@@ -865,18 +1134,14 @@ class Store:
 
     def open_trade_for(self, ticker: str, strategy: str | None = None) -> Trade | None:
         with self.session() as s:
-            stmt = select(Trade).where(
-                Trade.ticker == ticker, Trade.status == TradeStatus.OPEN
-            )
+            stmt = select(Trade).where(Trade.ticker == ticker, Trade.status == TradeStatus.OPEN)
             if strategy is not None:
                 stmt = stmt.where(Trade.strategy == strategy)
             return s.scalar(stmt)
 
     def closed_trades_for(self, ticker: str, strategy: str | None = None) -> Sequence[Trade]:
         with self.session() as s:
-            stmt = select(Trade).where(
-                Trade.ticker == ticker, Trade.status == TradeStatus.CLOSED
-            )
+            stmt = select(Trade).where(Trade.ticker == ticker, Trade.status == TradeStatus.CLOSED)
             if strategy is not None:
                 stmt = stmt.where(Trade.strategy == strategy)
             return list(s.scalars(stmt.order_by(Trade.closed_at)))
@@ -918,9 +1183,7 @@ class Store:
 
     def count_open_trades(self, strategy: str | None = None) -> int:
         with self.session() as s:
-            stmt = select(func.count()).select_from(Trade).where(
-                Trade.status == TradeStatus.OPEN
-            )
+            stmt = select(func.count()).select_from(Trade).where(Trade.status == TradeStatus.OPEN)
             if strategy is not None:
                 stmt = stmt.where(Trade.strategy == strategy)
             return int(s.scalar(stmt) or 0)

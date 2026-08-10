@@ -24,6 +24,7 @@ from ..ops.alerts import Alerter
 from ..ops.reports import trade_closed_alert, trade_opened_alert, trade_partial_alert
 from ..store import Store
 from .broker import Broker
+from .execution import ExecutionCostEstimator, conservative_quote
 from .signals import TradeCandidate
 
 log = get_logger("smt.manager")
@@ -183,6 +184,14 @@ class TradeManager:
         tp, sl, exit_note = self.exit_levels(entry_price, candidate, strategy)
 
         fill = self.broker.open_long(candidate.product_id, notional_usd, tp, sl)
+        paper_bar_cursor = 0
+        cursor_reader = getattr(self.broker, "last_closed_bar_ts", None)
+        if (
+            self.broker.name == "paper"
+            and not getattr(self.broker, "offline_simulation", True)
+            and callable(cursor_reader)
+        ):
+            paper_bar_cursor = int(cursor_reader(candidate.product_id))
         if 0 < candidate.structure_stop < fill.price:
             sl = round(candidate.structure_stop, 8)
             tp = round(
@@ -193,9 +202,7 @@ class TradeManager:
             tp, sl, exit_note = self.exit_levels(fill.price, candidate, strategy)
         initial_risk = max(fill.price - sl, 0.0)
         actual_risk = initial_risk * fill.qty
-        fill_slippage = (
-            abs(fill.price - entry_price) / entry_price if entry_price > 0 else 0.0
-        )
+        fill_slippage = abs(fill.price - entry_price) / entry_price if entry_price > 0 else 0.0
         entry_risk_breach = (
             risk_budget_usd > 0
             and candidate.entry_price > 0
@@ -225,6 +232,7 @@ class TradeManager:
                 initial_risk_per_unit=initial_risk,
                 entry_fee_paid=fill.fee,
                 setup=candidate.setup,
+                last_processed_paper_bar_ts=paper_bar_cursor,
                 time_stop_at=utcnow(),
                 exit_price=unwind.price,
                 exit_reason=ExitReason.ENTRY_RISK,
@@ -265,6 +273,7 @@ class TradeManager:
             trailing_stop=0.0,
             entry_fee_paid=fill.fee,
             setup=candidate.setup,
+            last_processed_paper_bar_ts=paper_bar_cursor,
             time_stop_at=utcnow() + timedelta(hours=strategy.time_stop_hours),
             fees_paid=fill.fee,
             broker_entry_order_id=fill.order_id,
@@ -291,7 +300,11 @@ class TradeManager:
     def _close(self, trade: Trade, price: float, reason: ExitReason) -> None:
         # For paper we simulate the sell; for live-with-server-brackets TP/SL are
         # already handled by the exchange, so we only actively close on time-stop/kill.
-        fill = self.broker.close_long(trade.product_id, trade.qty)
+        fill = self.broker.close_long(
+            trade.product_id,
+            trade.qty,
+            reference_price=price,
+        )
         exit_price = fill.price
         gross = (exit_price - trade.entry_price) * trade.qty
         total_fees = trade.fees_paid + fill.fee
@@ -338,7 +351,11 @@ class TradeManager:
         partial_qty = min(original_qty * strategy.partial_take_profit_fraction, trade.qty)
         if partial_qty <= 0 or partial_qty >= trade.qty:
             return
-        fill = self.broker.close_long(trade.product_id, partial_qty)
+        fill = self.broker.close_long(
+            trade.product_id,
+            partial_qty,
+            reference_price=trade.take_profit,
+        )
         entry_fee_share = trade.entry_fee_paid * (fill.qty / original_qty)
         gross = (fill.price - trade.entry_price) * fill.qty
         trade.partial_realized_pnl = gross - fill.fee - entry_fee_share
@@ -346,6 +363,37 @@ class TradeManager:
         trade.qty = max(trade.qty - fill.qty, 0.0)
         trade.partial_taken = True
         trade.highest_price = max(trade.highest_price, fill.price)
+        quote_reader = getattr(self.broker, "execution_quote", None)
+        try:
+            quote = (
+                quote_reader(trade.product_id, fill.price)
+                if callable(quote_reader)
+                else conservative_quote(
+                    trade.product_id,
+                    fill.price,
+                    self.market_cfg.paper_max_spread_bps,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - partial already filled; preserve protection
+            log.warning(
+                "breakeven quote unavailable for %s after partial; using max spread: %s",
+                trade.product_id,
+                exc,
+            )
+            quote = conservative_quote(
+                trade.product_id,
+                fill.price,
+                self.market_cfg.paper_max_spread_bps,
+            )
+        remaining_entry_fee = trade.entry_fee_paid * (trade.qty / original_qty)
+        entry_fee_per_unit = remaining_entry_fee / trade.qty
+        costs = ExecutionCostEstimator(strategy.assumed_fee_pct_per_side, self.market_cfg)
+        breakeven_floor = costs.cost_adjusted_breakeven(
+            trade.entry_price,
+            entry_fee_per_unit,
+            quote,
+        )
+        trade.trailing_stop = max(trade.stop_loss, round(breakeven_floor, 8))
         trade.trailing_stop = self._chandelier_stop(trade, strategy)
         self.store.update_trade(trade)
         log.info(
@@ -367,6 +415,119 @@ class TradeManager:
                 )
             )
 
+    def _manage_deployed_paper_trade(
+        self,
+        trade: Trade,
+        strategy: StrategyConfig | None,
+        tstop,
+    ) -> None:
+        """Walk each newly closed one-minute bar exactly once, oldest-first."""
+        if trade.last_processed_paper_bar_ts <= 0:
+            cursor_reader = getattr(self.broker, "last_closed_bar_ts", None)
+            try:
+                latest = int(cursor_reader(trade.product_id)) if callable(cursor_reader) else 0
+            except Exception as exc:  # noqa: BLE001 - legacy position remains protected
+                log.warning(
+                    "PAPER cannot initialize exit cursor for %s: %s",
+                    trade.product_id,
+                    exc,
+                )
+                return
+            if latest <= 0:
+                log.warning("PAPER cannot initialize exit cursor for %s", trade.product_id)
+                return
+            # A legacy open trade has no trustworthy minute-by-minute history.
+            # Start at the latest closed bar rather than replaying pre-entry or
+            # unavailable candles; subsequent bars are processed normally.
+            trade.last_processed_paper_bar_ts = latest
+            self.store.update_trade(trade)
+            return
+
+        bars = []
+        try:
+            bars = self.broker.closed_bars_since(  # type: ignore[attr-defined]
+                trade.product_id,
+                trade.last_processed_paper_bar_ts,
+            )
+        except Exception as exc:  # noqa: BLE001 - fail closed for this position, not all
+            log.warning(
+                "PAPER exit bars unavailable for %s at cursor=%s: %s",
+                trade.product_id,
+                trade.last_processed_paper_bar_ts,
+                exc,
+            )
+
+        advanced = (
+            strategy is not None
+            and strategy.advanced_exit_enabled
+            and trade.setup not in ("", "offline_social")
+        )
+        for bar in bars:
+            # Persist only after any required fill succeeds. A failed fill leaves
+            # the database cursor unchanged so the same bar is retried.
+            trade.last_processed_paper_bar_ts = bar.ts
+
+            if advanced:
+                active_stop = max(
+                    trade.stop_loss,
+                    trade.trailing_stop if trade.partial_taken else 0.0,
+                )
+                if bar.low <= active_stop:
+                    reason = (
+                        ExitReason.TRAILING_STOP
+                        if trade.partial_taken and active_stop > trade.stop_loss
+                        else ExitReason.STOP_LOSS
+                    )
+                    self._close(trade, active_stop, reason)
+                    return
+
+                trade.highest_price = max(
+                    trade.highest_price or trade.entry_price,
+                    bar.high,
+                )
+                if not trade.partial_taken and bar.high >= trade.take_profit:
+                    self._take_partial(trade, strategy)
+                    if trade.trailing_stop > 0 and bar.low <= trade.trailing_stop:
+                        self._close(trade, trade.trailing_stop, ExitReason.TRAILING_STOP)
+                        return
+                elif trade.partial_taken:
+                    trade.trailing_stop = self._chandelier_stop(trade, strategy)
+                    if bar.low <= trade.trailing_stop:
+                        self._close(trade, trade.trailing_stop, ExitReason.TRAILING_STOP)
+                        return
+            else:
+                # Conservative ambiguity rule: if one bar touches both levels,
+                # assume the stop happened first.
+                if bar.low <= trade.stop_loss:
+                    self._close(trade, trade.stop_loss, ExitReason.STOP_LOSS)
+                    return
+                if bar.high >= trade.take_profit:
+                    self._close(trade, trade.take_profit, ExitReason.TAKE_PROFIT)
+                    return
+
+            self.store.update_trade(trade)
+
+        now = utcnow()
+        if advanced and strategy is not None and not trade.partial_taken:
+            opened = trade.opened_at
+            opened = opened if opened.tzinfo else opened.replace(tzinfo=now.tzinfo)
+            stale_at = opened + timedelta(hours=strategy.stale_time_stop_hours)
+            one_r = trade.entry_price + trade.initial_risk_per_unit
+            if now >= stale_at and trade.highest_price < one_r:
+                self._close(
+                    trade,
+                    self.broker.current_price(trade.product_id),
+                    ExitReason.TIME_STOP,
+                )
+                return
+
+        if now >= tstop:
+            self._close(
+                trade,
+                self.broker.current_price(trade.product_id),
+                ExitReason.TIME_STOP,
+            )
+
     def manage_open_trades(self, force_flatten: bool = False) -> None:
         # Kill switch flattens EVERY strategy's positions.
         for trade in self.store.open_trades():
@@ -380,9 +541,18 @@ class TradeManager:
                 )
                 continue
 
+            strategy = self._strategy_for(trade)
+            deployed_paper = (
+                self.broker.name == "paper"
+                and not getattr(self.broker, "offline_simulation", True)
+                and callable(getattr(self.broker, "closed_bars_since", None))
+            )
+            if deployed_paper:
+                self._manage_deployed_paper_trade(trade, strategy, tstop)
+                continue
+
             price = self.broker.current_price(trade.product_id)
 
-            strategy = self._strategy_for(trade)
             advanced_paper = (
                 strategy is not None
                 and strategy.advanced_exit_enabled
@@ -410,9 +580,7 @@ class TradeManager:
                         self.store.update_trade(trade)
                 else:
                     opened = trade.opened_at
-                    opened = (
-                        opened if opened.tzinfo else opened.replace(tzinfo=utcnow().tzinfo)
-                    )
+                    opened = opened if opened.tzinfo else opened.replace(tzinfo=utcnow().tzinfo)
                     stale_at = opened + timedelta(hours=strategy.stale_time_stop_hours)
                     one_r = trade.entry_price + trade.initial_risk_per_unit
                     if utcnow() >= stale_at and trade.highest_price < one_r:

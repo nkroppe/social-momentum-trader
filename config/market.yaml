@@ -6,13 +6,23 @@
 candle_granularity_seconds: 3600   # 1h candles
 atr_periods: 14
 cache_ttl_seconds: 300             # re-fetch candles at most every 5 min
-price_cache_ttl_seconds: 20
+price_cache_ttl_seconds: 2
 request_timeout_seconds: 15
 unavailable_retry_seconds: 900     # back off products Coinbase does not list
 
-# Paper fills use real Coinbase quotes so soak results reflect the live market.
-# Set false for fully offline dev on a simulated random walk.
+# Deployed PAPER is executable and fail-closed: a fresh level-1 book and a
+# contiguous, newly closed one-minute feed are required. Random prices exist
+# only behind the explicit offline simulation path.
 paper_use_real_prices: true
+paper_quote_max_age_seconds: 10
+paper_bar_granularity_seconds: 60
+paper_bar_max_age_seconds: 90
+paper_bar_cache_ttl_seconds: 10
+paper_max_spread_bps: 40
+paper_min_top_level_notional_usd: 100
+paper_max_top_level_participation: 0.50
+paper_adverse_slippage_bps: 5
+candle_max_age_multiplier: 1.10
 
 # Hard production latch for the deterministic multi-timeframe setup engine.
 # Offline `smt simulate` disables this in memory; deployed runs fail closed.

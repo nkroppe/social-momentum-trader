@@ -127,8 +127,14 @@ def test_both_strategies_simulate_end_to_end(tmp_path):
     universe = make_universe()
     settings = _settings()
     broker = PaperBroker(seed=3)
-    gate = RiskGate(store)
     manager = TradeManager(settings, universe, store, broker)
+    gate = RiskGate(
+        store,
+        mark_price=broker.current_price,
+        quote=broker.execution_quote,
+        portfolio_equity=lambda: manager.equity(),
+        universe=universe,
+    )
 
     strategies = get_strategies().enabled()
     names = {s.name for s in strategies}

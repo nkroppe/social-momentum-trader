@@ -36,12 +36,18 @@ def _response(payload: dict, *, error: bool = False) -> MagicMock:
 
 
 def test_recent_count_parser_trigger_and_cold_start():
-    assert XCollector._parse_recent_count(
-        {"data": [{"tweet_count": 2}, {"tweet_count": 3}, {"tweet_count": 5}]}
-    ) == 10
-    assert XCollector._parse_recent_count(
-        {"meta": {"total_tweet_count": 42}, "data": [{"tweet_count": 1}]}
-    ) == 42
+    assert (
+        XCollector._parse_recent_count(
+            {"data": [{"tweet_count": 2}, {"tweet_count": 3}, {"tweet_count": 5}]}
+        )
+        == 10
+    )
+    assert (
+        XCollector._parse_recent_count(
+            {"meta": {"total_tweet_count": 42}, "data": [{"tweet_count": 1}]}
+        )
+        == 42
+    )
     cfg = XSource(
         trigger_min_count=8,
         trigger_zscore=2,
@@ -141,15 +147,11 @@ def test_count_trigger_persists_observation_then_samples_posts(tmp_path, monkeyp
     assert collector.budget.reads_used == 1
 
 
-def test_duplicate_aligned_count_window_reuses_without_spend_or_sample(
-    tmp_path, monkeypatch
-):
+def test_duplicate_aligned_count_window_reuses_without_spend_or_sample(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     store = make_store(tmp_path)
     cfg = XSource(enabled=True, keywords=["$SOL"], counts_enabled=True)
-    collector = XCollector(
-        Settings(x_bearer_token="token"), cfg, make_universe(), store=store
-    )
+    collector = XCollector(Settings(x_bearer_token="token"), cfg, make_universe(), store=store)
     start, end = collector._count_window()
     store.add_social_counts(
         [
@@ -177,9 +179,7 @@ def test_corrupt_budget_state_skips_all_x_api_calls(tmp_path, monkeypatch):
     budget_path.write_text("{corrupt", encoding="utf-8")
     cfg = XSource(enabled=True, keywords=["$SOL"], counts_enabled=True)
     with patch("httpx.Client.get") as get:
-        collector = XCollector(
-            Settings(x_bearer_token="token"), cfg, make_universe()
-        )
+        collector = XCollector(Settings(x_bearer_token="token"), cfg, make_universe())
         assert collector.collect() == []
     get.assert_not_called()
 
@@ -222,10 +222,7 @@ def test_dollar_ledger_reserves_both_endpoints_and_migrates(tmp_path):
     path = tmp_path / "budget.json"
     now = datetime.now(UTC)
     path.write_text(
-        (
-            f'{{"month":"{now:%Y-%m}","reads":2,'
-            f'"day":"{now:%Y-%m-%d}","day_reads":2}}'
-        ),
+        (f'{{"month":"{now:%Y-%m}","reads":2,"day":"{now:%Y-%m-%d}","day_reads":2}}'),
         encoding="utf-8",
     )
     budget = ReadBudget(
@@ -399,7 +396,23 @@ def test_shadow_social_reject_yields_price_candidate_without_resize(monkeypatch)
         conviction=0.85,
         metadata={"trigger_ts": "2026-08-09T12:00:00Z"},
     )
-    monkeypatch.setattr(engine, "_price_setup", lambda *_args: setup)
+    monkeypatch.setattr(
+        engine,
+        "_price_setup",
+        lambda *_args: SimpleNamespace(setup=setup, evaluated=True, detail="test"),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_snapshot",
+        lambda *_args: SimpleNamespace(
+            ok=True,
+            above_sma=True,
+            price=100,
+            sma=90,
+            volume_z=2,
+            trailing_return=0.05,
+        ),
+    )
     monkeypatch.setattr(engine, "_regime", lambda: (True, "test"))
     candidate = engine.candidates([_low_social_score()])[0]
     assert candidate.social_decision == "would_reject"

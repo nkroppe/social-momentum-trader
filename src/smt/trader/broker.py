@@ -33,10 +33,20 @@ class Broker(Protocol):
         self, product_id: str, notional_usd: float, tp_price: float, sl_price: float
     ) -> Fill: ...
 
-    def close_long(self, product_id: str, qty: float) -> Fill: ...
+    def close_long(
+        self,
+        product_id: str,
+        qty: float,
+        reference_price: float | None = None,
+    ) -> Fill: ...
 
 
-def build_broker(settings: Settings, market: MarketData | None = None) -> Broker:
+def build_broker(
+    settings: Settings,
+    market: MarketData | None = None,
+    *,
+    offline_simulation: bool = False,
+) -> Broker:
     """Return a live Coinbase broker if LIVE and fully configured, else paper.
 
     The live path enforces the trade-only-key guardrails on construction and
@@ -54,6 +64,9 @@ def build_broker(settings: Settings, market: MarketData | None = None) -> Broker
 
     from .paper import PaperBroker
 
-    source = "real Coinbase quotes" if market is not None else "simulated random walk"
+    if market is None and not offline_simulation:
+        raise RuntimeError("PAPER startup blocked: fresh MarketData is required")
+
+    source = "real Coinbase level-1 book" if market is not None else "explicit offline simulation"
     log.info("PAPER mode: constructing simulated broker (%s)", source)
-    return PaperBroker(market=market)
+    return PaperBroker(market=market, offline_simulation=offline_simulation)

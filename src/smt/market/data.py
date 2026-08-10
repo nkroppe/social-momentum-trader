@@ -25,6 +25,46 @@ API_BASE = "https://api.exchange.coinbase.com"
 COINBASE_GRANULARITIES = frozenset({60, 300, 900, 3_600, 21_600, 86_400})
 
 
+class MarketDataUnavailable(RuntimeError):
+    """Fresh, internally consistent market data could not be obtained."""
+
+
+@dataclass(frozen=True)
+class TopOfBookQuote:
+    """Typed Coinbase level-1 book observed by this process."""
+
+    product_id: str
+    bid: float
+    ask: float
+    bid_size: float
+    ask_size: float
+    sequence: int
+    observed_at: float
+
+    @property
+    def midpoint(self) -> float:
+        return (self.bid + self.ask) / 2.0
+
+    @property
+    def spread(self) -> float:
+        return self.ask - self.bid
+
+    @property
+    def spread_bps(self) -> float:
+        return (self.spread / self.midpoint * 10_000.0) if self.midpoint > 0 else float("inf")
+
+    @property
+    def bid_notional(self) -> float:
+        return self.bid * self.bid_size
+
+    @property
+    def ask_notional(self) -> float:
+        return self.ask * self.ask_size
+
+    def age_seconds(self, now: float | None = None) -> float:
+        return max((time.time() if now is None else now) - self.observed_at, 0.0)
+
+
 @dataclass
 class TechnicalSnapshot:
     """Point-in-time technicals for one product.
@@ -63,7 +103,7 @@ class MarketData:
             headers={"User-Agent": "social-momentum-trader"},
         )
         self._candles: dict[tuple[str, int], _Cached] = {}
-        self._prices: dict[str, tuple[float, float]] = {}
+        self._quotes: dict[str, tuple[float, TopOfBookQuote]] = {}
         self._unavailable: dict[str, float] = {}
 
     # ---- Raw fetches --------------------------------------------------------
@@ -80,17 +120,72 @@ class MarketData:
     def _mark_unavailable(self, product_id: str) -> None:
         self._unavailable[product_id] = time.monotonic() + self.cfg.unavailable_retry_seconds
 
+    def _candle_freshness_limit(self, granularity: int) -> float:
+        if granularity == self.cfg.paper_bar_granularity_seconds:
+            return self.cfg.paper_bar_max_age_seconds
+        return granularity * self.cfg.candle_max_age_multiplier
+
+    def validate_candles(
+        self,
+        candles: list[Candle],
+        granularity: int,
+        *,
+        now: float | None = None,
+    ) -> tuple[bool, str]:
+        """Validate OHLCV shape, exact continuity, closure, and recency."""
+        if not candles:
+            return False, "no candles"
+        current = time.time() if now is None else now
+        previous_ts: int | None = None
+        for candle in candles:
+            if candle.ts % granularity:
+                return False, f"unaligned candle at {candle.ts}"
+            if previous_ts is not None and candle.ts != previous_ts + granularity:
+                return False, f"candle gap after {previous_ts}"
+            if (
+                candle.open <= 0
+                or candle.close <= 0
+                or candle.low <= 0
+                or candle.high <= 0
+                or candle.volume < 0
+                or candle.low > min(candle.open, candle.close)
+                or candle.high < max(candle.open, candle.close)
+                or candle.low > candle.high
+            ):
+                return False, f"invalid OHLCV candle at {candle.ts}"
+            previous_ts = candle.ts
+
+        latest_end = candles[-1].ts + granularity
+        if latest_end > current:
+            return False, f"latest candle at {candles[-1].ts} is not closed"
+        age = current - latest_end
+        limit = self._candle_freshness_limit(granularity)
+        if age > limit:
+            return False, f"latest candle is {age:.1f}s old (max {limit:.1f}s)"
+        return True, "ok"
+
+    def _usable_cached_candles(self, cached: _Cached | None, granularity: int) -> list[Candle]:
+        if cached is None:
+            return []
+        valid, _ = self.validate_candles(cached.candles, granularity)
+        return cached.candles if valid else []
+
     def candles(self, product_id: str, granularity: int | None = None) -> list[Candle]:
-        """Return cached hourly (or `granularity`) candles, oldest-first."""
+        """Return fresh, contiguous closed candles oldest-first, else an empty list."""
         gran = granularity or self.cfg.candle_granularity_seconds
         key = (product_id, gran)
         now = time.monotonic()
+        ttl = self.cfg.cache_ttl_seconds
+        if gran == self.cfg.paper_bar_granularity_seconds:
+            ttl = min(ttl, self.cfg.paper_bar_cache_ttl_seconds)
 
         cached = self._candles.get(key)
-        if cached is not None and now - cached.at < self.cfg.cache_ttl_seconds:
-            return cached.candles
+        if cached is not None and now - cached.at < ttl:
+            usable = self._usable_cached_candles(cached, gran)
+            if usable:
+                return usable
         if self._is_unavailable(product_id):
-            return cached.candles if cached else []
+            return self._usable_cached_candles(cached, gran)
 
         # Coinbase Exchange does not offer 4h candles. Build UTC-aligned 4h
         # bars from its standard 1h feed instead of sending an invalid request.
@@ -101,6 +196,10 @@ class MarketData:
                 for candle in aggregate_candles(hourly, gran)
                 if candle.ts + gran <= time.time()
             ]
+            valid, detail = self.validate_candles(parsed, gran)
+            if not valid:
+                log.warning("market: rejected 4h candles for %s: %s", product_id, detail)
+                return self._usable_cached_candles(cached, gran)
             self._candles[key] = _Cached(at=now, candles=parsed)
             return parsed
         if gran not in COINBASE_GRANULARITIES:
@@ -120,65 +219,124 @@ class MarketData:
             rows = resp.json()
         except Exception as exc:  # noqa: BLE001 - never let market data crash the loop
             log.warning("market: candle fetch failed for %s: %s", product_id, exc)
-            return cached.candles if cached else []
+            return self._usable_cached_candles(cached, gran)
 
-        parsed = [
-            Candle(
-                ts=int(r[0]),
-                low=float(r[1]),
-                high=float(r[2]),
-                open=float(r[3]),
-                close=float(r[4]),
-                volume=float(r[5]),
-            )
-            for r in rows
-            if isinstance(r, list) and len(r) >= 6
-        ]
+        try:
+            parsed = [
+                Candle(
+                    ts=int(r[0]),
+                    low=float(r[1]),
+                    high=float(r[2]),
+                    open=float(r[3]),
+                    close=float(r[4]),
+                    volume=float(r[5]),
+                )
+                for r in rows
+                if isinstance(r, list) and len(r) >= 6
+            ]
+        except (TypeError, ValueError) as exc:
+            log.warning("market: malformed candle payload for %s: %s", product_id, exc)
+            return self._usable_cached_candles(cached, gran)
         parsed.sort(key=lambda c: c.ts)
         # Strategies act on candle closes, never a still-forming Coinbase bar.
         parsed = [candle for candle in parsed if candle.ts + gran <= time.time()]
+        valid, detail = self.validate_candles(parsed, gran)
+        if not valid:
+            log.warning("market: rejected %s candles for %s: %s", gran, product_id, detail)
+            return self._usable_cached_candles(cached, gran)
         self._candles[key] = _Cached(at=now, candles=parsed)
         return parsed
 
-    def price(self, product_id: str) -> float | None:
-        """Latest trade price, or None when unavailable."""
-        now = time.monotonic()
-        hit = self._prices.get(product_id)
-        if hit is not None and now - hit[0] < self.cfg.price_cache_ttl_seconds:
+    def quote(self, product_id: str) -> TopOfBookQuote | None:
+        """Fresh level-1 bid/ask and top-size, with no stale fallback."""
+        now_mono = time.monotonic()
+        hit = self._quotes.get(product_id)
+        if (
+            hit is not None
+            and now_mono - hit[0] < self.cfg.price_cache_ttl_seconds
+            and hit[1].age_seconds() <= self.cfg.paper_quote_max_age_seconds
+        ):
             return hit[1]
         if self._is_unavailable(product_id):
             return None
 
         try:
-            resp = self._client.get(f"{API_BASE}/products/{product_id}/ticker")
+            resp = self._client.get(
+                f"{API_BASE}/products/{product_id}/book",
+                params={"level": 1},
+            )
             if resp.status_code == 404:
                 self._mark_unavailable(product_id)
                 return None
             resp.raise_for_status()
-            price = float(resp.json()["price"])
+            payload = resp.json()
+            bid_row = payload["bids"][0]
+            ask_row = payload["asks"][0]
+            quote = TopOfBookQuote(
+                product_id=product_id,
+                bid=float(bid_row[0]),
+                ask=float(ask_row[0]),
+                bid_size=float(bid_row[1]),
+                ask_size=float(ask_row[1]),
+                sequence=int(payload.get("sequence", 0)),
+                observed_at=time.time(),
+            )
+            if (
+                quote.bid <= 0
+                or quote.ask <= 0
+                or quote.bid_size <= 0
+                or quote.ask_size <= 0
+                or quote.ask < quote.bid
+            ):
+                raise ValueError("invalid top-of-book values")
         except Exception as exc:  # noqa: BLE001
-            log.warning("market: price fetch failed for %s: %s", product_id, exc)
-            # Fall back to the most recent candle close before giving up.
-            candles = self._candles.get((product_id, self.cfg.candle_granularity_seconds))
-            if candles and candles.candles:
-                return candles.candles[-1].close
+            log.warning("market: quote fetch failed for %s: %s", product_id, exc)
             return None
 
-        self._prices[product_id] = (now, price)
-        return price
+        self._quotes[product_id] = (now_mono, quote)
+        return quote
+
+    def price(self, product_id: str) -> float | None:
+        """Fresh top-of-book midpoint, or None; never a candle-close fallback."""
+        quote = self.quote(product_id)
+        return quote.midpoint if quote is not None else None
+
+    def paper_bars(self, product_id: str, after_ts: int | None = None) -> list[Candle]:
+        """Return a fresh contiguous one-minute PAPER bar walk after `after_ts`."""
+        granularity = self.cfg.paper_bar_granularity_seconds
+        candles = self.candles(product_id, granularity)
+        valid, detail = self.validate_candles(candles, granularity)
+        if not valid:
+            raise MarketDataUnavailable(f"{product_id} paper bars unavailable: {detail}")
+        if after_ts is None:
+            return candles
+        if after_ts > candles[-1].ts:
+            raise MarketDataUnavailable(
+                f"{product_id} paper bar cursor {after_ts} is ahead of latest {candles[-1].ts}"
+            )
+        newer = [candle for candle in candles if candle.ts > after_ts]
+        if newer and newer[0].ts != after_ts + granularity:
+            raise MarketDataUnavailable(
+                f"{product_id} paper bars are not contiguous after cursor {after_ts}"
+            )
+        return newer
 
     # ---- Derived ------------------------------------------------------------
 
-    def snapshot(self, product_id: str, sma_periods: int, lookback_periods: int) -> (
-        TechnicalSnapshot
-    ):
+    def snapshot(
+        self, product_id: str, sma_periods: int, lookback_periods: int
+    ) -> TechnicalSnapshot:
         candles = self.candles(product_id)
         if len(candles) < 3:
             return TechnicalSnapshot(
                 product_id=product_id, ok=False, detail="insufficient candle history"
             )
 
-        price = self.price(product_id) or candles[-1].close
+        price = self.price(product_id)
+        if price is None or price <= 0:
+            return TechnicalSnapshot(
+                product_id=product_id, ok=False, detail="fresh top-of-book quote unavailable"
+            )
         atr_abs = atr(candles, self.cfg.atr_periods)
         return TechnicalSnapshot(
             product_id=product_id,
@@ -202,8 +360,7 @@ class MarketData:
         candles = self.candles(cfg.benchmark_product_id, cfg.granularity_seconds)
         if len(candles) < cfg.sma_periods:
             detail = (
-                f"{cfg.benchmark_product_id}: only {len(candles)} candles, "
-                f"need {cfg.sma_periods}"
+                f"{cfg.benchmark_product_id}: only {len(candles)} candles, need {cfg.sma_periods}"
             )
             return (not cfg.fail_closed), detail
 

@@ -12,6 +12,7 @@ from ..config import (
     LIVE_ACK_PHRASE,
     REPO_ROOT,
     Settings,
+    get_market,
     get_ops,
     get_security,
     get_settings,
@@ -19,6 +20,7 @@ from ..config import (
     get_strategies,
 )
 from ..ops.soak import SoakTracker
+from ..policy import trading_policy_identity
 
 REQUIRED_CONFIGS = (
     "risk.yaml",
@@ -56,17 +58,32 @@ def _market_data_checks() -> list[CheckResult]:
     from ..market import MarketData
 
     results: list[CheckResult] = []
-    market = MarketData(get_market())
+    market_cfg = get_market()
+    market = MarketData(market_cfg)
     universe = get_universe()
     try:
         missing: list[str] = []
         thin: list[str] = []
+        paper_unready: list[str] = []
         for ticker, spec in universe.symbols.items():
             candles = market.candles(spec.product_id)
             if not candles:
                 missing.append(f"{ticker} ({spec.product_id})")
-            elif len(candles) < get_market().confirmation.sma_periods:
+            elif len(candles) < market_cfg.confirmation.sma_periods:
                 thin.append(f"{ticker}:{len(candles)}")
+            try:
+                quote = market.quote(spec.product_id)
+                bars = market.paper_bars(spec.product_id)
+                if quote is None:
+                    paper_unready.append(f"{ticker}:quote unavailable")
+                elif quote.spread_bps > market_cfg.paper_max_spread_bps:
+                    paper_unready.append(f"{ticker}:spread {quote.spread_bps:.1f}bps")
+                elif quote.ask_notional < market_cfg.paper_min_top_level_notional_usd:
+                    paper_unready.append(f"{ticker}:ask depth ${quote.ask_notional:.2f}")
+                elif not bars:
+                    paper_unready.append(f"{ticker}:1m bars unavailable")
+            except Exception as exc:  # noqa: BLE001
+                paper_unready.append(f"{ticker}:{exc}")
 
         detail = "all universe products resolve on Coinbase"
         if missing:
@@ -74,6 +91,17 @@ def _market_data_checks() -> list[CheckResult]:
         elif thin:
             detail = "listed but thin history: " + ", ".join(thin)
         results.append(CheckResult("market_data_products", not missing, detail))
+        results.append(
+            CheckResult(
+                "paper_execution_market",
+                not paper_unready,
+                (
+                    "fresh quotes and contiguous 1m bars available"
+                    if not paper_unready
+                    else "; ".join(paper_unready)
+                ),
+            )
+        )
 
         regime_ok, regime_detail = market.regime_ok()
         results.append(
@@ -154,9 +182,7 @@ def _x_budget_check(settings) -> CheckResult:
             f"{endpoints} | total {spend} | {pace} - burning today's allowance by "
             f"{blind_from:.0f}h UTC, ingest pauses after that",
         )
-    return CheckResult(
-        "x_read_budget", True, f"{endpoints} | total {spend} | {pace} on pace"
-    )
+    return CheckResult("x_read_budget", True, f"{endpoints} | total {spend} | {pace} on pace")
 
 
 def run_preflight(profile: str = "production") -> list[CheckResult]:
@@ -165,6 +191,7 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
     sources = get_sources()
     security = get_security()
     ops = get_ops()
+    market_cfg = get_market()
     results: list[CheckResult] = []
 
     # --- shared config sanity ---
@@ -195,6 +222,17 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
         return results
 
     # --- production (VPS paper soak) ---
+    results.append(
+        CheckResult(
+            "paper_fail_closed_market",
+            market_cfg.paper_use_real_prices,
+            (
+                "fresh Coinbase quotes and bars required"
+                if market_cfg.paper_use_real_prices
+                else "paper_use_real_prices must be true outside offline simulation"
+            ),
+        )
+    )
     env_candidates = (REPO_ROOT / ".env", Path("/app/.env"), Path.cwd() / ".env")
     env_path = next((p for p in env_candidates if p.exists()), None)
     if env_path is not None:
@@ -205,9 +243,7 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
             CheckResult(".env file", True, "environment variables loaded (no .env in container)")
         )
     else:
-        results.append(
-            CheckResult(".env file", False, "copy from .env.production.example")
-        )
+        results.append(CheckResult(".env file", False, "copy from .env.production.example"))
 
     if ops.preflight.require_postgres:
         pg = settings.database_url.startswith("postgresql")
@@ -299,6 +335,23 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
 
     results.extend(_market_data_checks())
 
+    policy = trading_policy_identity()
+    tracker = SoakTracker(Path(ops.soak.state_file))
+    policy_matches = tracker.policy_matches(policy.fingerprint)
+    state = tracker.current_state()
+    results.append(
+        CheckResult(
+            "soak_policy_generation",
+            policy_matches,
+            (
+                f"generation={state.generation if state else 0} "
+                f"active={(state.active_fingerprint[:12] if state else 'missing')} "
+                f"expected={policy.fingerprint[:12]}"
+                + ("" if policy_matches else " - fingerprint mismatch; soak invalid")
+            ),
+        )
+    )
+
     if profile != "live":
         return results
 
@@ -340,13 +393,18 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
         )
     )
 
-    tracker = SoakTracker(Path(ops.soak.state_file))
-    soak_ok = tracker.meets_minimum(security.min_paper_soak_days)
+    soak_ok = tracker.meets_minimum(
+        security.min_paper_soak_days,
+        policy.fingerprint,
+    )
     results.append(
         CheckResult(
             "paper_soak_duration",
             soak_ok,
-            tracker.summary_line(security.min_paper_soak_days),
+            tracker.summary_line(
+                security.min_paper_soak_days,
+                policy.fingerprint,
+            ),
         )
     )
 

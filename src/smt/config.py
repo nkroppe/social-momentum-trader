@@ -113,6 +113,10 @@ class Settings(BaseSettings):
 class RiskConfig(BaseModel):
     max_position_pct: float = 0.10
     risk_per_trade_pct: float = 0.005
+    max_aggregate_open_heat_pct: float = 0.02
+    max_gross_exposure_pct: float = 0.50
+    max_combined_symbol_exposure_pct: float = 0.10
+    max_micro_exposure_pct: float = 0.15
     max_open_positions: int = 3
     max_trades_per_day: int = 8
     daily_loss_halt_pct: float = -0.05
@@ -169,6 +173,25 @@ class RiskConfig(BaseModel):
             raise ValueError("fraction must be within 0.0..1.0")
         return v
 
+    @field_validator(
+        "max_aggregate_open_heat_pct",
+        "max_gross_exposure_pct",
+        "max_combined_symbol_exposure_pct",
+        "max_micro_exposure_pct",
+    )
+    @classmethod
+    def _global_risk_fraction(cls, v: float) -> float:
+        if not 0.0 < v <= 1.0:
+            raise ValueError("global risk fractions must be within 0.0..1.0")
+        return v
+
+    @field_validator("assumed_fee_pct_per_side")
+    @classmethod
+    def _valid_fee(cls, v: float) -> float:
+        if not 0.0 <= v < 1.0:
+            raise ValueError("assumed_fee_pct_per_side must be within 0.0..<1.0")
+        return v
+
     @field_validator("partial_take_profit_fraction")
     @classmethod
     def _partial_fraction(cls, v: float) -> float:
@@ -182,6 +205,16 @@ class RiskConfig(BaseModel):
         if v <= 0:
             raise ValueError("exit multipliers must be positive")
         return v
+
+    @model_validator(mode="after")
+    def _valid_global_exposure_caps(self) -> RiskConfig:
+        if self.max_aggregate_open_heat_pct > self.max_gross_exposure_pct:
+            raise ValueError("aggregate open heat cannot exceed gross exposure cap")
+        if self.max_combined_symbol_exposure_pct > self.max_gross_exposure_pct:
+            raise ValueError("combined symbol exposure cannot exceed gross exposure cap")
+        if self.max_micro_exposure_pct > self.max_gross_exposure_pct:
+            raise ValueError("micro exposure cannot exceed gross exposure cap")
+        return self
 
 
 # Maximum allowed hold before a time-stop, across any strategy.
@@ -571,9 +604,7 @@ class ShadowReportConfig(BaseModel):
             raise ValueError("shadow report readiness counts must be positive")
         return value
 
-    @field_validator(
-        "min_count_coverage", "min_llm_completion_rate", "max_llm_error_rate"
-    )
+    @field_validator("min_count_coverage", "min_llm_completion_rate", "max_llm_error_rate")
     @classmethod
     def _readiness_fraction(cls, value: float) -> float:
         if not 0.0 <= value <= 1.0:
@@ -641,17 +672,53 @@ class MarketConfig(BaseModel):
     candle_granularity_seconds: int = 3_600
     atr_periods: int = 14
     cache_ttl_seconds: int = 300
-    price_cache_ttl_seconds: int = 20
+    price_cache_ttl_seconds: int = 2
     request_timeout_seconds: float = 15.0
     unavailable_retry_seconds: int = 900
     # Paper fills price off real Coinbase quotes so soak results reflect the
     # same market the live path would trade.
     paper_use_real_prices: bool = True
+    paper_quote_max_age_seconds: float = 10.0
+    paper_bar_granularity_seconds: int = 60
+    paper_bar_max_age_seconds: float = 90.0
+    paper_bar_cache_ttl_seconds: float = 10.0
+    paper_max_spread_bps: float = 40.0
+    paper_min_top_level_notional_usd: float = 100.0
+    paper_max_top_level_participation: float = 0.50
+    paper_adverse_slippage_bps: float = 5.0
+    candle_max_age_multiplier: float = 1.10
     confirmation: ConfirmationConfig = Field(default_factory=ConfirmationConfig)
     regime: RegimeConfig = Field(default_factory=RegimeConfig)
     sizing: VolSizingConfig = Field(default_factory=VolSizingConfig)
     price_action_enabled: bool = True
     price_action_fail_closed: bool = True
+
+    @model_validator(mode="after")
+    def _valid_market_freshness(self) -> MarketConfig:
+        if self.paper_bar_granularity_seconds != 60:
+            raise ValueError("paper_bar_granularity_seconds must be 60")
+        positive = {
+            "price_cache_ttl_seconds": self.price_cache_ttl_seconds,
+            "paper_quote_max_age_seconds": self.paper_quote_max_age_seconds,
+            "paper_bar_max_age_seconds": self.paper_bar_max_age_seconds,
+            "paper_bar_cache_ttl_seconds": self.paper_bar_cache_ttl_seconds,
+            "paper_max_spread_bps": self.paper_max_spread_bps,
+            "paper_min_top_level_notional_usd": self.paper_min_top_level_notional_usd,
+            "paper_adverse_slippage_bps": self.paper_adverse_slippage_bps,
+        }
+        if any(value <= 0 for value in positive.values()):
+            raise ValueError("paper freshness, liquidity, and slippage settings must be positive")
+        if self.price_cache_ttl_seconds > self.paper_quote_max_age_seconds:
+            raise ValueError("price_cache_ttl_seconds cannot exceed paper_quote_max_age_seconds")
+        if self.paper_bar_cache_ttl_seconds > self.paper_bar_max_age_seconds:
+            raise ValueError("paper_bar_cache_ttl_seconds cannot exceed paper_bar_max_age_seconds")
+        if not 0 < self.paper_max_top_level_participation <= 0.50:
+            raise ValueError("paper_max_top_level_participation must be within 0..0.50")
+        if self.paper_max_spread_bps > 1_000 or self.paper_adverse_slippage_bps > 1_000:
+            raise ValueError("paper spread and slippage limits cannot exceed 1000 bps")
+        if self.candle_max_age_multiplier < 1.0:
+            raise ValueError("candle_max_age_multiplier must be at least 1.0")
+        return self
 
 
 # ----------------------------------------------------------------------------

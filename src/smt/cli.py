@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 
 from . import __version__
 from .logging_setup import get_logger
@@ -175,7 +176,12 @@ def _cmd_soak_report(args: argparse.Namespace) -> int:
     from .run import Runner
 
     r = Runner()
-    print(r.soak.summary_line(r.security.min_paper_soak_days))
+    print(
+        r.soak.summary_line(
+            r.security.min_paper_soak_days,
+            r.config_fingerprint,
+        )
+    )
     print()
     return _cmd_compare(args)
 
@@ -302,9 +308,7 @@ def _cmd_preview(_args: argparse.Namespace) -> int:
             cells += f"{f'+{tp - 100:.2f}% / -{100 - sl:.2f}%':<22}"
 
         first = r.strategies[0]
-        notional, _ = r.risk_gate.size_position(
-            cand, first, r.manager.allocation_equity(first)
-        )
+        notional, _ = r.risk_gate.size_position(cand, first, r.manager.allocation_equity(first))
         print(
             f"{ticker:<6}{tier:<7}{r.signals.tier(tier).signal_mode:<8}"
             f"{snap.atr_pct * 100:>7.2f}%  {cells}{notional:>9.2f}"
@@ -319,10 +323,12 @@ def _cmd_soak_reset(args: argparse.Namespace) -> int:
 
     from .config import get_ops, get_security
     from .ops.soak import SoakTracker
+    from .policy import trading_policy_identity
 
     tracker = SoakTracker(Path(get_ops().soak.state_file))
     min_days = get_security().min_paper_soak_days
-    print(f"Current: {tracker.summary_line(min_days)}")
+    policy = trading_policy_identity()
+    print(f"Current: {tracker.summary_line(min_days, policy.fingerprint)}")
 
     if not args.yes:
         answer = input(f"Reset the soak clock to zero ({min_days}d required)? [y/N] ")
@@ -330,8 +336,16 @@ def _cmd_soak_reset(args: argparse.Namespace) -> int:
             print("Aborted.")
             return 1
 
-    state = tracker.restart("paper")
-    print(f"Soak clock reset. New start: {state.started_at.isoformat()}")
+    state = tracker.restart(
+        "paper",
+        fingerprint=policy.fingerprint,
+        manifest=policy.manifest,
+        reason="explicit soak-reset command",
+    )
+    print(
+        f"Soak generation {state.generation} reset. "
+        f"Policy: {state.active_fingerprint[:12]}; new start: {state.started_at.isoformat()}"
+    )
     return 0
 
 
@@ -407,6 +421,40 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_backtest(args: argparse.Namespace) -> int:
+    """Replay deterministic price rules against strict local candle files."""
+    from pathlib import Path
+
+    from .backtest import BacktestDataError, run_backtest
+
+    symbols = None
+    if args.symbols:
+        symbols = [
+            symbol.strip()
+            for value in args.symbols
+            for symbol in value.split(",")
+            if symbol.strip()
+        ]
+    try:
+        result = run_backtest(
+            Path(args.data_dir),
+            Path(args.output_dir),
+            start=args.start,
+            end=args.end,
+            symbols=symbols,
+        )
+    except (BacktestDataError, OSError, ValueError) as exc:
+        print(f"backtest failed: {exc}", file=sys.stderr)
+        return 2
+    summary = result.summary
+    print(
+        f"Backtest complete: {summary['trades']} trades, "
+        f"net ${summary['net_pnl']:+.2f} ({summary['net_return']:+.2%})"
+    )
+    print(f"Artifacts: {Path(args.output_dir).resolve()}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="smt", description="Social Momentum Trader")
     p.add_argument("--version", action="version", version=f"smt {__version__}")
@@ -438,9 +486,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("test-alerts", help="Send a test alert to configured channels").set_defaults(
         func=_cmd_test_alerts
     )
-    sub.add_parser(
-        "soak-report", help="Paper soak progress + strategy comparison"
-    ).set_defaults(func=_cmd_soak_report)
+    sub.add_parser("soak-report", help="Paper soak progress + strategy comparison").set_defaults(
+        func=_cmd_soak_report
+    )
 
     sub.add_parser(
         "preview", help="Show live exit levels and position sizes per symbol"
@@ -450,14 +498,10 @@ def build_parser() -> argparse.ArgumentParser:
     weekly.add_argument(
         "--send", action="store_true", help="Also deliver it to the alert channels now"
     )
-    weekly.add_argument(
-        "--last", action="store_true", help="Show the last completed week instead"
-    )
+    weekly.add_argument("--last", action="store_true", help="Show the last completed week instead")
     weekly.set_defaults(func=_cmd_weekly_report)
 
-    shadow = sub.add_parser(
-        "shadow-report", help="Assess social and Sonnet shadow readiness"
-    )
+    shadow = sub.add_parser("shadow-report", help="Assess social and Sonnet shadow readiness")
     shadow.add_argument(
         "--days",
         type=_positive_int,
@@ -478,6 +522,21 @@ def build_parser() -> argparse.ArgumentParser:
     sim = sub.add_parser("simulate", help="Deterministic end-to-end paper demo")
     sim.add_argument("--ticker", default="SOL")
     sim.set_defaults(func=_cmd_simulate)
+
+    replay = sub.add_parser(
+        "backtest",
+        help="Replay price-only strategy logic from local UTC OHLCV CSV files",
+    )
+    replay.add_argument("--data-dir", required=True, help="Directory containing PRODUCT.csv files")
+    replay.add_argument("--start", help="Inclusive UTC timestamp (ISO-8601 or epoch)")
+    replay.add_argument("--end", help="Exclusive UTC timestamp (ISO-8601 or epoch)")
+    replay.add_argument(
+        "--symbols",
+        nargs="+",
+        help="Ticker/product list; accepts spaces and/or commas (default: available universe)",
+    )
+    replay.add_argument("--output-dir", required=True, help="Artifact output directory")
+    replay.set_defaults(func=_cmd_backtest)
 
     return p
 
