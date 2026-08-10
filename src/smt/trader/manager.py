@@ -21,7 +21,7 @@ from ..logging_setup import get_logger
 from ..market import MarketData, atr, horizon_volatility
 from ..models import ExitReason, Trade, TradeStatus, utcnow
 from ..ops.alerts import Alerter
-from ..ops.reports import trade_closed_alert, trade_opened_alert
+from ..ops.reports import trade_closed_alert, trade_opened_alert, trade_partial_alert
 from ..store import Store
 from .broker import Broker
 from .signals import TradeCandidate
@@ -40,6 +40,7 @@ class TradeManager:
         market_cfg: MarketConfig | None = None,
         alerter: Alerter | None = None,
         trade_alerts: TradeAlertsConfig | None = None,
+        strategies: list[StrategyConfig] | None = None,
     ):
         self.settings = settings
         self.universe = universe
@@ -49,6 +50,7 @@ class TradeManager:
         self.market_cfg = market_cfg if market_cfg is not None else get_market()
         self.alerter = alerter
         self.trade_alerts = trade_alerts if trade_alerts is not None else TradeAlertsConfig()
+        self.strategies = {strategy.name: strategy for strategy in (strategies or [])}
 
     # ---- Notifications -------------------------------------------------------
 
@@ -79,6 +81,7 @@ class TradeManager:
         for t in self.store.open_trades():
             price = self.broker.current_price(t.product_id)
             eq += (price - t.entry_price) * t.qty
+            eq += t.partial_realized_pnl or 0.0
         return eq
 
     def allocation_start_equity(self, strategy: StrategyConfig) -> float:
@@ -101,6 +104,7 @@ class TradeManager:
         for t in self.store.open_trades(strategy.name):
             price = self.broker.current_price(t.product_id)
             eq += (price - t.entry_price) * t.qty
+            eq += t.partial_realized_pnl or 0.0
         return eq
 
     # ---- Entry -------------------------------------------------------------
@@ -130,6 +134,17 @@ class TradeManager:
         price) while sitting inside the noise band of the micro cap (so it stops
         out on nothing).
         """
+        if 0 < candidate.structure_stop < entry_price:
+            sl = round(candidate.structure_stop, 8)
+            risk_per_unit = entry_price - sl
+            tp = round(entry_price + risk_per_unit * strategy.partial_take_profit_r, 8)
+            return (
+                tp,
+                sl,
+                f"structure stop={candidate.stop_pct:.2%} "
+                f"partial={strategy.partial_take_profit_r:.2f}R",
+            )
+
         tp_pct = strategy.take_profit_pct
         sl_pct = strategy.stop_loss_pct
         note = "fixed"
@@ -158,12 +173,79 @@ class TradeManager:
         return tp, sl, f"{note} tp={tp_pct:.2%} sl={sl_pct:.2%}"
 
     def open_position(
-        self, candidate: TradeCandidate, notional_usd: float, strategy: StrategyConfig
+        self,
+        candidate: TradeCandidate,
+        notional_usd: float,
+        strategy: StrategyConfig,
+        risk_budget_usd: float = 0.0,
     ) -> Trade:
         entry_price = self.broker.current_price(candidate.product_id)
         tp, sl, exit_note = self.exit_levels(entry_price, candidate, strategy)
 
         fill = self.broker.open_long(candidate.product_id, notional_usd, tp, sl)
+        if 0 < candidate.structure_stop < fill.price:
+            sl = round(candidate.structure_stop, 8)
+            tp = round(
+                fill.price + (fill.price - sl) * strategy.partial_take_profit_r,
+                8,
+            )
+        else:
+            tp, sl, exit_note = self.exit_levels(fill.price, candidate, strategy)
+        initial_risk = max(fill.price - sl, 0.0)
+        actual_risk = initial_risk * fill.qty
+        fill_slippage = (
+            abs(fill.price - entry_price) / entry_price if entry_price > 0 else 0.0
+        )
+        entry_risk_breach = (
+            risk_budget_usd > 0
+            and candidate.entry_price > 0
+            and candidate.structure_stop > 0
+            and (
+                actual_risk > risk_budget_usd * 1.02
+                or fill_slippage > strategy.entry.max_entry_slippage_pct
+            )
+        )
+
+        if entry_risk_breach and self.broker.name == "paper":
+            unwind = self.broker.close_long(candidate.product_id, fill.qty)
+            fees = fill.fee + unwind.fee
+            trade = Trade(
+                ticker=candidate.ticker,
+                strategy=strategy.name,
+                product_id=candidate.product_id,
+                is_live=False,
+                status=TradeStatus.CLOSED,
+                qty=fill.qty,
+                original_qty=fill.qty,
+                entry_price=fill.price,
+                entry_notional=notional_usd,
+                take_profit=tp,
+                stop_loss=sl,
+                highest_price=fill.price,
+                initial_risk_per_unit=initial_risk,
+                entry_fee_paid=fill.fee,
+                setup=candidate.setup,
+                time_stop_at=utcnow(),
+                exit_price=unwind.price,
+                exit_reason=ExitReason.ENTRY_RISK,
+                realized_pnl=(unwind.price - fill.price) * fill.qty - fees,
+                fees_paid=fees,
+                broker_entry_order_id=fill.order_id,
+                closed_at=utcnow(),
+            )
+            trade = self.store.add_trade(trade)
+            log.error(
+                "UNWOUND[%s] %s entry risk $%.2f > budget $%.2f or slippage %.2f%%",
+                strategy.name,
+                trade.ticker,
+                actual_risk,
+                risk_budget_usd,
+                fill_slippage * 100,
+            )
+            if self.trade_alerts.on_close:
+                self._notify(*trade_closed_alert(trade))
+            return trade
+
         trade = Trade(
             ticker=candidate.ticker,
             strategy=strategy.name,
@@ -171,14 +253,23 @@ class TradeManager:
             is_live=(self.broker.name == "coinbase"),
             status=TradeStatus.OPEN,
             qty=fill.qty,
+            original_qty=fill.qty,
             entry_price=fill.price,
             entry_notional=notional_usd,
             take_profit=tp,
             stop_loss=sl,
+            highest_price=fill.price,
+            initial_risk_per_unit=initial_risk,
+            partial_taken=False,
+            partial_realized_pnl=0.0,
+            trailing_stop=0.0,
+            entry_fee_paid=fill.fee,
+            setup=candidate.setup,
             time_stop_at=utcnow() + timedelta(hours=strategy.time_stop_hours),
             fees_paid=fill.fee,
             broker_entry_order_id=fill.order_id,
         )
+        self.strategies[strategy.name] = strategy
         trade = self.store.add_trade(trade)
         log.info(
             "OPENED[%s] %s qty=%.8f entry=%.6f tp=%.6f sl=%.6f notional=$%.2f (%s)",
@@ -201,15 +292,15 @@ class TradeManager:
         # For paper we simulate the sell; for live-with-server-brackets TP/SL are
         # already handled by the exchange, so we only actively close on time-stop/kill.
         fill = self.broker.close_long(trade.product_id, trade.qty)
-        exit_price = (
-            price if reason in (ExitReason.TAKE_PROFIT, ExitReason.STOP_LOSS) else fill.price
-        )
+        exit_price = fill.price
         gross = (exit_price - trade.entry_price) * trade.qty
         total_fees = trade.fees_paid + fill.fee
+        original_qty = trade.original_qty or trade.qty
+        remaining_entry_fee = trade.entry_fee_paid * (trade.qty / original_qty)
         trade.exit_price = exit_price
         trade.exit_reason = reason
         trade.fees_paid = total_fees
-        trade.realized_pnl = gross - total_fees
+        trade.realized_pnl = trade.partial_realized_pnl + gross - fill.fee - remaining_entry_fee
         trade.status = TradeStatus.CLOSED
         trade.closed_at = utcnow()
         self.store.update_trade(trade)
@@ -225,6 +316,57 @@ class TradeManager:
         if self.trade_alerts.on_close:
             self._notify(*trade_closed_alert(trade))
 
+    def _strategy_for(self, trade: Trade) -> StrategyConfig | None:
+        return self.strategies.get(trade.strategy)
+
+    def _chandelier_stop(self, trade: Trade, strategy: StrategyConfig) -> float:
+        atr_abs = 0.0
+        if self.market is not None:
+            candles = self.market.candles(
+                trade.product_id, strategy.entry.trigger_granularity_seconds
+            )
+            atr_abs = atr(candles, self.market_cfg.atr_periods)
+        if atr_abs <= 0:
+            atr_abs = trade.initial_risk_per_unit
+        if atr_abs <= 0:
+            return trade.trailing_stop
+        proposed = trade.highest_price - strategy.chandelier_atr_mult * atr_abs
+        return max(trade.trailing_stop, trade.stop_loss, proposed)
+
+    def _take_partial(self, trade: Trade, strategy: StrategyConfig) -> None:
+        original_qty = trade.original_qty or trade.qty
+        partial_qty = min(original_qty * strategy.partial_take_profit_fraction, trade.qty)
+        if partial_qty <= 0 or partial_qty >= trade.qty:
+            return
+        fill = self.broker.close_long(trade.product_id, partial_qty)
+        entry_fee_share = trade.entry_fee_paid * (fill.qty / original_qty)
+        gross = (fill.price - trade.entry_price) * fill.qty
+        trade.partial_realized_pnl = gross - fill.fee - entry_fee_share
+        trade.fees_paid += fill.fee
+        trade.qty = max(trade.qty - fill.qty, 0.0)
+        trade.partial_taken = True
+        trade.highest_price = max(trade.highest_price, fill.price)
+        trade.trailing_stop = self._chandelier_stop(trade, strategy)
+        self.store.update_trade(trade)
+        log.info(
+            "PARTIAL[%s] %s qty=%.8f exit=%.6f pnl=$%.2f trail=%.6f",
+            trade.strategy,
+            trade.ticker,
+            fill.qty,
+            fill.price,
+            trade.partial_realized_pnl,
+            trade.trailing_stop,
+        )
+        if self.trade_alerts.on_close:
+            self._notify(
+                *trade_partial_alert(
+                    trade,
+                    fill.qty,
+                    fill.price,
+                    trade.partial_realized_pnl,
+                )
+            )
+
     def manage_open_trades(self, force_flatten: bool = False) -> None:
         # Kill switch flattens EVERY strategy's positions.
         for trade in self.store.open_trades():
@@ -239,6 +381,49 @@ class TradeManager:
                 continue
 
             price = self.broker.current_price(trade.product_id)
+
+            strategy = self._strategy_for(trade)
+            advanced_paper = (
+                strategy is not None
+                and strategy.advanced_exit_enabled
+                and self.broker.name == "paper"
+                and trade.setup not in ("", "offline_social")
+            )
+            if advanced_paper:
+                trade.highest_price = max(trade.highest_price or trade.entry_price, price)
+
+                if price <= trade.stop_loss:
+                    self._close(trade, price, ExitReason.STOP_LOSS)
+                    continue
+
+                if not trade.partial_taken and price >= trade.take_profit:
+                    self._take_partial(trade, strategy)
+                    continue
+
+                if trade.partial_taken:
+                    prior_trail = trade.trailing_stop
+                    trade.trailing_stop = self._chandelier_stop(trade, strategy)
+                    if price <= trade.trailing_stop:
+                        self._close(trade, price, ExitReason.TRAILING_STOP)
+                        continue
+                    if trade.trailing_stop != prior_trail:
+                        self.store.update_trade(trade)
+                else:
+                    opened = trade.opened_at
+                    opened = (
+                        opened if opened.tzinfo else opened.replace(tzinfo=utcnow().tzinfo)
+                    )
+                    stale_at = opened + timedelta(hours=strategy.stale_time_stop_hours)
+                    one_r = trade.entry_price + trade.initial_risk_per_unit
+                    if utcnow() >= stale_at and trade.highest_price < one_r:
+                        self._close(trade, price, ExitReason.TIME_STOP)
+                        continue
+
+                if utcnow() >= tstop:
+                    self._close(trade, price, ExitReason.TIME_STOP)
+                else:
+                    self.store.update_trade(trade)
+                continue
 
             # TP/SL: simulated in paper; server-side in live (skip to avoid double close).
             if not self.broker.server_side_brackets:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib.util
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,6 +28,7 @@ REQUIRED_CONFIGS = (
     "security.yaml",
     "market.yaml",
     "signals.yaml",
+    "llm.yaml",
 )
 
 
@@ -90,10 +93,9 @@ def _market_data_checks() -> list[CheckResult]:
 def _x_budget_check(settings) -> CheckResult:
     """Project this month's X read burn against the configured budget.
 
-    Reads are billed per tweet returned, so a short poll interval across many
-    cashtags burns budget far faster than the interval alone suggests. An
-    exhausted budget silently stops ingest, which would leave a soak collecting
-    nothing, so surface the trajectory before that happens.
+    The shared dollar ledger includes recent-count requests and distinct posts
+    returned by triggered searches. An exhausted daily or monthly budget stops
+    ingest, so surface endpoint usage and the trajectory before that happens.
 
     The rate is measured against time spent polling, not the elapsed month: a
     bot started on the 8th has spent nothing on the first seven days, and
@@ -102,25 +104,34 @@ def _x_budget_check(settings) -> CheckResult:
     """
     from datetime import UTC, datetime
 
-    from ..ingest.x import ReadBudget
+    from ..ingest.x import BudgetStateUnavailable, ReadBudget
 
-    limit = settings.x_monthly_read_budget
     budget = ReadBudget(
         Path("./data/x_budget.json"),
-        limit,
-        settings.x_read_cost_usd,
+        settings.x_monthly_read_budget,
+        settings.effective_x_post_read_cost_usd,
         settings.x_budget_opening_reads,
+        monthly_budget_usd=settings.effective_x_monthly_budget_usd,
+        count_request_cost_usd=settings.x_recent_count_request_cost_usd,
     )
-    used = budget.reads_used
-    started = budget.started_at
+    try:
+        started = budget.started_at
+        allowance = budget.daily_dollar_allowance()
+        day_used = budget.day_spend_usd()
+        spend = f"${budget.spend_usd:,.2f} of ${budget.budget_usd:,.2f}"
+        pace = f"today ${day_used:,.3f}/${allowance:,.3f}"
+        endpoints = (
+            f"post reads={budget.reads_used:,} (${budget.post_spend_usd:,.2f}), "
+            f"count requests={budget.count_requests_used:,} "
+            f"(${budget.count_spend_usd:,.2f})"
+        )
+    except BudgetStateUnavailable as exc:
+        return CheckResult("x_read_budget", False, str(exc))
 
-    allowance = budget.daily_allowance()
-    day_used = budget.day_used()
-    spend = f"${budget.spend_usd:,.2f} of ${budget.budget_usd:,.2f}"
-    pace = f"today {day_used:,}/{allowance:,}"
-
-    if used == 0 or started is None:
-        return CheckResult("x_read_budget", True, f"{spend} used this month | {pace}")
+    if budget.spend_usd == 0 or started is None:
+        return CheckResult(
+            "x_read_budget", True, f"{endpoints} | total {spend} this month | {pace}"
+        )
 
     # The monthly cap is enforced in the collector, so overspend is not the
     # risk worth flagging. The risk is spending the daily allowance early and
@@ -129,17 +140,23 @@ def _x_budget_check(settings) -> CheckResult:
     day_elapsed = (now.hour + now.minute / 60.0) / 24.0
     spent_ahead_of_pace = allowance > 0 and (day_used / allowance) > day_elapsed + 0.25
 
-    if used > limit:
-        return CheckResult("x_read_budget", False, f"{spend} - monthly cap exceeded | {pace}")
+    if budget.spend_usd > budget.budget_usd:
+        return CheckResult(
+            "x_read_budget",
+            False,
+            f"{endpoints} | total {spend} - monthly cap exceeded | {pace}",
+        )
     if spent_ahead_of_pace:
         blind_from = (day_used / allowance) * 24 if allowance else 24
         return CheckResult(
             "x_read_budget",
             False,
-            f"{spend} | {pace} - burning today's allowance by "
+            f"{endpoints} | total {spend} | {pace} - burning today's allowance by "
             f"{blind_from:.0f}h UTC, ingest pauses after that",
         )
-    return CheckResult("x_read_budget", True, f"{spend} | {pace} on pace")
+    return CheckResult(
+        "x_read_budget", True, f"{endpoints} | total {spend} | {pace} on pace"
+    )
 
 
 def run_preflight(profile: str = "production") -> list[CheckResult]:
@@ -243,6 +260,34 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
             )
         )
 
+    from ..llm import get_llm
+
+    llm = get_llm()
+    if llm.enabled:
+        key_ok = bool(os.environ.get("CURSOR_API_KEY", "").strip())
+        sdk_ok = importlib.util.find_spec("cursor_sdk") is not None
+        model_detail = ""
+        model_ok = False
+        if key_ok and sdk_ok:
+            try:
+                from ..llm.provider import CursorJSONProvider
+
+                model_detail = CursorJSONProvider(llm)._resolve_model()
+                model_ok = True
+            except Exception as exc:  # noqa: BLE001
+                model_detail = str(exc)
+        results.append(
+            CheckResult(
+                "cursor_llm",
+                key_ok and sdk_ok and model_ok,
+                (
+                    f"{model_detail}; max {llm.max_calls_per_month} calls/month"
+                    if model_ok
+                    else model_detail or "set CURSOR_API_KEY and install the llm extra"
+                ),
+            )
+        )
+
     control = Path(settings.kill_file).parent
     results.append(
         CheckResult(
@@ -270,6 +315,19 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
             "live_ack",
             settings.live_ack == LIVE_ACK_PHRASE,
             f"LIVE_ACK must equal {LIVE_ACK_PHRASE!r}",
+        )
+    )
+    advanced_exit = any(st.advanced_exit_enabled for st in get_strategies().enabled())
+    results.append(
+        CheckResult(
+            "advanced_exit_live_parity",
+            not advanced_exit,
+            (
+                "advanced PAPER partial/chandelier exits enabled; live startup is blocked "
+                "until Coinbase bracket-adjustment parity exists"
+                if advanced_exit
+                else "advanced exits disabled"
+            ),
         )
     )
 

@@ -104,9 +104,12 @@ def _universe(tier: str) -> UniverseConfig:
 
 
 def _engine(tier: str, **strategy_overrides) -> SignalEngine:
+    signals = get_signals().model_copy(deep=True)
+    signals.social_decision_mode = "enforce"
     return SignalEngine(
         make_strategy(**strategy_overrides),
         _universe(tier),
+        signals,
         market_cfg=social_only_market_cfg(),
     )
 

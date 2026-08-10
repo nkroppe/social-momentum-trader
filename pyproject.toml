@@ -23,6 +23,11 @@ live = [
     "coinbase-advanced-py>=1.2",       # Coinbase Advanced Trade
     "psycopg[binary]>=3.2",            # Postgres driver
 ]
+llm = [
+    # Text-only Cursor agents (tools=[]), used sparsely for catalyst vetoes and
+    # weekly advisory reflections. Exact Sonnet model is account-discovered.
+    "cursor-sdk>=1.0.27",
+]
 dev = [
     "ruff>=0.5",
     "pytest>=8.2",

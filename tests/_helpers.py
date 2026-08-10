@@ -17,6 +17,8 @@ def social_only_market_cfg() -> MarketConfig:
     cfg.confirmation.enabled = False
     cfg.confirmation.fail_closed = False
     cfg.regime.enabled = False
+    cfg.price_action_enabled = False
+    cfg.price_action_fail_closed = False
     return cfg
 
 

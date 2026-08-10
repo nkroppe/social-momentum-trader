@@ -20,6 +20,7 @@ from .config import (
     get_universe,
 )
 from .ingest import build_collectors
+from .llm import LLMCoordinator, get_llm
 from .logging_setup import get_logger
 from .market import MarketData
 from .ops import Alerter, KillSwitch
@@ -52,6 +53,7 @@ class Runner:
         self.security = get_security()
         self.ops = get_ops()
         self.signals = get_signals()
+        self.llm_cfg = get_llm()
         self.strategies = get_strategies().enabled()
         self.offline = offline
 
@@ -64,6 +66,8 @@ class Runner:
             self.market_cfg.confirmation.fail_closed = False
             self.market_cfg.regime.enabled = False
             self.market_cfg.sizing.enabled = False
+            self.market_cfg.price_action_enabled = False
+            self.market_cfg.price_action_fail_closed = False
 
         self._enforce_live_latches()
 
@@ -79,7 +83,9 @@ class Runner:
 
         self.alerter = Alerter(self.settings)
         self.kill = KillSwitch(self.settings.kill_file)
-        self.collectors = build_collectors(self.settings, self.sources, self.universe)
+        self.collectors = build_collectors(
+            self.settings, self.sources, self.universe, self.store
+        )
 
         self.market = None if offline else MarketData(self.market_cfg)
 
@@ -113,7 +119,12 @@ class Runner:
 
         paper_market = self.market if self.market_cfg.paper_use_real_prices else None
         self.broker = build_broker(self.settings, paper_market)
-        self.risk_gate = RiskGate(self.store, self.signals, self.market_cfg)
+        self.risk_gate = RiskGate(
+            self.store,
+            self.signals,
+            self.market_cfg,
+            mark_price=self.market.price if self.market is not None else self.broker.current_price,
+        )
         self.manager = TradeManager(
             self.settings,
             self.universe,
@@ -123,9 +134,19 @@ class Runner:
             self.market_cfg,
             alerter=self.alerter,
             trade_alerts=self.ops.trade_alerts,
+            strategies=self.strategies,
         )
         self.soak = SoakTracker(Path(self.ops.soak.state_file))
         self.weekly = WeeklyScheduler(self.ops.weekly_report)
+        self.llm = LLMCoordinator(
+            self.llm_cfg,
+            self.store,
+            self.alerter,
+            self.strategies,
+            self.signals,
+            self.market_cfg,
+            offline=offline,
+        )
         self._last_ingest = 0.0
         self._last_digest = 0.0
         self._digest_interval_s = self.ops.soak.digest_interval_hours * 3600
@@ -166,6 +187,11 @@ class Runner:
 
     def _enforce_live_latches(self) -> None:
         """Second latch: force paper unless LIVE and the ack phrase are both set."""
+        if self.settings.live and any(st.advanced_exit_enabled for st in self.strategies):
+            raise RuntimeError(
+                "LIVE startup blocked: advanced partial/chandelier exits are PAPER-only "
+                "until Coinbase server-side bracket adjustment parity is implemented."
+            )
         if self.settings.live and self.settings.live_ack != LIVE_ACK_PHRASE:
             log.critical(
                 "LIVE=true but LIVE_ACK != %s -> forcing PAPER mode for safety.",
@@ -222,12 +248,54 @@ class Runner:
             scores = self.scorers[st.name].score_all()
             candidates = self.signal_engines[st.name].candidates(scores)
             for cand in candidates:
+                self._audit_candidate(cand, risk_status="not_evaluated")
+                if not self.llm.review_candidate(cand):
+                    self._audit_candidate(cand, risk_status="blocked_by_llm")
+                    continue
                 decision = self.risk_gate.evaluate(cand, st, equity_alloc, start_alloc)
+                self._audit_candidate(
+                    cand,
+                    risk_status="approved" if decision.approved else "rejected",
+                    risk_reason=decision.reason,
+                )
                 if not decision.approved:
                     log.info("REJECT[%s] %s: %s", st.name, cand.ticker, decision.reason)
                     continue
-                self.manager.open_position(cand, decision.notional_usd, st)
+                trade = self.manager.open_position(
+                    cand,
+                    decision.notional_usd,
+                    st,
+                    risk_budget_usd=decision.risk_budget_usd,
+                )
+                self.store.link_shadow_trade(cand.decision_key, trade.id)
                 equity_alloc = self.manager.allocation_equity(st)
+
+    def _audit_candidate(
+        self,
+        candidate,
+        *,
+        risk_status: str,
+        risk_reason: str = "",
+    ) -> None:
+        """Upsert the latest social/LLM/risk view for one stable setup."""
+        self.store.upsert_shadow_decision(
+            decision_key=candidate.decision_key,
+            ticker=candidate.ticker,
+            strategy=candidate.strategy,
+            tier=candidate.tier,
+            decision_mode=candidate.decision_mode,
+            setup=candidate.setup,
+            count_volume=candidate.count_volume,
+            engagement=candidate.engagement,
+            social_decision=candidate.social_decision,
+            social_reason=candidate.social_reason,
+            llm_status=candidate.llm_status or "not_evaluated",
+            llm_score=candidate.llm_score,
+            llm_veto=candidate.llm_veto,
+            llm_reason=candidate.llm_reason,
+            risk_status=risk_status,
+            risk_reason=risk_reason,
+        )
 
     def _send_digest(self) -> None:
         """Periodic soak summary to configured alert channels (non-critical)."""
@@ -268,6 +336,14 @@ class Runner:
         if occurrence is None:
             return
         subject, body = self.weekly_report(occurrence)
+        start, end = self.weekly.report_window(occurrence)
+        self.llm.request_weekly_reflection(
+            occurrence=occurrence,
+            start=start,
+            end=end,
+            report_subject=subject,
+            report_body=body,
+        )
         if not self.alerter.notify(subject, body, critical=False):
             log.warning(
                 "Weekly report for %s was not delivered; will retry next loop",
@@ -278,6 +354,10 @@ class Runner:
         log.info("Sent weekly report for week ending %s", occurrence.isoformat())
 
     def step(self) -> None:
+        # Shadow reviews are observational and should finish even while the
+        # kill switch is holding the trading path flat.
+        self.llm.poll_judgements()
+
         # 1) Kill switch: flatten and block entries.
         if self.kill.is_active():
             if not self._killed_notified:
@@ -319,6 +399,7 @@ class Runner:
                     self._send_digest()
                     self._last_digest = time.monotonic()
                 self._send_weekly_if_due()
+                self.llm.poll_reflection()
             except Exception as exc:  # noqa: BLE001
                 log.exception("loop error: %s", exc)
                 self.alerter.notify("Loop error", str(exc))

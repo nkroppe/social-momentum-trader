@@ -27,3 +27,18 @@ weekly_report:
   minute: 0
   state_file: ./data/weekly_report.json
   max_trades_listed: 40
+
+# Advisory evidence thresholds for `smt shadow-report`. These deliberately
+# fail closed on short observation spans, count downtime, small outcome groups,
+# unresolved outcomes, LLM errors, or weak realized expectancy separation.
+shadow_report:
+  report_days: 28
+  min_observation_days: 28
+  min_count_coverage: 0.95
+  min_closed_linked_trades_per_tier: 30
+  # Each pass/reject group needs this many linked, closed outcomes. Raw audit
+  # counts remain visible but do not satisfy the evidence floor.
+  min_completed_per_outcome_group: 10
+  min_llm_completion_rate: 0.95
+  max_llm_error_rate: 0.05
+  min_expectancy_separation_r: 0.25

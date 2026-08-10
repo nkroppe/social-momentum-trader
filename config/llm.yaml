@@ -1,0 +1,37 @@
+# Sparse L3 decision support through the Cursor SDK.
+#
+# Cursor runs use the same pricing/request pools as IDE and Cloud Agent runs and
+# appear under the SDK tag in the Cursor usage dashboard. The exact Sonnet model
+# is discovered from the API key's model catalog at runtime; no stale model ID
+# is hard-coded.
+enabled: true
+provider: cursor
+model_family: sonnet
+
+# Hard local invocation ceiling. Typical sparse usage should be far below this:
+# only technically valid large/mid/micro setups are reviewed, plus one weekly
+# reflection. This controls calls, while Cursor's usage dashboard is the source
+# of truth for included credits and billed cost.
+max_calls_per_month: 250
+request_timeout_seconds: 120
+budget_state_file: ./data/llm_budget.json
+sandbox_dir: ./data/llm_sandbox
+
+judge:
+  enabled: true
+  # BTC/ETH are deliberately absent: their entries are pure price action.
+  tiers: [large, mid, micro]
+  # Counterfactual enforcement policy recorded during social shadow mode.
+  # These tiers would need a real catalyst if enforcement is enabled later.
+  required_tiers: [mid, micro]
+  min_catalyst_score: 0.55
+  cache_ttl_minutes: 60
+  max_social_posts: 12
+  max_post_chars: 500
+  state_file: ./data/llm_judge_cache.json
+
+reflection:
+  enabled: true
+  state_file: ./data/weekly_reflections.jsonl
+  max_trades: 80
+  deliver_telegram: true

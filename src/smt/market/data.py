@@ -17,11 +17,12 @@ import httpx
 
 from ..config import MarketConfig
 from ..logging_setup import get_logger
-from .indicators import Candle, atr, sma, trailing_return, volume_zscore
+from .indicators import Candle, aggregate_candles, atr, sma, trailing_return, volume_zscore
 
 log = get_logger("smt.market")
 
 API_BASE = "https://api.exchange.coinbase.com"
+COINBASE_GRANULARITIES = frozenset({60, 300, 900, 3_600, 21_600, 86_400})
 
 
 @dataclass
@@ -91,6 +92,21 @@ class MarketData:
         if self._is_unavailable(product_id):
             return cached.candles if cached else []
 
+        # Coinbase Exchange does not offer 4h candles. Build UTC-aligned 4h
+        # bars from its standard 1h feed instead of sending an invalid request.
+        if gran == 14_400:
+            hourly = self.candles(product_id, 3_600)
+            parsed = [
+                candle
+                for candle in aggregate_candles(hourly, gran)
+                if candle.ts + gran <= time.time()
+            ]
+            self._candles[key] = _Cached(at=now, candles=parsed)
+            return parsed
+        if gran not in COINBASE_GRANULARITIES:
+            log.warning("market: unsupported Coinbase candle granularity %s", gran)
+            return []
+
         try:
             resp = self._client.get(
                 f"{API_BASE}/products/{product_id}/candles",
@@ -119,6 +135,8 @@ class MarketData:
             if isinstance(r, list) and len(r) >= 6
         ]
         parsed.sort(key=lambda c: c.ts)
+        # Strategies act on candle closes, never a still-forming Coinbase bar.
+        parsed = [candle for candle in parsed if candle.ts + gran <= time.time()]
         self._candles[key] = _Cached(at=now, candles=parsed)
         return parsed
 

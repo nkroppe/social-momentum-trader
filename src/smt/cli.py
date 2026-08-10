@@ -10,6 +10,13 @@ from .logging_setup import get_logger
 log = get_logger("smt.cli")
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def _cmd_run(_args: argparse.Namespace) -> int:
     from .run import Runner
 
@@ -204,6 +211,50 @@ def _cmd_weekly_report(args: argparse.Namespace) -> int:
         else:
             print("\nReport delivery failed; state not updated (retry with --send).")
             return 1
+    return 0
+
+
+def _cmd_shadow_report(args: argparse.Namespace) -> int:
+    """Build the advisory report from local config and persisted data only."""
+    from datetime import UTC, datetime, timedelta
+
+    from .config import (
+        get_ops,
+        get_settings,
+        get_signals,
+        get_sources,
+        get_universe,
+    )
+    from .llm import get_llm
+    from .ops import Alerter
+    from .ops.shadow_report import build_shadow_report
+    from .store import Store
+
+    settings = get_settings()
+    report_cfg = get_ops().shadow_report
+    days = args.days if args.days is not None else report_cfg.report_days
+    end = datetime.now(UTC)
+    start = end - timedelta(days=days)
+    store = Store(settings.database_url)
+    store.init_db()
+    subject, body = build_shadow_report(
+        store,
+        report_cfg,
+        get_sources(),
+        get_signals(),
+        get_universe(),
+        get_llm(),
+        start,
+        end,
+    )
+    print(subject)
+    print("-" * len(subject))
+    print(body)
+    if args.send and not Alerter(settings).notify(subject, body, critical=False):
+        print("\nReport delivery failed.")
+        return 1
+    if args.send:
+        print("\nReport dispatched to configured alert channels.")
     return 0
 
 
@@ -403,6 +454,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--last", action="store_true", help="Show the last completed week instead"
     )
     weekly.set_defaults(func=_cmd_weekly_report)
+
+    shadow = sub.add_parser(
+        "shadow-report", help="Assess social and Sonnet shadow readiness"
+    )
+    shadow.add_argument(
+        "--days",
+        type=_positive_int,
+        default=None,
+        help="Trailing UTC days (default: config/ops.yaml)",
+    )
+    shadow.add_argument(
+        "--send", action="store_true", help="Also deliver through configured alerts"
+    )
+    shadow.set_defaults(func=_cmd_shadow_report)
 
     reset = sub.add_parser(
         "soak-reset", help="Restart the paper soak clock (after a signal change)"

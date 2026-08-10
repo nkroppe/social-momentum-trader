@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 
-from smt.ingest.x import ReadBudget
+import pytest
+
+from smt.ingest.x import BudgetStateUnavailable, ReadBudget
 
 
 def _budget(tmp_path, limit=20_000) -> ReadBudget:
@@ -144,12 +146,14 @@ def test_a_new_month_resets_usage_and_the_clock(tmp_path):
     assert b.register(["1"], now=AUG_8) == 1
 
 
-def test_corrupt_state_does_not_crash_ingest(tmp_path):
+def test_corrupt_state_fails_closed(tmp_path):
     path = tmp_path / "x_budget.json"
     path.write_text("{not json", encoding="utf-8")
     b = ReadBudget(path, 20_000)
-    assert b.reads_used == 0
-    assert b.register(["1"], now=AUG_8) == 1
+    with pytest.raises(BudgetStateUnavailable, match="refusing paid requests"):
+        _ = b.reads_used
+    with pytest.raises(BudgetStateUnavailable):
+        b.register(["1"], now=AUG_8)
 
 
 def test_legacy_state_without_daily_fields_is_upgraded(tmp_path):

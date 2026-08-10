@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -59,11 +60,15 @@ class Settings(BaseSettings):
 
     # X
     x_bearer_token: str = ""
-    # Billable post reads per month. X dedupes repeat reads of the same post
-    # within a UTC day, so this counts distinct posts, not API responses.
-    x_monthly_read_budget: int = 50_000
-    # X pay-per-use list price per post read; used to report spend in dollars.
-    x_read_cost_usd: float = 0.005
+    # Dollar cap shared by recent-count requests and distinct post reads.
+    x_monthly_budget_usd: float = 100.0
+    x_post_read_cost_usd: float = 0.005
+    x_recent_count_request_cost_usd: float = 0.005
+    # Legacy read cap/cost remain supported. If X_MONTHLY_BUDGET_USD is absent
+    # and X_MONTHLY_READ_BUDGET is explicitly set, the old read cap determines
+    # the dollar ceiling.
+    x_monthly_read_budget: int = 20_000
+    x_read_cost_usd: float | None = None
     # Reads already billed this month per the X console; applied when a new
     # billing month starts so the local cap stays aligned with reality.
     x_budget_opening_reads: int = 0
@@ -82,6 +87,23 @@ class Settings(BaseSettings):
     def coinbase_configured(self) -> bool:
         return bool(self.coinbase_api_key and self.coinbase_api_secret)
 
+    @property
+    def effective_x_post_read_cost_usd(self) -> float:
+        """Prefer the explicit new price, while honoring the legacy cost env."""
+        if "x_read_cost_usd" in self.model_fields_set and self.x_read_cost_usd is not None:
+            return self.x_read_cost_usd
+        return self.x_post_read_cost_usd
+
+    @property
+    def effective_x_monthly_budget_usd(self) -> float:
+        """Translate explicitly configured legacy read caps into dollars."""
+        if (
+            "x_monthly_read_budget" in self.model_fields_set
+            and "x_monthly_budget_usd" not in self.model_fields_set
+        ):
+            return self.x_monthly_read_budget * self.effective_x_post_read_cost_usd
+        return self.x_monthly_budget_usd
+
 
 # ----------------------------------------------------------------------------
 # Typed YAML configs
@@ -90,6 +112,7 @@ class Settings(BaseSettings):
 
 class RiskConfig(BaseModel):
     max_position_pct: float = 0.10
+    risk_per_trade_pct: float = 0.005
     max_open_positions: int = 3
     max_trades_per_day: int = 8
     daily_loss_halt_pct: float = -0.05
@@ -108,6 +131,11 @@ class RiskConfig(BaseModel):
     atr_stop_loss_mult: float = 1.0
     atr_min_stop_pct: float = 0.008
     atr_max_stop_pct: float = 0.15
+    advanced_exit_enabled: bool = True
+    partial_take_profit_fraction: float = 0.50
+    partial_take_profit_r: float = 1.5
+    chandelier_atr_mult: float = 3.0
+    stale_time_stop_hours: int = 4
 
     # Signal entry thresholds
     signal_min_zscore: float = 2.5
@@ -134,6 +162,27 @@ class RiskConfig(BaseModel):
             raise ValueError("exit_style must be 'atr' or 'fixed'")
         return v
 
+    @field_validator("risk_per_trade_pct")
+    @classmethod
+    def _fraction(cls, v: float) -> float:
+        if not 0.0 < v <= 1.0:
+            raise ValueError("fraction must be within 0.0..1.0")
+        return v
+
+    @field_validator("partial_take_profit_fraction")
+    @classmethod
+    def _partial_fraction(cls, v: float) -> float:
+        if not 0.0 < v < 1.0:
+            raise ValueError("partial_take_profit_fraction must be within 0.0..<1.0")
+        return v
+
+    @field_validator("partial_take_profit_r", "chandelier_atr_mult")
+    @classmethod
+    def _positive_multiplier(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("exit multipliers must be positive")
+        return v
+
 
 # Maximum allowed hold before a time-stop, across any strategy.
 MAX_TIME_STOP_HOURS = 72
@@ -148,6 +197,11 @@ _INHERITED_FIELDS = (
     "atr_stop_loss_mult",
     "atr_min_stop_pct",
     "atr_max_stop_pct",
+    "advanced_exit_enabled",
+    "partial_take_profit_fraction",
+    "partial_take_profit_r",
+    "chandelier_atr_mult",
+    "stale_time_stop_hours",
     "signal_min_zscore",
     "signal_min_distinct_sources",
     "signal_min_distinct_authors",
@@ -160,6 +214,7 @@ _INHERITED_FIELDS = (
     "confirm_lookback_hours",
     "confirm_min_return_pct",
     "max_position_pct",
+    "risk_per_trade_pct",
     "max_open_positions",
     "max_trades_per_day",
     "daily_loss_halt_pct",
@@ -168,6 +223,56 @@ _INHERITED_FIELDS = (
     "min_order_notional_usd",
     "assumed_fee_pct_per_side",
 )
+
+
+class EntryRulesConfig(BaseModel):
+    """Deterministic price-action rules for one holding methodology."""
+
+    trigger_granularity_seconds: int = 900
+    bias_granularity_seconds: int = 3_600
+    breakout_lookback: int = 20
+    structure_lookback: int = 20
+    rsi_periods: int = 14
+    rsi_min: float = 55.0
+    volume_lookback: int = 20
+    compression_lookback: int = 20
+    compression_recent: int = 5
+    compression_ratio_max: float = 0.80
+    require_compression: bool = False
+    retest_window: int = 3
+    retest_tolerance_pct: float = 0.003
+    vwap_periods: int = 32
+    allow_vwap_pullback: bool = True
+    require_trigger_ema_stack: bool = True
+    require_bias_ema_stack: bool = True
+    stop_atr_buffer: float = 0.25
+    min_stop_pct: float = 0.005
+    max_stop_pct: float = 0.15
+    max_entry_slippage_pct: float = 0.005
+
+    @field_validator(
+        "breakout_lookback",
+        "structure_lookback",
+        "rsi_periods",
+        "volume_lookback",
+        "compression_lookback",
+        "compression_recent",
+        "retest_window",
+        "vwap_periods",
+    )
+    @classmethod
+    def _positive_period(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("indicator periods must be positive")
+        return v
+
+    @model_validator(mode="after")
+    def _valid_stops(self) -> EntryRulesConfig:
+        if not 0 < self.min_stop_pct <= self.max_stop_pct:
+            raise ValueError("entry stop bounds must satisfy 0 < min <= max")
+        if not 0 < self.max_entry_slippage_pct <= 0.05:
+            raise ValueError("max_entry_slippage_pct must be within 0..5%")
+        return self
 
 
 class StrategyConfig(BaseModel):
@@ -190,6 +295,11 @@ class StrategyConfig(BaseModel):
     atr_stop_loss_mult: float
     atr_min_stop_pct: float
     atr_max_stop_pct: float
+    advanced_exit_enabled: bool
+    partial_take_profit_fraction: float
+    partial_take_profit_r: float
+    chandelier_atr_mult: float
+    stale_time_stop_hours: int
 
     # Signal thresholds + scorer windowing
     signal_min_zscore: float
@@ -208,6 +318,7 @@ class StrategyConfig(BaseModel):
 
     # Per-strategy hard limits (independent of the other strategy)
     max_position_pct: float
+    risk_per_trade_pct: float
     max_open_positions: int
     max_trades_per_day: int
     daily_loss_halt_pct: float
@@ -215,6 +326,7 @@ class StrategyConfig(BaseModel):
     cooldown_minutes_after_stop: int
     min_order_notional_usd: float
     assumed_fee_pct_per_side: float
+    entry: EntryRulesConfig = Field(default_factory=EntryRulesConfig)
 
     @field_validator("time_stop_hours")
     @classmethod
@@ -222,6 +334,20 @@ class StrategyConfig(BaseModel):
         if v <= 0 or v > MAX_TIME_STOP_HOURS:
             raise ValueError(f"time_stop_hours must be in 1..{MAX_TIME_STOP_HOURS}")
         return v
+
+    @model_validator(mode="after")
+    def _valid_exit_times(self) -> StrategyConfig:
+        if self.stale_time_stop_hours <= 0:
+            raise ValueError("stale_time_stop_hours must be positive")
+        if self.stale_time_stop_hours > self.time_stop_hours:
+            raise ValueError("stale_time_stop_hours cannot exceed time_stop_hours")
+        if not 0 < self.risk_per_trade_pct <= 1:
+            raise ValueError("risk_per_trade_pct must be within 0.0..1.0")
+        if not 0 < self.partial_take_profit_fraction < 1:
+            raise ValueError("partial_take_profit_fraction must be within 0.0..<1.0")
+        if self.partial_take_profit_r <= 0 or self.chandelier_atr_mult <= 0:
+            raise ValueError("advanced exit multipliers must be positive")
+        return self
 
     @field_validator("allocation")
     @classmethod
@@ -291,6 +417,15 @@ class XSource(BaseModel):
     watch_accounts: list[str] = Field(default_factory=list)
     keywords: list[str] = Field(default_factory=list)
     max_results_per_query: int = 100
+    counts_enabled: bool = False
+    count_window_minutes: int = 30
+    count_granularity: Literal["minute"] = "minute"
+    trigger_min_count: int = 8
+    trigger_zscore: float = 2.0
+    trigger_relative_multiple: float = 2.0
+    trigger_min_baseline_windows: int = 24
+    cold_start_sample_interval: int = 12
+    sample_size: int = 25
     mention_weight: float = 2.0
     # Ask X to exclude retweets/replies server-side so budget is spent on
     # original posts rather than amplification noise.
@@ -302,6 +437,23 @@ class XSource(BaseModel):
     def _valid_max_results(cls, v: int) -> int:
         # X recent-search accepts 10..100.
         return max(10, min(v, 100))
+
+    @field_validator("sample_size")
+    @classmethod
+    def _valid_sample_size(cls, v: int) -> int:
+        return max(10, min(v, 100))
+
+    @field_validator(
+        "count_window_minutes",
+        "trigger_min_count",
+        "trigger_min_baseline_windows",
+        "cold_start_sample_interval",
+    )
+    @classmethod
+    def _positive_count_setting(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("X count window and trigger settings must be positive")
+        return v
 
 
 class MockSource(BaseModel):
@@ -395,11 +547,53 @@ class WeeklyReportConfig(BaseModel):
         return WEEKDAYS.index(self.weekday)
 
 
+class ShadowReportConfig(BaseModel):
+    """Conservative evidence floors for staged shadow activation reviews."""
+
+    report_days: int = 28
+    min_observation_days: int = 28
+    min_count_coverage: float = 0.95
+    min_closed_linked_trades_per_tier: int = 30
+    min_completed_per_outcome_group: int = 10
+    min_llm_completion_rate: float = 0.95
+    max_llm_error_rate: float = 0.05
+    min_expectancy_separation_r: float = 0.25
+
+    @field_validator(
+        "report_days",
+        "min_observation_days",
+        "min_closed_linked_trades_per_tier",
+        "min_completed_per_outcome_group",
+    )
+    @classmethod
+    def _positive_readiness_count(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("shadow report readiness counts must be positive")
+        return value
+
+    @field_validator(
+        "min_count_coverage", "min_llm_completion_rate", "max_llm_error_rate"
+    )
+    @classmethod
+    def _readiness_fraction(cls, value: float) -> float:
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("shadow report fractions must be within 0..1")
+        return value
+
+    @field_validator("min_expectancy_separation_r")
+    @classmethod
+    def _positive_expectancy_gap(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("shadow expectancy separation must be positive")
+        return value
+
+
 class OpsConfig(BaseModel):
     soak: SoakOpsConfig = Field(default_factory=SoakOpsConfig)
     preflight: PreflightConfig = Field(default_factory=PreflightConfig)
     trade_alerts: TradeAlertsConfig = Field(default_factory=TradeAlertsConfig)
     weekly_report: WeeklyReportConfig = Field(default_factory=WeeklyReportConfig)
+    shadow_report: ShadowReportConfig = Field(default_factory=ShadowReportConfig)
 
 
 # ----------------------------------------------------------------------------
@@ -456,6 +650,8 @@ class MarketConfig(BaseModel):
     confirmation: ConfirmationConfig = Field(default_factory=ConfirmationConfig)
     regime: RegimeConfig = Field(default_factory=RegimeConfig)
     sizing: VolSizingConfig = Field(default_factory=VolSizingConfig)
+    price_action_enabled: bool = True
+    price_action_fail_closed: bool = True
 
 
 # ----------------------------------------------------------------------------
@@ -485,6 +681,8 @@ class SentimentConfig(BaseModel):
 
 
 SIGNAL_MODES = ("social", "trend", "hybrid")
+SOCIAL_POLICIES = ("ignored", "optional", "required", "catalyst")
+RETEST_POLICIES = ("preferred", "required")
 
 
 class TierConfig(BaseModel):
@@ -499,6 +697,12 @@ class TierConfig(BaseModel):
     min_mentions_mult: float = 1.0
     min_trailing_return_pct: float = 0.0
     max_position_pct_mult: float = 1.0
+    social_policy: str = "required"
+    min_relative_volume: float = 2.0
+    retest_policy: str = "required"
+    allow_vwap_pullback: bool = False
+    optional_social_boost: float = 1.10
+    social_veto_bullish_ratio: float = 0.40
 
     @field_validator("signal_mode")
     @classmethod
@@ -507,9 +711,24 @@ class TierConfig(BaseModel):
             raise ValueError(f"signal_mode must be one of {SIGNAL_MODES}")
         return v
 
+    @field_validator("social_policy")
+    @classmethod
+    def _valid_social_policy(cls, v: str) -> str:
+        if v not in SOCIAL_POLICIES:
+            raise ValueError(f"social_policy must be one of {SOCIAL_POLICIES}")
+        return v
+
+    @field_validator("retest_policy")
+    @classmethod
+    def _valid_retest_policy(cls, v: str) -> str:
+        if v not in RETEST_POLICIES:
+            raise ValueError(f"retest_policy must be one of {RETEST_POLICIES}")
+        return v
+
 
 class SignalsConfig(BaseModel):
     default_tier: str = "mid"
+    social_decision_mode: Literal["shadow", "enforce"] = "shadow"
     # Minimum posts carrying directional language before the bullish ratio is
     # trusted; below this the ratio is too noisy to gate on.
     min_sentiment_posts: int = 5
@@ -593,5 +812,16 @@ def get_strategies() -> StrategiesConfig:
         merged: dict = {**inherited, "name": name, "enabled": True, "allocation": 0.5}
         merged.update(override or {})
         merged["name"] = name  # name is authoritative from the mapping key
+        if "entry" not in merged:
+            merged["entry"] = (
+                EntryRulesConfig(
+                    trigger_granularity_seconds=3_600,
+                    bias_granularity_seconds=14_400,
+                    require_compression=True,
+                    allow_vwap_pullback=False,
+                )
+                if name == "swing"
+                else EntryRulesConfig()
+            )
         strategies[name] = StrategyConfig(**merged)
     return StrategiesConfig(strategies=strategies)

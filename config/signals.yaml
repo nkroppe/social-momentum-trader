@@ -2,6 +2,11 @@
 
 default_tier: mid
 
+# P0 observation phase: social rules and L3 are evaluated and audited exactly,
+# but cannot reject, approve, boost, veto, or resize a paper candidate. Price
+# action and hard risk are authoritative. Change to enforce only after review.
+social_decision_mode: shadow
+
 # Directional posts required before the bullish ratio is trusted as a gate.
 min_sentiment_posts: 5
 
@@ -99,13 +104,23 @@ sentiment:
 tiers:
   major:
     signal_mode: trend           # BTC/ETH: price trend decides, social is ignored
+    social_policy: ignored
+    min_relative_volume: 1.5
+    retest_policy: preferred
+    allow_vwap_pullback: true
     zscore_mult: 2.0
     min_mentions_mult: 2.0
     min_trailing_return_pct: 0.01
     max_position_pct_mult: 1.0
 
   large:
-    signal_mode: hybrid          # needs BOTH a social spike and price confirmation
+    signal_mode: hybrid          # SOL: price is hard; social may boost or veto
+    social_policy: optional
+    min_relative_volume: 1.5
+    retest_policy: preferred
+    allow_vwap_pullback: true
+    optional_social_boost: 1.10
+    social_veto_bullish_ratio: 0.40
     zscore_mult: 1.4
     min_mentions_mult: 1.5
     min_trailing_return_pct: 0.005
@@ -113,13 +128,21 @@ tiers:
 
   mid:
     signal_mode: hybrid
+    social_policy: required
+    min_relative_volume: 2.0
+    retest_policy: required
+    allow_vwap_pullback: false
     zscore_mult: 1.0
     min_mentions_mult: 1.0
     min_trailing_return_pct: 0.0
     max_position_pct_mult: 0.8
 
   micro:
-    signal_mode: social          # where social attention genuinely leads price
+    signal_mode: social          # catalyst required, but price breakout remains hard
+    social_policy: catalyst
+    min_relative_volume: 2.0
+    retest_policy: required
+    allow_vwap_pullback: false
     zscore_mult: 0.8
     min_mentions_mult: 0.8
     min_trailing_return_pct: 0.0

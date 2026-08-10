@@ -100,7 +100,8 @@ def test_x_collector_skips_when_budget_exhausted(tmp_path, monkeypatch):
 
 def test_x_collector_builds_from_watch_accounts(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    settings = Settings(x_bearer_token="test-token", x_monthly_read_budget=100)
+    # The strict daily dollar reservation must cover the 25-post sample.
+    settings = Settings(x_bearer_token="test-token", x_monthly_read_budget=1000)
     cfg = XSource(enabled=True, watch_accounts=["elonmusk"], keywords=[])
 
     mock_response = MagicMock()

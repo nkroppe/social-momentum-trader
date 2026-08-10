@@ -1,10 +1,9 @@
 # social-momentum-trader
 
-A 24/7, **long-only spot** crypto trader driven by **social-momentum** signals
-(Reddit + X; mock fallback for local dev), with **hard risk limits** and layered
-**fund-protection guardrails**. Runs on a cloud VPS. Coinbase Advanced Trade is
-the broker. **Paper mode is the default**; live trading is gated behind explicit
-safety latches and a paper soak.
+A 24/7, **long-only spot** crypto trader driven primarily by multi-timeframe
+**price action**, with tier-specific social catalysts, hard risk limits, and
+layered fund-protection guardrails. Runs on a cloud VPS. Coinbase Advanced Trade
+is the broker. **Paper mode is the default**.
 
 > Not financial advice. Social momentum is noisy and most retail variants lose
 > after fees/slippage. Trade only capital you can afford to lose.
@@ -12,60 +11,81 @@ safety latches and a paper soak.
 ## What it does
 
 ```
-ingest (Reddit/X/mock) -> spam filter + sentiment -> velocity z-score (seasonal baseline)
-   -> per-strategy signal (tiered social + price confirmation) -> HARD RISK GATE (per strategy)
-   -> paper/live executor (ATR entry + TP/SL + time-stop) -> manage exits
+X recent counts (30m) -> anomaly-triggered 25-post samples -> quality metadata
+   -> count-based attention z-score -> multi-timeframe price setup
+   -> SHADOW tier social policy + SHADOW sparse L3 Sonnet review
+   -> HARD RISK GATE (per strategy)
+   -> PAPER partial profit + Chandelier trailing stop -> manage exits
 ```
 
 - **Direction:** long-only spot (USD pairs on an allowlist).
 - **Execution venue (locked):** [Coinbase Advanced Trade](docs/venue.md) — US spot only. No Robinhood, Phantom, or Bullpen in this repo.
-- **Signals:** keyword velocity, lexicon sentiment, and price/volume confirmation. No LLM (deferred to phase 2).
+- **Signals:** deterministic price/volume setups first. During the P0 shadow
+  phase, social and LLM outcomes are audited but cannot approve, reject, boost,
+  veto, or resize a paper candidate.
 
 ## How entries are gated
 
-Social attention alone is a weak signal, and it gets weaker as market cap rises:
-published studies find crowd trading signals roughly twice as predictive for
-low-cap coins as for high-cap ones, and attention spikes on majors are often
-*contrarian*. So each symbol carries a `tier` in `config/universe.yaml` that
-selects which gates must pass:
+Every production entry starts with price. Intraday uses a 15-minute trigger and
+1-hour bias; swing uses a 1-hour trigger and a deterministically aggregated
+4-hour bias. Both require EMA 9/21/50 alignment, RSI(14) >= 55, N-bar structure,
+and tier-relative volume. Setups are breakout-and-close or breakout-retest;
+majors and SOL may also use a rolling-VWAP reclaim intraday. Swing rules are
+separate: compression is required and VWAP pullbacks are disabled.
 
-| Tier | Signal mode | Social gate | Trend gate | Direction gate |
-|---|---|---|---|---|
-| `major` (BTC, ETH) | `trend` | ignored | required | required |
-| `large` / `mid` | `hybrid` | required | required | required |
-| `micro` (PUMP, BICO, CAP) | `social` | required | ignored | required |
+The tier playbook is evaluated only after the price setup. With
+`social_decision_mode: shadow` (the shipped default), these are counterfactual
+outcomes for audit and do not affect orders:
 
-- **Social gate** — velocity z-score, raw mentions, distinct *accounts*, and a
-  bullish-vs-bearish ratio. Distinct authors matter most when running a single
-  source: it stops one loud account manufacturing a signal.
-- **Trend gate** — price above its moving average with volume participation.
-- **Direction gate** — positive trailing return over the strategy's window. This
-  always applies. Buying an attention spike caused by a crash is the most
-  damaging failure mode of a pure mention count.
+- **Major (BTC/ETH):** price-only; social is ignored.
+- **Large (SOL):** price is hard; constructive social can boost conviction and
+  sufficiently bearish social can veto.
+- **Mid (HYPE/ZEC):** price setup plus required social confirmation.
+- **Micro (PUMP/BICO/CAP):** social catalyst plus a hard price breakout/retest.
+
+Social attention can never open a trade without a qualifying price trigger, and
+in shadow mode it cannot close the gate or change size either.
+Retests are preferred for majors/large and required for mid/micro. Relative
+volume is at least 1.5x for major/large and 2.0x for mid/micro.
 
 A benchmark regime filter (BTC vs its 50-day average) blocks *all* new entries
 in a broad downtrend. Every price gate is **fail-closed**: no market data means
 no entry.
+
+### Sparse L3 Sonnet review
+
+After deterministic gates pass, large/mid/micro candidates are queued for one
+bounded Sonnet review through the Cursor SDK. BTC/ETH bypass the LLM. The review
+records whether it would veto credible adverse events or require a stronger
+catalyst. Calls are non-blocking and cached by setup, with a hard monthly
+invocation cap. Pending, veto, score, and approval results do not block or resize
+paper candidates while shadow mode is configured.
+
+The Cursor agent runs with `tools=[]`: it cannot read files, run commands,
+inspect VPS secrets, edit code, or place orders. It receives only bounded setup
+metrics and recent posts. It does not label individual posts. Cursor SDK usage
+uses the account's Cursor request pools/pricing and appears under the SDK tag in
+the Cursor usage dashboard.
+
+Each Sunday report also queues a Sonnet reflection over closed trades and
+current rules. Recommendations are persisted and sent as an advisory Telegram
+message; they are never applied automatically.
 
 ## Two strategies, one capital pool
 
 The bot runs **two methodologies simultaneously** on a configurable capital
 split (default 50/50) so you can compare which performs best over the soak:
 
-| Strategy | Hold | Take-profit | Stop-loss | Time-stop | Entry thresholds |
-|---|---|---|---|---|---|
-| `intraday` | hours-intraday | 2x ATR | 1x ATR | 6h | z>=2.5, >=3 authors, >=8 mentions, >=60% bullish, 30m x 8 buckets |
-| `swing` | 1-3 days | 2x ATR | 1x ATR | 48h (max 72h) | z>=3.0, >=5 authors, >=15 mentions, >=65% bullish, 120m x 12 buckets |
+Intraday targets 50% off at 1.5R with a 6-hour hard time-stop and a tighter
+4-hour stale stop if price never reaches +1R. Swing targets 50% off at 2R with
+48-hour/24-hour equivalents. After the partial, the remainder uses a
+Chandelier ATR stop that only ratchets upward.
 
-Exits are **volatility-scaled**, not fixed percentages. ATR is scaled to each
-strategy's holding period (volatility grows with the square root of time), so
-one rule fits a universe spanning BTC and a sub-cent token. A fixed +6%/-3%
-makes BTC targets unreachable within 6 hours — nearly every trade would end on
-the time stop at a random price — while sitting inside a micro cap's noise band.
-Run `smt preview` to see the live levels per symbol. Position size is scaled the
-same way, so a high-volatility asset risks the same dollars as a calm one.
-
-Take-profit is never allowed inside round-trip fees.
+Position size starts from a 0.5% equity risk budget divided by the candidate's
+structure-stop percentage. The result is capped by the hard max-position
+percentage, liquidity tier, volatility, and setup conviction; no multiplier can
+raise it above the hard cap. Daily and weekly halts include marked unrealized
+P/L and fail conservatively when an open position cannot be quoted.
 
 Each strategy sizes off its **own** allocation half and enforces its **own**
 limits (max position %, max open, max trades/day, daily/weekly loss halts,
@@ -106,28 +126,49 @@ the `simulate` demo run with zero external accounts.
 - `config/ops.yaml` - soak tracking, digest interval, preflight requirements
 - `config/market.yaml` - price confirmation, regime filter, volatility sizing
 - `config/signals.yaml` - spam filters, sentiment lexicon, per-tier signal profiles
+- `config/llm.yaml` - sparse Sonnet judge, call budget, cache, weekly reflection
 - `.env` (copy from `.env.example`) - secrets + mode flags
 - `.env.production.example` - VPS production template (Postgres, alerts, no mock)
 
 ### X (Twitter) production setup
 
 1. Create an X developer app and generate a **Bearer Token** (pay-per-use API).
-2. Set `X_BEARER_TOKEN` and optionally `X_MONTHLY_READ_BUDGET` (default 50,000 reads/mo) in `.env`.
-3. `config/sources.yaml` has `x.enabled: true` with cashtag watchlist queries for the universe.
-4. Reads are tracked in `data/x_budget.json`; polling stops when the monthly cap is hit.
+2. Set `X_BEARER_TOKEN`. The default shared ceiling is
+   `X_MONTHLY_BUDGET_USD=100`; both endpoint prices are configurable because X
+   pricing can change.
+3. `config/sources.yaml` requests uncensored recent counts for each cashtag in
+   UTC-aligned 30-minute windows, then samples 25 posts only on adaptive
+   anomalies or scheduled cold-start windows. Watch accounts remain trusted
+   sampled event feeds.
+4. Distinct post reads, count requests, endpoint spend, and daily/monthly dollar
+   pace are tracked atomically in `data/x_budget.json`.
 5. On the VPS, set `mock.enabled: false` once Reddit + X credentials are configured.
+
+### Cursor LLM setup
+
+1. Create a user API key in **Cursor Dashboard → Integrations**.
+2. Set `CURSOR_API_KEY` in the VPS `.env`.
+3. Rebuild the image; Docker installs the `llm` extra automatically.
+4. Run `docker compose exec trader smt doctor`. The `cursor_llm` check must pass.
+
+The exact Sonnet model ID is discovered from the API key's current model catalog,
+so the code does not hard-code a stale model version.
 
 ### Schema migrations
 
-`init_db()` runs a lightweight, idempotent migration that adds the
-`trades.strategy` column to databases created before dual-strategy support
-(SQLite `ALTER TABLE ... ADD COLUMN`; Postgres `ADD COLUMN IF NOT EXISTS`).
-No manual step is required; existing rows default to `intraday`. To start
-fresh in dev instead, delete `data/smt.sqlite`.
+`init_db()` runs lightweight, idempotent SQLite/Postgres migrations. Social
+counts, richer X author/engagement metadata, and stable shadow-decision audit
+records are persisted alongside the existing trade migration fields.
+Existing open trades are conservatively backfilled from their stored entry and
+stop. No manual migration step is required.
 
 ## Going live on Coinbase Advanced (only after a clean paper soak)
 
 Execution is **Coinbase Advanced Trade only** — see [docs/venue.md](docs/venue.md).
+
+> Deployment warning: the shipped social layer is intentionally `shadow`.
+> Do not change it to `enforce` or treat shadow audit results as live-ready
+> evidence without a separately reviewed paper-validation period.
 
 Two independent latches must both be set, and the Coinbase key must pass the
 trade-only assertion:
@@ -137,6 +178,10 @@ trade-only assertion:
 3. Coinbase API key = **View + Trade only** (Transfer disabled). On startup the
    app calls `get_api_key_permissions()` and **refuses to run** if
    `can_transfer` is true.
+
+Advanced partial/Chandelier management is currently **PAPER-only**. `smt doctor
+--live` and Runner startup explicitly block LIVE while it is enabled because
+safe Coinbase server-side bracket adjustment parity is not implemented.
 
 See `docs/compromise-runbook.md` and the fund-protection layers below.
 
@@ -176,11 +221,31 @@ smt test-alerts         # send a test alert to configured channels
 smt soak-report         # soak progress + strategy comparison
 smt preview             # live exit levels + position size per symbol
 smt weekly-report       # preview this week's P/L (--send to deliver, --last for prior week)
+smt shadow-report       # social + Sonnet readiness evidence (--days N, --send)
 smt soak-reset          # restart the soak clock after changing signal logic
 ```
 
 Reset the soak clock whenever entry or exit logic changes. Days accumulated
 under different rules do not evidence the system that would go live.
+
+### Interpreting `shadow-report`
+
+`smt shadow-report` is read-only: it uses persisted count coverage, setup audits,
+and exactly linked paper trades without ingesting, calling Sonnet, or placing an
+order. It reports separate `SOCIAL` and `SONNET L3` verdicts plus per-tier
+readiness, false-rejection outcomes, and net-R separation. `NOT READY` is the
+expected result until the conservative sample, coverage, and observation floors
+in `config/ops.yaml` are met. Outcome-group floors count only linked, closed
+paper trades—not unresolved audit rows. Sonnet also requires at least 95%
+completion across eligible pending/complete/error reviews and a low error rate.
+Current X/count collection and the Sonnet judge must remain enabled; historical
+rows cannot make a disabled evidence pipeline READY.
+
+Activation is staged, never automatic: review the report, activate only an
+individual READY tier in a separately approved paper rollout, re-observe it,
+then consider another tier or layer. A social READY verdict does not authorize
+Sonnet, and a Sonnet READY verdict does not authorize social enforcement. The
+command never edits configuration or changes `social_decision_mode`.
 
 ### Notifications
 

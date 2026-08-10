@@ -76,6 +76,28 @@ def trade_closed_alert(trade: Trade) -> tuple[str, str]:
     return subject, body
 
 
+def trade_partial_alert(
+    trade: Trade,
+    sold_qty: float,
+    exit_price: float,
+    partial_pnl: float,
+) -> tuple[str, str]:
+    """Notification for the first scale-out sell."""
+    result = "PROFIT" if partial_pnl >= 0 else "LOSS"
+    subject = f"PARTIAL SELL {trade.ticker} [{trade.strategy}] {result} ${partial_pnl:+,.2f}"
+    body = "\n".join(
+        [
+            f"Sold {sold_qty:.8f} {trade.ticker} @ ${exit_price:,.6f}",
+            f"Remaining: {trade.qty:.8f} {trade.ticker}",
+            f"Entry: ${trade.entry_price:,.6f}",
+            f"Partial P/L: ${partial_pnl:+,.2f}",
+            f"Trailing stop: ${trade.trailing_stop:,.6f}",
+            f"Mode: {'LIVE' if trade.is_live else 'PAPER'}",
+        ]
+    )
+    return subject, body
+
+
 def build_weekly_report(
     store: Store,
     strategies: Sequence[str],

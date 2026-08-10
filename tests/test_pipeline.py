@@ -7,7 +7,7 @@ from datetime import timedelta
 
 from _helpers import make_store, make_strategy, make_universe, social_only_market_cfg
 
-from smt.config import UniverseConfig
+from smt.config import UniverseConfig, get_signals
 from smt.ingest.base import extract_tickers
 from smt.models import SocialEvent, TradeStatus, utcnow
 from smt.scorer import MomentumScorer
@@ -157,7 +157,9 @@ def test_bearish_burst_is_rejected(tmp_path):
     assert result.zscore >= st.signal_min_zscore  # attention really did spike
     assert result.bullish_ratio == 0.0
 
-    engine = SignalEngine(st, u, market_cfg=social_only_market_cfg())
+    signals = get_signals().model_copy(deep=True)
+    signals.social_decision_mode = "enforce"
+    engine = SignalEngine(st, u, signals, market_cfg=social_only_market_cfg())
     assert engine.candidates(scorer.score_all()) == []
 
 

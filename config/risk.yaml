@@ -4,6 +4,10 @@
 # Fraction of the isolated portfolio deployable into a single position.
 max_position_pct: 0.10
 
+# Dollar risk budget per trade. Notional = equity * this value / structure-stop
+# distance, then all exposure caps below can only reduce it.
+risk_per_trade_pct: 0.005
+
 # Max simultaneous open positions.
 max_open_positions: 3
 
@@ -28,6 +32,14 @@ atr_take_profit_mult: 2.0  # TP = entry + 2 x ATR
 atr_stop_loss_mult: 1.0    # SL = entry - 1 x ATR
 atr_min_stop_pct: 0.008    # floor: never stop tighter than 0.8% (fee-dominated)
 atr_max_stop_pct: 0.15     # ceiling: never risk more than 15% on one entry
+
+# PAPER-only professional exit management. LIVE startup is explicitly blocked
+# while enabled because Coinbase bracket replacement parity is not implemented.
+advanced_exit_enabled: true
+partial_take_profit_fraction: 0.50
+partial_take_profit_r: 1.5
+chandelier_atr_mult: 3.0
+stale_time_stop_hours: 4
 
 # Fallback exit parameters, used when exit_style is "fixed" or ATR is unavailable.
 take_profit_pct: 0.06      # +6% target

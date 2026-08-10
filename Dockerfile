@@ -7,10 +7,11 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Install with live extras so real Coinbase/Reddit/Postgres drivers are present.
+# Install live + LLM extras so Coinbase/Reddit/Postgres and the text-only Cursor
+# SDK judge are available on the VPS.
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN pip install --upgrade pip && pip install ".[live]"
+RUN pip install --upgrade pip && pip install ".[live,llm]"
 
 COPY config ./config
 

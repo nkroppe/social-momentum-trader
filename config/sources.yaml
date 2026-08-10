@@ -1,11 +1,10 @@
 # Social sources config. Ingest polls on a schedule (hours->intraday horizon).
 
-# Sized to the read budget rather than to what the strategy would prefer. At
-# $100/mo (20k distinct posts) the daily pace is ~780 posts; six queries
-# returning the API's 10-post minimum costs ~70 per poll, so ~11 polls/day is
-# the most that fits. Two hours also matches the swing bucket width, which is
-# the timeframe this much data can actually support.
-poll_interval_seconds: 7200  # 2h
+# Every poll buys one $0.005 recent-count request per keyword. Six symbols at
+# 48 windows/day cost about $43.20/month. Post reads are bought only when a
+# count anomaly (or scheduled cold-start window) triggers a 25-post sample.
+# Endpoint prices and the shared $100 ceiling are environment-configurable.
+poll_interval_seconds: 1800  # UTC-aligned 30-minute count windows
 
 reddit:
   enabled: false   # enable when REDDIT_* creds are approved
@@ -34,10 +33,17 @@ x:
     - "$PUMP"
     - "$BICO"
     - "$CAP"
-  # 10 is the API's minimum for recent search, and the budget cannot afford
-  # more. Every returned post is billed on first sight, so this is the floor on
-  # cost per query and the reason poll cadence carries the rest of the saving.
-  max_results_per_query: 10
+  counts_enabled: true
+  count_window_minutes: 30
+  count_granularity: minute
+  trigger_min_count: 8
+  trigger_zscore: 2.0
+  trigger_relative_multiple: 2.0
+  trigger_min_baseline_windows: 24  # 12h before adaptive baseline is trusted
+  cold_start_sample_interval: 12
+  sample_size: 25
+  # Kept for migration compatibility when counts are disabled.
+  max_results_per_query: 25
   mention_weight: 2.0        # X mentions weighted higher than Reddit in scorer
   exclude_retweets: true     # spend budget on original posts, not amplification
   exclude_replies: true

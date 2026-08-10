@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import re
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from ..config import Settings, SourcesConfig, UniverseConfig
 from ..logging_setup import get_logger
 from ..models import SocialEvent
+
+if TYPE_CHECKING:
+    from ..store import Store
 
 log = get_logger("smt.ingest")
 
@@ -99,7 +102,10 @@ def extract_tickers(text: str, universe: UniverseConfig) -> set[str]:
 
 
 def build_collectors(
-    settings: Settings, sources: SourcesConfig, universe: UniverseConfig
+    settings: Settings,
+    sources: SourcesConfig,
+    universe: UniverseConfig,
+    store: Store | None = None,
 ) -> list[Collector]:
     """Instantiate enabled collectors; fall back to mock so the loop always runs."""
     collectors: list[Collector] = []
@@ -117,12 +123,12 @@ def build_collectors(
         try:
             from .x import XCollector
 
-            x_collector = XCollector(settings, sources.x, universe)
+            x_collector = XCollector(settings, sources.x, universe, store=store)
             collectors.append(x_collector)
             log.info(
-                "X collector enabled (budget %d reads/mo, %d remaining)",
-                settings.x_monthly_read_budget,
-                x_collector.budget.remaining,
+                "X collector enabled ($%.2f/month; $%.2f remaining)",
+                x_collector.budget.budget_usd,
+                x_collector.budget.remaining_usd,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("X collector unavailable: %s", exc)
