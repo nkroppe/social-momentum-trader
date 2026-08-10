@@ -5,8 +5,9 @@ soak:
   digest_interval_hours: 24
 
 preflight:
-  # Production VPS profile requires real Reddit + X (mock disabled in sources.yaml).
-  require_reddit: true
+  # Reddit access is intentionally disabled pending API approval; X is the
+  # production social source and mock data must remain disabled.
+  require_reddit: false
   require_x: true
   require_alert_channel: true
   require_postgres: true

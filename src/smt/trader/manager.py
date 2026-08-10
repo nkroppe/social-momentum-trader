@@ -60,9 +60,12 @@ class TradeManager:
         if self.alerter is None or not self.trade_alerts.enabled:
             return
         try:
-            self.alerter.notify(subject, body)
+            delivered = self.alerter.notify(subject, body)
         except Exception as exc:  # noqa: BLE001
             log.warning("trade notification failed: %s", exc)
+            return
+        if not delivered:
+            log.warning("trade notification not delivered: %s", subject)
 
     # ---- Equity ------------------------------------------------------------
 
@@ -415,6 +418,71 @@ class TradeManager:
                 )
             )
 
+    def _manage_trade_by_quote(
+        self,
+        trade: Trade,
+        strategy: StrategyConfig | None,
+        tstop,
+    ) -> None:
+        """Fail-safe exit management when a complete PAPER bar walk is unavailable."""
+        try:
+            price = self.broker.current_price(trade.product_id)
+        except Exception as exc:  # noqa: BLE001 - leave position open, retry next loop
+            log.warning("Exit quote unavailable for %s: %s", trade.product_id, exc)
+            return
+
+        advanced_paper = (
+            strategy is not None
+            and strategy.advanced_exit_enabled
+            and self.broker.name == "paper"
+            and trade.setup not in ("", "offline_social")
+        )
+        if advanced_paper:
+            trade.highest_price = max(trade.highest_price or trade.entry_price, price)
+
+            if price <= trade.stop_loss:
+                self._close(trade, price, ExitReason.STOP_LOSS)
+                return
+
+            if not trade.partial_taken and price >= trade.take_profit:
+                self._take_partial(trade, strategy)
+                return
+
+            if trade.partial_taken:
+                prior_trail = trade.trailing_stop
+                trade.trailing_stop = self._chandelier_stop(trade, strategy)
+                if price <= trade.trailing_stop:
+                    self._close(trade, price, ExitReason.TRAILING_STOP)
+                    return
+                if trade.trailing_stop != prior_trail:
+                    self.store.update_trade(trade)
+            else:
+                opened = trade.opened_at
+                opened = opened if opened.tzinfo else opened.replace(tzinfo=utcnow().tzinfo)
+                stale_at = opened + timedelta(hours=strategy.stale_time_stop_hours)
+                one_r = trade.entry_price + trade.initial_risk_per_unit
+                if utcnow() >= stale_at and trade.highest_price < one_r:
+                    self._close(trade, price, ExitReason.TIME_STOP)
+                    return
+
+            if utcnow() >= tstop:
+                self._close(trade, price, ExitReason.TIME_STOP)
+            else:
+                self.store.update_trade(trade)
+            return
+
+        # TP/SL: simulated in paper; server-side in live (skip to avoid double close).
+        if not self.broker.server_side_brackets:
+            if price >= trade.take_profit:
+                self._close(trade, trade.take_profit, ExitReason.TAKE_PROFIT)
+                return
+            if price <= trade.stop_loss:
+                self._close(trade, trade.stop_loss, ExitReason.STOP_LOSS)
+                return
+
+        if utcnow() >= tstop:
+            self._close(trade, price, ExitReason.TIME_STOP)
+
     def _manage_deployed_paper_trade(
         self,
         trade: Trade,
@@ -432,9 +500,11 @@ class TradeManager:
                     trade.product_id,
                     exc,
                 )
+                self._manage_trade_by_quote(trade, strategy, tstop)
                 return
             if latest <= 0:
                 log.warning("PAPER cannot initialize exit cursor for %s", trade.product_id)
+                self._manage_trade_by_quote(trade, strategy, tstop)
                 return
             # A legacy open trade has no trustworthy minute-by-minute history.
             # Start at the latest closed bar rather than replaying pre-entry or
@@ -456,6 +526,8 @@ class TradeManager:
                 trade.last_processed_paper_bar_ts,
                 exc,
             )
+            self._manage_trade_by_quote(trade, strategy, tstop)
+            return
 
         advanced = (
             strategy is not None
@@ -551,56 +623,4 @@ class TradeManager:
                 self._manage_deployed_paper_trade(trade, strategy, tstop)
                 continue
 
-            price = self.broker.current_price(trade.product_id)
-
-            advanced_paper = (
-                strategy is not None
-                and strategy.advanced_exit_enabled
-                and self.broker.name == "paper"
-                and trade.setup not in ("", "offline_social")
-            )
-            if advanced_paper:
-                trade.highest_price = max(trade.highest_price or trade.entry_price, price)
-
-                if price <= trade.stop_loss:
-                    self._close(trade, price, ExitReason.STOP_LOSS)
-                    continue
-
-                if not trade.partial_taken and price >= trade.take_profit:
-                    self._take_partial(trade, strategy)
-                    continue
-
-                if trade.partial_taken:
-                    prior_trail = trade.trailing_stop
-                    trade.trailing_stop = self._chandelier_stop(trade, strategy)
-                    if price <= trade.trailing_stop:
-                        self._close(trade, price, ExitReason.TRAILING_STOP)
-                        continue
-                    if trade.trailing_stop != prior_trail:
-                        self.store.update_trade(trade)
-                else:
-                    opened = trade.opened_at
-                    opened = opened if opened.tzinfo else opened.replace(tzinfo=utcnow().tzinfo)
-                    stale_at = opened + timedelta(hours=strategy.stale_time_stop_hours)
-                    one_r = trade.entry_price + trade.initial_risk_per_unit
-                    if utcnow() >= stale_at and trade.highest_price < one_r:
-                        self._close(trade, price, ExitReason.TIME_STOP)
-                        continue
-
-                if utcnow() >= tstop:
-                    self._close(trade, price, ExitReason.TIME_STOP)
-                else:
-                    self.store.update_trade(trade)
-                continue
-
-            # TP/SL: simulated in paper; server-side in live (skip to avoid double close).
-            if not self.broker.server_side_brackets:
-                if price >= trade.take_profit:
-                    self._close(trade, trade.take_profit, ExitReason.TAKE_PROFIT)
-                    continue
-                if price <= trade.stop_loss:
-                    self._close(trade, trade.stop_loss, ExitReason.STOP_LOSS)
-                    continue
-
-            if utcnow() >= tstop:
-                self._close(trade, price, ExitReason.TIME_STOP)
+            self._manage_trade_by_quote(trade, strategy, tstop)

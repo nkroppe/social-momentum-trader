@@ -43,7 +43,7 @@ outcomes for audit and do not affect orders:
 - **Large (SOL):** price is hard; constructive social can boost conviction and
   sufficiently bearish social can veto.
 - **Mid (HYPE/ZEC):** price setup plus required social confirmation.
-- **Micro (PUMP/BICO/CAP):** social catalyst plus a hard price breakout/retest.
+- **Micro (PUMP/CAP):** social catalyst plus a hard price breakout/retest.
 
 Social attention can never open a trade without a qualifying price trigger, and
 in shadow mode it cannot close the gate or change size either.

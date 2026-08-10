@@ -223,3 +223,45 @@ def test_live_preflight_fails_closed_on_policy_mismatch(monkeypatch, tmp_path):
     assert "generation=7" in results["soak_policy_generation"].detail
     assert results["paper_soak_duration"].passed is False
     assert "fingerprint mismatch" in results["paper_soak_duration"].detail
+
+
+def test_email_alert_uses_settings_smtp_fields(monkeypatch):
+    from smt.config import Settings
+    from smt.ops.alerts import Alerter
+
+    settings = Settings(
+        smtp_host="smtp.example.com",
+        smtp_port=2525,
+        smtp_user="bot@example.com",
+        smtp_password="secret",
+        alert_email_to="me@example.com",
+    )
+    calls: dict[str, object] = {}
+
+    class FakeSMTP:
+        def __init__(self, host, port, timeout=None):
+            calls["host"] = host
+            calls["port"] = port
+            calls["timeout"] = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def starttls(self):
+            calls["starttls"] = True
+
+        def login(self, user, password):
+            calls["login"] = (user, password)
+
+        def send_message(self, msg):
+            calls["to"] = msg["To"]
+
+    monkeypatch.setattr("smt.ops.alerts.smtplib.SMTP", FakeSMTP)
+    assert Alerter(settings)._email("subj", "body") is True
+    assert calls["host"] == "smtp.example.com"
+    assert calls["port"] == 2525
+    assert calls["login"] == ("bot@example.com", "secret")
+    assert calls["to"] == "me@example.com"

@@ -245,6 +245,38 @@ def test_legacy_paper_trade_initializes_cursor_without_replaying_old_bar(tmp_pat
     assert store.closed_trades_for("BTC", strategy.name)[-1].exit_reason == ExitReason.STOP_LOSS
 
 
+def test_paper_exit_uses_fresh_quote_when_bar_walk_is_unavailable(tmp_path):
+    market, client = _market()
+    broker = PaperBroker(market=market)
+    store = make_store(tmp_path)
+    strategy = make_strategy(advanced_exit_enabled=False, exit_style="fixed")
+    manager = TradeManager(
+        Settings(paper_start_equity=5_000),
+        make_universe(),
+        store,
+        broker,
+        market,
+        market.cfg,
+        strategies=[strategy],
+    )
+    candidate = TradeCandidate("BTC", "BTC-USD", 5.0, 20, 3, "x", strategy.name)
+    trade = manager.open_position(candidate, 500.0, strategy)
+    client.candle_rows = [
+        client.candle_rows[0],
+        client.candle_rows[-1],
+    ]
+    stopped_bid = trade.stop_loss - 1.0
+    client.book = _book(bid=stopped_bid, ask=stopped_bid + 0.1, size=20.0)
+    market._candles.clear()  # noqa: SLF001 - force the gapped test bars
+    market._quotes.clear()  # noqa: SLF001 - force the changed test quote
+
+    manager.manage_open_trades()
+
+    closed = store.closed_trades_for("BTC", strategy.name)[-1]
+    assert closed.exit_reason == ExitReason.STOP_LOSS
+    assert closed.exit_price == pytest.approx(stopped_bid * 0.9995)
+
+
 def test_recovered_quote_cannot_improve_paper_target_exit(tmp_path):
     market, client = _market()
     broker = PaperBroker(market=market)

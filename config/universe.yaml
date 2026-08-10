@@ -38,10 +38,6 @@ symbols:
     # bare symbol needs the $ form. The pumpfun spellings stay unambiguous.
     require_cashtag: true
     aliases: ["pumpfun", "pump.fun", "pump fun", "$pump"]
-  BICO:
-    product_id: BICO-USD
-    tier: micro
-    aliases: ["bico", "biconomy", "$bico"]
   CAP:
     product_id: CAP-USD
     tier: micro

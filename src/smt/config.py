@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data/smt.sqlite"
 
     # Starting equity used for paper sizing / loss-halt math.
-    paper_start_equity: float = 5000.0
+    paper_start_equity: float = 10_000.0
     # Poll cadence for the main trade loop (exit checks).
     loop_interval_seconds: int = 60
 
@@ -680,7 +680,7 @@ class MarketConfig(BaseModel):
     paper_use_real_prices: bool = True
     paper_quote_max_age_seconds: float = 10.0
     paper_bar_granularity_seconds: int = 60
-    paper_bar_max_age_seconds: float = 90.0
+    paper_bar_max_age_seconds: float = 300.0
     paper_bar_cache_ttl_seconds: float = 10.0
     paper_max_spread_bps: float = 40.0
     paper_min_top_level_notional_usd: float = 100.0

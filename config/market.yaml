@@ -16,7 +16,7 @@ unavailable_retry_seconds: 900     # back off products Coinbase does not list
 paper_use_real_prices: true
 paper_quote_max_age_seconds: 10
 paper_bar_granularity_seconds: 60
-paper_bar_max_age_seconds: 90
+paper_bar_max_age_seconds: 300       # public closed-candle endpoint can lag several minutes
 paper_bar_cache_ttl_seconds: 10
 paper_max_spread_bps: 40
 paper_min_top_level_notional_usd: 100

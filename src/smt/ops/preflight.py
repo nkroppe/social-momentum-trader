@@ -64,7 +64,7 @@ def _market_data_checks() -> list[CheckResult]:
     try:
         missing: list[str] = []
         thin: list[str] = []
-        paper_unready: list[str] = []
+        paper_unready: list[tuple[str, str]] = []
         for ticker, spec in universe.symbols.items():
             candles = market.candles(spec.product_id)
             if not candles:
@@ -75,15 +75,17 @@ def _market_data_checks() -> list[CheckResult]:
                 quote = market.quote(spec.product_id)
                 bars = market.paper_bars(spec.product_id)
                 if quote is None:
-                    paper_unready.append(f"{ticker}:quote unavailable")
+                    paper_unready.append((spec.tier, f"{ticker}:quote unavailable"))
                 elif quote.spread_bps > market_cfg.paper_max_spread_bps:
-                    paper_unready.append(f"{ticker}:spread {quote.spread_bps:.1f}bps")
+                    paper_unready.append((spec.tier, f"{ticker}:spread {quote.spread_bps:.1f}bps"))
                 elif quote.ask_notional < market_cfg.paper_min_top_level_notional_usd:
-                    paper_unready.append(f"{ticker}:ask depth ${quote.ask_notional:.2f}")
+                    paper_unready.append(
+                        (spec.tier, f"{ticker}:ask depth ${quote.ask_notional:.2f}")
+                    )
                 elif not bars:
-                    paper_unready.append(f"{ticker}:1m bars unavailable")
+                    paper_unready.append((spec.tier, f"{ticker}:1m bars unavailable"))
             except Exception as exc:  # noqa: BLE001
-                paper_unready.append(f"{ticker}:{exc}")
+                paper_unready.append((spec.tier, f"{ticker}:{exc}"))
 
         detail = "all universe products resolve on Coinbase"
         if missing:
@@ -91,15 +93,18 @@ def _market_data_checks() -> list[CheckResult]:
         elif thin:
             detail = "listed but thin history: " + ", ".join(thin)
         results.append(CheckResult("market_data_products", not missing, detail))
+        blocking = [detail for tier, detail in paper_unready if tier in {"major", "large"}]
+        quarantined = [detail for tier, detail in paper_unready if tier not in {"major", "large"}]
+        paper_detail = "fresh executable market available for core tiers"
+        if blocking:
+            paper_detail = "core unavailable: " + "; ".join(blocking)
+        elif quarantined:
+            paper_detail += "; runtime fail-closed quarantine: " + "; ".join(quarantined)
         results.append(
             CheckResult(
                 "paper_execution_market",
-                not paper_unready,
-                (
-                    "fresh quotes and contiguous 1m bars available"
-                    if not paper_unready
-                    else "; ".join(paper_unready)
-                ),
+                not blocking,
+                paper_detail,
             )
         )
 
