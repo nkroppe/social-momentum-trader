@@ -536,6 +536,21 @@ class TradeAlertsConfig(BaseModel):
     on_close: bool = True
 
 
+class TelegramControlConfig(BaseModel):
+    """Inbound Telegram commands that trip or clear the kill switch."""
+
+    enabled: bool = True
+    state_file: str = "./data/telegram_control.json"
+    request_timeout_seconds: float = 5.0
+
+    @field_validator("request_timeout_seconds")
+    @classmethod
+    def _positive_timeout(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("request_timeout_seconds must be positive")
+        return value
+
+
 WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
 
@@ -623,6 +638,7 @@ class OpsConfig(BaseModel):
     soak: SoakOpsConfig = Field(default_factory=SoakOpsConfig)
     preflight: PreflightConfig = Field(default_factory=PreflightConfig)
     trade_alerts: TradeAlertsConfig = Field(default_factory=TradeAlertsConfig)
+    telegram_control: TelegramControlConfig = Field(default_factory=TelegramControlConfig)
     weekly_report: WeeklyReportConfig = Field(default_factory=WeeklyReportConfig)
     shadow_report: ShadowReportConfig = Field(default_factory=ShadowReportConfig)
 

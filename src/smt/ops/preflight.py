@@ -337,6 +337,19 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
             str(control.resolve()) if control.exists() else "mkdir control/",
         )
     )
+    if ops.telegram_control.enabled:
+        tg_ready = bool(settings.telegram_bot_token and settings.telegram_chat_id)
+        results.append(
+            CheckResult(
+                "telegram_control",
+                tg_ready,
+                (
+                    "KILL/START commands enabled for configured chat"
+                    if tg_ready
+                    else "enabled in ops.yaml but TELEGRAM_BOT_TOKEN/CHAT_ID missing"
+                ),
+            )
+        )
 
     results.extend(_market_data_checks())
 

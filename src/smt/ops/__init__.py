@@ -12,10 +12,12 @@ from .reports import (
 )
 from .schedule import WeeklyScheduler
 from .soak import SoakTracker
+from .telegram_control import TelegramControl
 
 __all__ = [
     "Alerter",
     "KillSwitch",
+    "TelegramControl",
     "EquityPoint",
     "PerformanceTrade",
     "SoakTracker",

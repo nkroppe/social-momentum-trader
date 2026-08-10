@@ -25,7 +25,7 @@ from .llm import LLMCoordinator, get_llm
 from .logging_setup import get_logger
 from .market import MarketData
 from .models import utcnow
-from .ops import Alerter, KillSwitch
+from .ops import Alerter, KillSwitch, TelegramControl
 from .ops.reports import build_weekly_report
 from .ops.schedule import WeeklyScheduler
 from .ops.soak import SoakTracker
@@ -114,6 +114,7 @@ class Runner:
 
         self.alerter = Alerter(self.settings)
         self.kill = KillSwitch(self.settings.kill_file)
+        self.telegram_control = TelegramControl(self.settings, self.ops.telegram_control)
         self.collectors = build_collectors(self.settings, self.sources, self.universe, self.store)
 
         self.market = None if offline else MarketData(self.market_cfg)
@@ -570,14 +571,36 @@ class Runner:
         self.llm.poll_judgements()
         self.mature_opportunities()
 
+        # 0) Phone control: exact Telegram KILL / START from the configured chat.
+        try:
+            applied = self.telegram_control.poll_and_apply(self.kill, self.alerter)
+        except Exception as exc:  # noqa: BLE001 - never let control polling abort the loop
+            log.warning("telegram control poll failed: %s", exc)
+            applied = []
+        if "KILL" in applied:
+            self.store.add_security_event(
+                "kill_switch",
+                "tripped via telegram KILL",
+                "CRITICAL",
+            )
+        elif "START" in applied:
+            self.store.add_security_event(
+                "kill_switch",
+                "cleared via telegram START",
+                "WARNING",
+            )
+            self._killed_notified = False
+
         # 1) Kill switch: flatten and block entries.
         if self.kill.is_active():
             if not self._killed_notified:
-                self.alerter.notify(
-                    "Kill switch active",
-                    "Flattening positions, no new entries.",
-                    critical=True,
-                )
+                # Telegram KILL already notifies; file/CLI trips still need one.
+                if "KILL" not in applied:
+                    self.alerter.notify(
+                        "Kill switch active",
+                        "Flattening positions, no new entries.",
+                        critical=True,
+                    )
                 self.store.add_security_event("kill_switch", "active", "CRITICAL")
                 self._killed_notified = True
             self.manager.manage_open_trades(force_flatten=True)

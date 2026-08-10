@@ -322,6 +322,14 @@ smt kill --reason "..." # same, via CLI
 smt clear-kill          # resume
 ```
 
+From the configured Telegram chat (`TELEGRAM_CHAT_ID`), send an exact message:
+
+- `KILL` — flatten every open position and pause new entries
+- `START` — clear the kill switch and resume trading
+
+Only those exact words (optional surrounding whitespace) from the authorized chat
+are accepted. The bot acknowledges each command with an alert.
+
 ## Safety / status
 
 ```bash
