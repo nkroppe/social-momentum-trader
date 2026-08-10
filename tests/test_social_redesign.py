@@ -129,7 +129,7 @@ def test_count_trigger_persists_observation_then_samples_posts(tmp_path, monkeyp
     ) as get:
         events = collector.collect()
     assert get.call_count == 2
-    assert get.call_args_list[0].kwargs["params"]["max_results"] == 500
+    assert "max_results" not in get.call_args_list[0].kwargs["params"]
     assert len(events) == 1
     assert events[0].author_id == "42"
     assert events[0].author_verified is True

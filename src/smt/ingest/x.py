@@ -646,7 +646,6 @@ class XCollector:
             "start_time": start.isoformat().replace("+00:00", "Z"),
             "end_time": end.isoformat().replace("+00:00", "Z"),
             "granularity": self.cfg.count_granularity,
-            "max_results": 500,
         }
         response = self._client.get(f"{API_BASE}/tweets/counts/recent", params=params)
         response.raise_for_status()
