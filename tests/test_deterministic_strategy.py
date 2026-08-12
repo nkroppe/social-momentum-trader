@@ -767,7 +767,7 @@ def test_paper_fill_risk_breach_is_immediately_unwound_and_recorded(tmp_path):
         def open_long(self, _product, notional, _tp, _sl):
             return Fill("buy", 110.0, notional / 110.0, 1.0)
 
-        def close_long(self, _product, qty):
+        def close_long(self, _product, qty, reference_price=None, *, emergency=False):
             return Fill("sell", 109.0, qty, 1.0)
 
     store = make_store(tmp_path)

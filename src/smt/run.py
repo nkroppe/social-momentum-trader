@@ -613,11 +613,15 @@ class Runner:
             self.ingest()
             self._last_ingest = now
 
-        # 3) Signals -> risk -> entries.
-        self.evaluate_and_trade()
-
-        # 4) Manage exits every loop.
+        # 3) Manage exits before entries so a transient quote miss on the entry
+        # path cannot skip bar-based stop/TP handling for open positions.
         self.manager.manage_open_trades()
+
+        # 4) Signals -> risk -> entries.
+        try:
+            self.evaluate_and_trade()
+        except PaperMarketUnavailable as exc:
+            log.warning("entry evaluation skipped (market unavailable): %s", exc)
 
     def run_forever(self) -> None:
         log.info("Starting main loop (interval=%ds)", self.settings.loop_interval_seconds)

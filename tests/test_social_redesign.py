@@ -413,7 +413,7 @@ def test_shadow_social_reject_yields_price_candidate_without_resize(monkeypatch)
             trailing_return=0.05,
         ),
     )
-    monkeypatch.setattr(engine, "_regime", lambda: (True, "test"))
+    monkeypatch.setattr(engine, "_regime", lambda: (True, False, "test"))
     candidate = engine.candidates([_low_social_score()])[0]
     assert candidate.social_decision == "would_reject"
     assert candidate.size_multiplier == pytest.approx(0.85)
@@ -533,10 +533,16 @@ def test_runner_step_polls_judgements_without_a_candidate():
     runner._killed_notified = False
     runner._last_ingest = time.monotonic()
     runner.sources = SimpleNamespace(poll_interval_seconds=1800)
-    runner.evaluate_and_trade = MagicMock()
+    runner.mature_opportunities = MagicMock()
+    runner.telegram_control = SimpleNamespace(poll_and_apply=MagicMock(return_value=[]))
+    order: list[str] = []
+    runner.manager = SimpleNamespace(
+        manage_open_trades=MagicMock(side_effect=lambda: order.append("manage"))
+    )
+    runner.evaluate_and_trade = MagicMock(side_effect=lambda: order.append("evaluate"))
     runner.llm = SimpleNamespace(poll_judgements=MagicMock())
-    runner.manager = SimpleNamespace(manage_open_trades=MagicMock())
     runner.step()
+    assert order == ["manage", "evaluate"]
     runner.llm.poll_judgements.assert_called_once_with()
 
 

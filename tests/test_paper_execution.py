@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
@@ -431,3 +433,58 @@ def test_paper_partial_fill_is_capped_at_partial_target(tmp_path):
     )
     assert partial.partial_realized_pnl == pytest.approx(expected_pnl)
     assert partial.last_processed_paper_bar_ts == next_ts
+
+
+def test_kill_flatten_fails_closed_when_quote_unavailable(tmp_path):
+    market, client = _market()
+    broker = PaperBroker(market=market)
+    store = make_store(tmp_path)
+    strategy = make_strategy(advanced_exit_enabled=False, exit_style="fixed")
+    manager = TradeManager(
+        Settings(paper_start_equity=5_000),
+        make_universe(),
+        store,
+        broker,
+        market,
+        market.cfg,
+        strategies=[strategy],
+    )
+    candidate = TradeCandidate("BTC", "BTC-USD", 5.0, 20, 3, "x", strategy.name)
+    trade = manager.open_position(candidate, 500.0, strategy)
+    entry = trade.entry_price
+
+    client.fail_book = True
+    market._quotes.clear()  # noqa: SLF001 - force a fresh quote miss
+
+    manager.manage_open_trades(force_flatten=True)
+
+    closed = store.closed_trades_for("BTC", strategy.name)[-1]
+    assert closed.exit_reason == ExitReason.KILL_SWITCH
+    assert closed.exit_price is not None
+    # Emergency path prices off the entry mark through the max-spread model.
+    assert closed.exit_price < entry
+    assert store.count_open_trades(strategy.name) == 0
+
+
+def test_runner_manages_exits_even_when_entry_path_raises():
+    from smt.run import Runner
+    from smt.trader.paper import PaperMarketUnavailable
+
+    runner = Runner.__new__(Runner)
+    runner.kill = SimpleNamespace(is_active=lambda: False)
+    runner._killed_notified = False
+    runner._last_ingest = time.monotonic()
+    runner.sources = SimpleNamespace(poll_interval_seconds=1800)
+    runner.mature_opportunities = MagicMock()
+    runner.telegram_control = SimpleNamespace(poll_and_apply=MagicMock(return_value=[]))
+    runner.llm = SimpleNamespace(poll_judgements=MagicMock())
+    manage = MagicMock()
+    runner.manager = SimpleNamespace(manage_open_trades=manage)
+
+    def boom() -> None:
+        raise PaperMarketUnavailable("BTC-USD: fresh top-of-book quote unavailable")
+
+    runner.evaluate_and_trade = boom
+    runner.step()
+
+    manage.assert_called_once_with()

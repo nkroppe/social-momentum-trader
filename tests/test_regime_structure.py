@@ -86,6 +86,38 @@ def test_regime_blocks_when_4h_prints_lower_lows():
     ok, detail = market.regime_ok()
     assert not ok
     assert "lower lows" in detail
+    risk_on, risk_off, assessment = market.regime_assessment()
+    assert not risk_on
+    assert not risk_off
+    assert "lower lows" in assessment
+
+
+def test_regime_risk_off_when_below_sma():
+    daily = _daily_above_sma()
+    # Force the last close below the SMA50 without needing a full downtrend history.
+    trend_proxy = sum(c.close for c in daily[-50:]) / 50.0
+    last = daily[-1]
+    daily[-1] = Candle(
+        ts=last.ts,
+        open=last.open,
+        high=last.high,
+        low=min(last.low, trend_proxy - 1.0),
+        close=trend_proxy - 1.0,
+        volume=last.volume,
+    )
+    cfg = MarketConfig(
+        regime=RegimeConfig(
+            enabled=True,
+            require_no_lower_lows=True,
+            structure_granularity_seconds=14_400,
+            structure_lower_lows_bars=3,
+        )
+    )
+    market = _StubMarket(daily, _four_hour([10.0, 12.0, 11.0]), cfg)
+    risk_on, risk_off, detail = market.regime_assessment()
+    assert not risk_on
+    assert risk_off
+    assert "below SMA" in detail
 
 
 def test_regime_passes_when_sma_ok_and_4h_not_breaking_down():
@@ -102,3 +134,6 @@ def test_regime_passes_when_sma_ok_and_4h_not_breaking_down():
     assert ok
     assert "above SMA" in detail
     assert "not consecutively lower" in detail
+    risk_on, risk_off, _ = market.regime_assessment()
+    assert risk_on
+    assert not risk_off

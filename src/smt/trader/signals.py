@@ -749,11 +749,19 @@ class SignalEngine:
             lookback_periods=periods,
         )
 
-    def _regime(self) -> tuple[bool, str]:
-        """Return (risk_on, detail). risk_on means BTC is above its trend SMA."""
+    def _regime(self) -> tuple[bool, bool, str]:
+        """Return (risk_on, risk_off, detail).
+
+        ``risk_on`` means full bull RISK-ON. ``risk_off`` means BTC daily close
+        at/below SMA — the only unlock for ``risk_off_only`` strategies.
+        """
         if self.market is None:
-            return True, "regime not evaluated"
-        return self.market.regime_ok()
+            return True, False, "regime not evaluated"
+        assessment = getattr(self.market, "regime_assessment", None)
+        if callable(assessment):
+            return assessment()
+        risk_on, detail = self.market.regime_ok()
+        return risk_on, False, detail
 
     def _price_setup(self, product_id: str, tier: TierConfig) -> _PriceSetupResult:
         rules = self.strategy.entry
@@ -837,13 +845,13 @@ class SignalEngine:
     # ---- Entry point --------------------------------------------------------
 
     def candidates(self, scores: list[ScoreResult]) -> list[TradeCandidate]:
-        risk_on, regime_detail = self._regime()
-        if not self.strategy.regime_allows_entries(risk_on):
+        risk_on, risk_off, regime_detail = self._regime()
+        if not self.strategy.regime_allows_entries(risk_on, risk_off=risk_off):
             log.info("[%s] regime gate: no new entries (%s)", self.strategy.name, regime_detail)
             return []
 
         out: list[TradeCandidate] = []
-        self._candidate_regime = (risk_on, regime_detail)
+        self._candidate_regime = (risk_on, risk_off, regime_detail)
         try:
             for s in scores:
                 cand = self._evaluate(s)
@@ -857,13 +865,18 @@ class SignalEngine:
 
     def _evaluate(self, s: ScoreResult) -> TradeCandidate | None:
         cached_regime = vars(self).get("_candidate_regime")
-        risk_on, regime_detail = cached_regime if cached_regime is not None else self._regime()
-        return self._evaluate_with_audit(s, risk_on, regime_detail).candidate
+        if cached_regime is not None:
+            risk_on, risk_off, regime_detail = cached_regime
+        else:
+            risk_on, risk_off, regime_detail = self._regime()
+        return self._evaluate_with_audit(s, risk_on, risk_off, regime_detail).candidate
 
     def evaluations(self, scores: list[ScoreResult]) -> list[SignalEvaluation]:
         """Evaluate every scored symbol, including all non-candidate outcomes."""
-        risk_on, regime_detail = self._regime()
-        rows = [self._evaluate_with_audit(score, risk_on, regime_detail) for score in scores]
+        risk_on, risk_off, regime_detail = self._regime()
+        rows = [
+            self._evaluate_with_audit(score, risk_on, risk_off, regime_detail) for score in scores
+        ]
         return rows
 
     def ranked_candidates(self, evaluations: list[SignalEvaluation]) -> list[TradeCandidate]:
@@ -878,10 +891,11 @@ class SignalEngine:
         self,
         s: ScoreResult,
         risk_on: bool,
+        risk_off: bool,
         regime_detail: str,
     ) -> SignalEvaluation:
         st = self.strategy
-        regime_allows = st.regime_allows_entries(risk_on)
+        regime_allows = st.regime_allows_entries(risk_on, risk_off=risk_off)
         granularity = st.entry.trigger_granularity_seconds
         fallback_ts = int(time.time()) // granularity * granularity - granularity
         tier_name = self.universe.tier_of(s.ticker, self.signals.default_tier)
@@ -901,6 +915,7 @@ class SignalEngine:
             "social_baseline_kind": s.baseline_kind,
             "regime_mode": st.regime_mode,
             "risk_on": risk_on,
+            "risk_off": risk_off,
         }
 
         def result(

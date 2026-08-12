@@ -38,6 +38,8 @@ class Broker(Protocol):
         product_id: str,
         qty: float,
         reference_price: float | None = None,
+        *,
+        emergency: bool = False,
     ) -> Fill: ...
 
 

@@ -287,10 +287,10 @@ class BacktestEngine:
     def _equity(self, marks: dict[str, float]) -> float:
         return self.cash + sum(position.qty * marks[position.ticker] for position in self.positions)
 
-    def _regime(self, as_of: int) -> tuple[bool, str]:
+    def _regime(self, as_of: int) -> tuple[bool, bool, str]:
         cfg = self.market.regime
         if not cfg.enabled:
-            return True, "disabled"
+            return True, False, "disabled"
         ticker = next(
             (
                 ticker
@@ -300,10 +300,10 @@ class BacktestEngine:
             None,
         )
         if ticker is None:
-            return False, f"benchmark {cfg.benchmark_product_id} not selected"
+            return False, False, f"benchmark {cfg.benchmark_product_id} not selected"
         rows = self._candles(ticker, cfg.granularity_seconds, as_of)
         if len(rows) < cfg.sma_periods:
-            return False, "insufficient benchmark history"
+            return False, False, "insufficient benchmark history"
         average = sma(rows, cfg.sma_periods)
         above = rows[-1].close > average
         detail = (
@@ -311,17 +311,17 @@ class BacktestEngine:
             f"SMA{cfg.sma_periods} {average:.8f}"
         )
         if not above:
-            return False, detail
+            return False, True, detail
         if cfg.require_no_lower_lows:
             structure = self._candles(ticker, cfg.structure_granularity_seconds, as_of)
             if len(structure) < cfg.structure_lower_lows_bars:
-                return False, f"{detail}; insufficient 4h history"
+                return False, False, f"{detail}; insufficient 4h history"
             lows = [c.low for c in structure[-cfg.structure_lower_lows_bars :]]
             if all(later < earlier for earlier, later in zip(lows[:-1], lows[1:], strict=True)):
                 joined = " > ".join(f"{low:.8f}" for low in lows)
-                return False, f"{detail}; 4h consecutive lower lows ({joined})"
+                return False, False, f"{detail}; 4h consecutive lower lows ({joined})"
             detail = f"{detail}; 4h lows not consecutively lower"
-        return True, detail
+        return True, False, detail
 
     def _confirmation(
         self, ticker: str, strategy: StrategyConfig, tier: str, as_of: int
@@ -385,8 +385,8 @@ class BacktestEngine:
             "notional": "",
         }
         self.opportunities.append(row)
-        risk_on, reason = self._regime(as_of)
-        if not strategy.regime_allows_entries(risk_on):
+        risk_on, risk_off, reason = self._regime(as_of)
+        if not strategy.regime_allows_entries(risk_on, risk_off=risk_off):
             row["status"] = "regime_blocked"
             row["reason"] = reason
             return None

@@ -416,27 +416,37 @@ class MarketData:
             detail="ok",
         )
 
-    def regime_ok(self) -> tuple[bool, str]:
-        """True when the benchmark is in a RISK-ON state for new bull entries.
+    def regime_assessment(self) -> tuple[bool, bool, str]:
+        """Classify the benchmark into RISK-ON / RISK-OFF / neither.
 
-        Requires daily close above SMA(sma_periods). When configured, also
-        rejects consecutive lower lows on the structure timeframe (default 4h).
+        Returns ``(risk_on, risk_off, detail)``:
+        - ``risk_on``: daily close above SMA and (when configured) no consecutive
+          lower lows on the structure timeframe.
+        - ``risk_off``: daily close at or below SMA — the only state that may
+          unlock ``risk_off_only`` strategies such as ``bear_rally``.
+        - both False when history is unavailable under fail-closed, or when
+          price is still above SMA but the structure filter blocks RISK-ON.
         """
         cfg = self.cfg.regime
         if not cfg.enabled:
-            return True, "regime filter disabled"
+            return True, False, "regime filter disabled"
 
         candles = self.candles(cfg.benchmark_product_id, cfg.granularity_seconds)
         if len(candles) < cfg.sma_periods:
             detail = (
                 f"{cfg.benchmark_product_id}: only {len(candles)} candles, need {cfg.sma_periods}"
             )
-            return (not cfg.fail_closed), detail
+            if cfg.fail_closed:
+                return False, False, detail
+            return True, False, detail
 
         trend = sma(candles, cfg.sma_periods)
         last = candles[-1].close
         if trend <= 0:
-            return (not cfg.fail_closed), "benchmark SMA unavailable"
+            detail = "benchmark SMA unavailable"
+            if cfg.fail_closed:
+                return False, False, detail
+            return True, False, detail
 
         above = last > trend
         detail = (
@@ -444,7 +454,7 @@ class MarketData:
             f"{'above' if above else 'below'} SMA{cfg.sma_periods} {trend:.2f}"
         )
         if not above:
-            return False, detail
+            return False, True, detail
 
         if cfg.require_no_lower_lows:
             structure = self.candles(cfg.benchmark_product_id, cfg.structure_granularity_seconds)
@@ -453,12 +463,22 @@ class MarketData:
             )
             if not ok:
                 if structure_detail.startswith("insufficient"):
-                    return (not cfg.fail_closed), (
+                    if cfg.fail_closed:
+                        return False, False, (
+                            f"{detail}; 4h structure unavailable ({structure_detail})"
+                        )
+                    return True, False, (
                         f"{detail}; 4h structure unavailable ({structure_detail})"
                     )
-                return False, f"{detail}; {structure_detail}"
+                # Still above SMA: not RISK-OFF, just not RISK-ON.
+                return False, False, f"{detail}; {structure_detail}"
             detail = f"{detail}; {structure_detail}"
-        return True, detail
+        return True, False, detail
+
+    def regime_ok(self) -> tuple[bool, str]:
+        """True when the benchmark is in a RISK-ON state for new bull entries."""
+        risk_on, _, detail = self.regime_assessment()
+        return risk_on, detail
 
     def close(self) -> None:
         self._client.close()

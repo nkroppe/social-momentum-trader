@@ -135,6 +135,8 @@ class PaperBroker:
         product_id: str,
         qty: float,
         reference_price: float | None = None,
+        *,
+        emergency: bool = False,
     ) -> Fill:
         if self.offline_simulation:
             executable_price = self.current_price(product_id)
@@ -144,7 +146,26 @@ class PaperBroker:
                 else executable_price
             )
         else:
-            quote = self._fresh_quote(product_id)
+            try:
+                quote = self._fresh_quote(product_id)
+            except PaperMarketUnavailable:
+                if (
+                    not emergency
+                    or reference_price is None
+                    or reference_price <= 0
+                ):
+                    raise
+                log.warning(
+                    "[paper] emergency SELL %s qty=%.8f using reference=%.6f (quote unavailable)",
+                    product_id,
+                    qty,
+                    reference_price,
+                )
+                quote = conservative_quote(
+                    product_id,
+                    reference_price,
+                    self._cfg.paper_max_spread_bps,
+                )
             estimate = self._costs.estimate_sell(
                 quote,
                 qty,

@@ -444,12 +444,17 @@ class StrategyConfig(BaseModel):
             raise ValueError("exit_style must be 'atr' or 'fixed'")
         return v
 
-    def regime_allows_entries(self, risk_on: bool) -> bool:
-        """Whether the BTC SMA regime state permits new entries for this strategy."""
+    def regime_allows_entries(self, risk_on: bool, *, risk_off: bool = False) -> bool:
+        """Whether the BTC SMA regime state permits new entries for this strategy.
+
+        ``risk_on`` is the full bull gate (above SMA + structure). ``risk_off`` is
+        specifically daily close at/below SMA — not merely ``not risk_on``, which
+        also covers structure blocks and missing history.
+        """
         if self.regime_mode == "always":
             return True
         if self.regime_mode == "risk_off_only":
-            return not risk_on
+            return risk_off
         return risk_on
 
 

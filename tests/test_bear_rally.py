@@ -85,7 +85,9 @@ def test_regime_mode_matrix():
     bear = make_strategy("bear_rally", regime_mode="risk_off_only")
     always = make_strategy("any", regime_mode="always")
     assert bull.regime_allows_entries(True) and not bull.regime_allows_entries(False)
-    assert bear.regime_allows_entries(False) and not bear.regime_allows_entries(True)
+    assert bear.regime_allows_entries(False, risk_off=True)
+    assert not bear.regime_allows_entries(False, risk_off=False)
+    assert not bear.regime_allows_entries(True, risk_off=False)
     assert always.regime_allows_entries(True) and always.regime_allows_entries(False)
 
 
@@ -138,11 +140,15 @@ def test_rsi_reclaim_rejects_bearish_reclaim_candle():
 
 
 class _RegimeMarket:
-    def __init__(self, risk_on: bool):
+    def __init__(self, *, risk_on: bool = False, risk_off: bool = False):
         self._risk_on = risk_on
+        self._risk_off = risk_off
 
     def regime_ok(self) -> tuple[bool, str]:
         return self._risk_on, "test regime"
+
+    def regime_assessment(self) -> tuple[bool, bool, str]:
+        return self._risk_on, self._risk_off, "test regime"
 
     def candles(self, product_id: str, granularity: int = 3600) -> list[Candle]:
         return []
@@ -174,11 +180,20 @@ def test_bear_rally_engine_only_enters_risk_off():
     )
     scores = [_score("BTC"), _score("SOL")]
 
-    off_engine = SignalEngine(bear, universe, market=_RegimeMarket(False), market_cfg=market_cfg)
-    on_engine = SignalEngine(bear, universe, market=_RegimeMarket(True), market_cfg=market_cfg)
+    off_engine = SignalEngine(
+        bear, universe, market=_RegimeMarket(risk_off=True), market_cfg=market_cfg
+    )
+    on_engine = SignalEngine(
+        bear, universe, market=_RegimeMarket(risk_on=True), market_cfg=market_cfg
+    )
+    # Above SMA with structure block is not RISK-OFF.
+    structure_blocked = SignalEngine(
+        bear, universe, market=_RegimeMarket(), market_cfg=market_cfg
+    )
 
     assert off_engine.candidates(scores)
     assert on_engine.candidates(scores) == []
+    assert structure_blocked.candidates(scores) == []
 
     blocked = on_engine.evaluations(scores)
     assert all(row.outcome_status == "regime_blocked" for row in blocked)

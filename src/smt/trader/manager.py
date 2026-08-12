@@ -300,13 +300,21 @@ class TradeManager:
 
     # ---- Exit --------------------------------------------------------------
 
-    def _close(self, trade: Trade, price: float, reason: ExitReason) -> None:
+    def _close(
+        self,
+        trade: Trade,
+        price: float,
+        reason: ExitReason,
+        *,
+        emergency: bool = False,
+    ) -> None:
         # For paper we simulate the sell; for live-with-server-brackets TP/SL are
         # already handled by the exchange, so we only actively close on time-stop/kill.
         fill = self.broker.close_long(
             trade.product_id,
             trade.qty,
             reference_price=price,
+            emergency=emergency,
         )
         exit_price = fill.price
         gross = (exit_price - trade.entry_price) * trade.qty
@@ -331,6 +339,32 @@ class TradeManager:
         )
         if self.trade_alerts.on_close:
             self._notify(*trade_closed_alert(trade))
+
+    def _kill_flatten(self, trade: Trade) -> None:
+        """Flatten for the kill switch, failing closed even when quotes are down."""
+        try:
+            price = self.broker.current_price(trade.product_id)
+            self._close(trade, price, ExitReason.KILL_SWITCH)
+            return
+        except Exception as exc:  # noqa: BLE001 - mandated flatten must continue
+            log.warning(
+                "Kill flatten primary path failed for %s: %s",
+                trade.product_id,
+                exc,
+            )
+        try:
+            self._close(
+                trade,
+                trade.entry_price,
+                ExitReason.KILL_SWITCH,
+                emergency=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "Kill flatten emergency path failed for %s: %s",
+                trade.product_id,
+                exc,
+            )
 
     def _strategy_for(self, trade: Trade) -> StrategyConfig | None:
         return self.strategies.get(trade.strategy)
@@ -608,9 +642,7 @@ class TradeManager:
             tstop = tstop if tstop.tzinfo else tstop.replace(tzinfo=utcnow().tzinfo)
 
             if force_flatten:
-                self._close(
-                    trade, self.broker.current_price(trade.product_id), ExitReason.KILL_SWITCH
-                )
+                self._kill_flatten(trade)
                 continue
 
             strategy = self._strategy_for(trade)

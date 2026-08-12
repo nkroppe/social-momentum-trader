@@ -120,8 +120,10 @@ class CoinbaseBroker:
         product_id: str,
         qty: float,
         reference_price: float | None = None,
+        *,
+        emergency: bool = False,
     ) -> Fill:
-        """Market sell; `reference_price` is PAPER-only and intentionally ignored."""
+        """Market sell; `reference_price` / `emergency` are PAPER-only and ignored."""
         self._guard_path("/orders")
         import uuid
 
