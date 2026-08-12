@@ -39,5 +39,33 @@ services:
       - ./control:/app/control
     command: ["smt", "run"]
 
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      SMT_CONFIG_DIR: /app/config
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://smt:${POSTGRES_PASSWORD:-smt}@postgres:5432/smt}
+      KILL_FILE: /app/control/KILL
+      DASHBOARD_REQUIRE_AUTH: "true"
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data:ro
+      - ./logs:/app/logs:ro
+      - ./control:/app/control:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
 volumes:
   pgdata:

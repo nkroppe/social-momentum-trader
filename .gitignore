@@ -24,6 +24,12 @@ secrets/
 data/
 logs/
 
+# Dashboard frontend
+web/node_modules/
+web/dist/
+src/smt/dashboard/static/assets/
+src/smt/dashboard/static/index.html
+
 # Tooling
 .pytest_cache/
 .ruff_cache/

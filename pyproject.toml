@@ -28,9 +28,15 @@ llm = [
     # weekly advisory reflections. Exact Sonnet model is account-discovered.
     "cursor-sdk>=1.0.27",
 ]
+dashboard = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+]
 dev = [
     "ruff>=0.5",
     "pytest>=8.2",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
 ]
 
 [project.scripts]
@@ -42,6 +48,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/smt"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/smt/dashboard/static" = "smt/dashboard/static"
 
 [tool.ruff]
 line-length = 100

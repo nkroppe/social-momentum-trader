@@ -421,6 +421,48 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_dashboard(args: argparse.Namespace) -> int:
+    """Serve the read-only monitoring dashboard (API + built SPA)."""
+    try:
+        import uvicorn
+    except ImportError:
+        print("Install dashboard extras: pip install -e \".[dashboard]\"", file=sys.stderr)
+        return 2
+
+    from .config import get_settings
+    from .dashboard.app import create_app
+    from .dashboard.auth import auth_required
+    from .store import Store
+
+    settings = get_settings()
+    host = args.host
+    port = args.port
+    token = args.token if args.token else settings.dashboard_token
+    must_auth = auth_required(
+        require_auth=settings.dashboard_require_auth, bind_host=host
+    )
+    if must_auth and not token:
+        print(
+            "DASHBOARD_TOKEN is required when binding a non-loopback address "
+            "or when DASHBOARD_REQUIRE_AUTH=true.",
+            file=sys.stderr,
+        )
+        return 2
+
+    store = Store(settings.database_url)
+    store.init_db()
+    app = create_app(
+        store=store,
+        settings=settings,
+        token=token,
+        require_auth=must_auth,
+        bind_host=host,
+    )
+    log.info("dashboard listening on http://%s:%s (auth=%s)", host, port, must_auth)
+    uvicorn.run(app, host=host, port=port, log_level="info")
+    return 0
+
+
 def _cmd_backtest(args: argparse.Namespace) -> int:
     """Replay deterministic price rules against strict local candle files."""
     from pathlib import Path
@@ -537,6 +579,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     replay.add_argument("--output-dir", required=True, help="Artifact output directory")
     replay.set_defaults(func=_cmd_backtest)
+
+    dash = sub.add_parser("dashboard", help="Serve the read-only monitoring web UI")
+    dash.add_argument("--host", default="127.0.0.1", help="Bind address (default 127.0.0.1)")
+    dash.add_argument("--port", type=int, default=8080, help="Bind port (default 8080)")
+    dash.add_argument(
+        "--token",
+        default="",
+        help="Override DASHBOARD_TOKEN for this process",
+    )
+    dash.set_defaults(func=_cmd_dashboard)
 
     return p
 

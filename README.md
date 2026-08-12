@@ -160,6 +160,10 @@ smt score
 
 # 5) Run the loop in paper mode
 smt run
+
+# 6) Optional: monitoring dashboard (read-only)
+pip install -e ".[dashboard]"
+smt dashboard
 ```
 
 With no `.env`, it uses **SQLite** and a **mock** social feed, so the loop and
@@ -275,9 +279,36 @@ smt soak-report         # soak progress + strategy comparison
 smt preview             # live exit levels + position size per symbol
 smt weekly-report       # preview this week's P/L (--send to deliver, --last for prior week)
 smt shadow-report       # social + Sonnet readiness evidence (--days N, --send)
+smt dashboard           # read-only web UI on http://127.0.0.1:8080
 smt backtest ...        # deterministic local price-only replay; never calls network
 smt soak-reset          # intentional restart; policy changes reset automatically
 ```
+
+### Monitoring dashboard
+
+A FastAPI + React dashboard reports open positions, trade history, equity, P&L,
+strategy comparison, opportunity funnel, and risk caps. It is **read-only**
+(no orders, no kill switch).
+
+Local (loopback, token optional):
+
+```bash
+pip install -e ".[dashboard]"
+cd web && npm install && npm run build && cd ..
+smt dashboard
+```
+
+Or keep the API on 8080 and the Vite dev server on 5173 (`npm run dev` in `web/`).
+
+On the VPS, Compose publishes **loopback only**: `127.0.0.1:8080`. Set a long
+`DASHBOARD_TOKEN` in `.env`. Reach it with an SSH tunnel:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 user@your-vps
+# then open http://127.0.0.1:8080 and paste the token
+```
+
+Do not publish port 8080 on `0.0.0.0`.
 
 `smt soak-report` shows the active policy fingerprint, generation, reset reason,
 and changed policy sections. Days accumulated under different rules do not

@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     # Poll cadence for the main trade loop (exit checks).
     loop_interval_seconds: int = 60
 
+    # Read-only web dashboard (`smt dashboard`). Token is required when binding
+    # a non-loopback address or when DASHBOARD_REQUIRE_AUTH=true (Docker default).
+    dashboard_token: str = ""
+    dashboard_require_auth: bool = False
+
     # Coinbase (trade-only key)
     coinbase_api_key: str = ""
     coinbase_api_secret: str = ""

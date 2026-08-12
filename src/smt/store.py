@@ -1266,6 +1266,124 @@ class Store:
             "avg_hold_hours": avg_hold_hours,
         }
 
+    def closed_trades_filtered(
+        self,
+        *,
+        strategy: str | None = None,
+        ticker: str | None = None,
+        exit_reason: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[Trade], int]:
+        """Paginated closed-trade history for the dashboard."""
+        limit = max(1, min(limit, 500))
+        offset = max(0, offset)
+        with self.session() as s:
+            stmt = select(Trade).where(Trade.status == TradeStatus.CLOSED)
+            count_stmt = (
+                select(func.count()).select_from(Trade).where(Trade.status == TradeStatus.CLOSED)
+            )
+            if strategy is not None:
+                stmt = stmt.where(Trade.strategy == strategy)
+                count_stmt = count_stmt.where(Trade.strategy == strategy)
+            if ticker is not None:
+                stmt = stmt.where(Trade.ticker == ticker)
+                count_stmt = count_stmt.where(Trade.ticker == ticker)
+            if exit_reason is not None:
+                stmt = stmt.where(Trade.exit_reason == ExitReason(exit_reason))
+                count_stmt = count_stmt.where(Trade.exit_reason == ExitReason(exit_reason))
+            if start is not None:
+                stmt = stmt.where(Trade.closed_at.is_not(None), Trade.closed_at >= start)
+                count_stmt = count_stmt.where(
+                    Trade.closed_at.is_not(None), Trade.closed_at >= start
+                )
+            if end is not None:
+                stmt = stmt.where(Trade.closed_at.is_not(None), Trade.closed_at < end)
+                count_stmt = count_stmt.where(Trade.closed_at.is_not(None), Trade.closed_at < end)
+            total = int(s.scalar(count_stmt) or 0)
+            rows = list(
+                s.scalars(
+                    stmt.order_by(Trade.closed_at.desc(), Trade.id.desc())
+                    .limit(limit)
+                    .offset(offset)
+                )
+            )
+            return rows, total
+
+    def total_fees_paid(self, strategy: str | None = None) -> float:
+        with self.session() as s:
+            stmt = select(func.coalesce(func.sum(Trade.fees_paid), 0.0))
+            if strategy is not None:
+                stmt = stmt.where(Trade.strategy == strategy)
+            return float(s.scalar(stmt) or 0.0)
+
+    def recent_opportunities(self, limit: int = 50) -> Sequence[OpportunityDecision]:
+        limit = max(1, min(limit, 200))
+        with self.session() as s:
+            return list(
+                s.scalars(
+                    select(OpportunityDecision)
+                    .order_by(
+                        OpportunityDecision.evaluated_at.desc(), OpportunityDecision.id.desc()
+                    )
+                    .limit(limit)
+                )
+            )
+
+    def opportunity_status_counts(self) -> dict[str, int]:
+        with self.session() as s:
+            rows = s.execute(
+                select(OpportunityDecision.outcome_status, func.count()).group_by(
+                    OpportunityDecision.outcome_status
+                )
+            )
+            return {str(status): int(count) for status, count in rows}
+
+    def recent_shadow_decisions(self, limit: int = 50) -> Sequence[ShadowDecision]:
+        limit = max(1, min(limit, 200))
+        with self.session() as s:
+            return list(
+                s.scalars(
+                    select(ShadowDecision)
+                    .order_by(ShadowDecision.updated_at.desc(), ShadowDecision.id.desc())
+                    .limit(limit)
+                )
+            )
+
+    def shadow_summary(self) -> tuple[int, int, dict[str, int]]:
+        """Full-table audit totals, independent of the recent-row page."""
+        with self.session() as s:
+            total = int(s.scalar(select(func.count()).select_from(ShadowDecision)) or 0)
+            vetoes = int(
+                s.scalar(
+                    select(func.count())
+                    .select_from(ShadowDecision)
+                    .where(ShadowDecision.llm_veto.is_(True))
+                )
+                or 0
+            )
+            rows = s.execute(
+                select(ShadowDecision.social_decision, func.count()).group_by(
+                    ShadowDecision.social_decision
+                )
+            )
+            social = {(str(status) if status else "unknown"): int(count) for status, count in rows}
+            return total, vetoes, social
+
+    def list_risk_equity_snapshots(self, limit: int = 60) -> Sequence[RiskEquitySnapshot]:
+        """Read-only halt baselines; does not create missing buckets."""
+        limit = max(1, min(limit, 200))
+        with self.session() as s:
+            return list(
+                s.scalars(
+                    select(RiskEquitySnapshot)
+                    .order_by(RiskEquitySnapshot.bucket_start.desc(), RiskEquitySnapshot.id.desc())
+                    .limit(limit)
+                )
+            )
+
     # ---- Security audit ----------------------------------------------------
 
     def add_security_event(self, kind: str, detail: str, severity: str = "INFO") -> None:
