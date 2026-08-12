@@ -37,16 +37,20 @@ confirmation:
   require_above_sma: true
   sma_periods: 24            # 24 x 1h = 1 day
   require_positive_return: true
-  min_volume_zscore: 0.0     # raise to ~1.0 to demand a real volume expansion
+  min_volume_zscore: 1.0     # demand real 1h volume expansion on confirmation
   volume_periods: 24
 
 # Broad-market trend gate. Long-only alt momentum bleeds in a BTC downtrend.
+# RISK-ON = daily close above SMA50 AND BTC 4h not printing consecutive lower lows.
 regime:
   enabled: true
   benchmark_product_id: BTC-USD
   granularity_seconds: 86400   # daily candles
   sma_periods: 50
   fail_closed: true
+  require_no_lower_lows: true
+  structure_granularity_seconds: 14400  # 4h
+  structure_lower_lows_bars: 3
 
 # Equalize risk across a universe spanning BTC to sub-cent tokens. Scale is
 # capped at 1.0, so this only ever reduces size below max_position_pct.

@@ -95,7 +95,9 @@ strategies:
       compression_lookback: 20
       compression_recent: 5
       compression_ratio_max: 0.80
-      require_compression: true
+      # Gen-3 ledger: swing produced 0 setups while intraday produced all near
+      # misses; keep compression as a soft preference via ranking, not a hard gate.
+      require_compression: false
       retest_window: 4
       retest_tolerance_pct: 0.005
       vwap_periods: 32

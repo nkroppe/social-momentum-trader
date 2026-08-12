@@ -563,6 +563,45 @@ def _detect_bear_rally_setup(
     return None
 
 
+def _setup_reject_diagnostics(
+    trigger: list[Candle],
+    bias: list[Candle],
+    rules: EntryRulesConfig,
+) -> dict[str, str | float | bool]:
+    """Capture gate proximity features even when no setup qualifies.
+
+    Opportunity-ledger tuning needs these on ``no_setup`` rows; without them
+    every reject looks identical.
+    """
+    if len(trigger) < 20 or len(bias) < 20:
+        return {}
+    trigger_stack, trigger_emas = _ema_stack(trigger)
+    bias_stack, bias_emas = _ema_stack(bias)
+    high, low = structure_levels(trigger, rules.breakout_lookback)
+    latest = trigger[-1]
+    return {
+        "rsi": rsi(trigger, rules.rsi_periods),
+        "relative_volume": relative_volume(trigger, rules.volume_lookback),
+        "ema9": trigger_emas[0],
+        "ema21": trigger_emas[1],
+        "ema50": trigger_emas[2],
+        "bias_ema9": bias_emas[0],
+        "bias_ema21": bias_emas[1],
+        "bias_ema50": bias_emas[2],
+        "trigger_ema_stack": trigger_stack,
+        "bias_ema_stack": bias_stack,
+        "structure_high": high,
+        "structure_low": low,
+        "close_above_structure_high": bool(high > 0 and latest.close > high),
+        "compressed": volatility_compression(
+            trigger,
+            rules.compression_lookback,
+            rules.compression_recent,
+            rules.compression_ratio_max,
+        ),
+    }
+
+
 def detect_price_setup(
     trigger: list[Candle],
     bias: list[Candle],
@@ -784,6 +823,8 @@ class SignalEngine:
         )
         if setup is not None:
             features.update(setup.metadata)
+        else:
+            features.update(_setup_reject_diagnostics(trigger, bias, rules))
         return _PriceSetupResult(
             setup,
             True,

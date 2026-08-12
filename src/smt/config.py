@@ -718,13 +718,35 @@ class ConfirmationConfig(BaseModel):
 
 
 class RegimeConfig(BaseModel):
-    """Benchmark trend filter: block new longs in a broad downtrend."""
+    """Benchmark trend filter: block new longs in a broad downtrend.
+
+    RISK-ON requires the daily close above SMA(sma_periods). When
+    ``require_no_lower_lows`` is set, consecutive lower lows on the structure
+    timeframe (default 4h) also block RISK-ON — so alts are not bought into a
+    BTC breakdown that the daily SMA has not yet flipped.
+    """
 
     enabled: bool = True
     benchmark_product_id: str = "BTC-USD"
     granularity_seconds: int = 86_400
     sma_periods: int = 50
     fail_closed: bool = True
+    require_no_lower_lows: bool = True
+    structure_granularity_seconds: int = 14_400  # 4h
+    structure_lower_lows_bars: int = 3
+
+    @field_validator("structure_granularity_seconds", "structure_lower_lows_bars", "sma_periods")
+    @classmethod
+    def _positive_regime_periods(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("regime period settings must be positive")
+        return value
+
+    @model_validator(mode="after")
+    def _valid_lower_lows(self) -> RegimeConfig:
+        if self.require_no_lower_lows and self.structure_lower_lows_bars < 2:
+            raise ValueError("structure_lower_lows_bars must be >= 2 when enabled")
+        return self
 
 
 class VolSizingConfig(BaseModel):
@@ -956,7 +978,7 @@ def get_strategies() -> StrategiesConfig:
                 EntryRulesConfig(
                     trigger_granularity_seconds=3_600,
                     bias_granularity_seconds=14_400,
-                    require_compression=True,
+                    require_compression=False,
                     allow_vwap_pullback=False,
                 )
                 if name == "swing"

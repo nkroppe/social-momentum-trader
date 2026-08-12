@@ -305,10 +305,23 @@ class BacktestEngine:
         if len(rows) < cfg.sma_periods:
             return False, "insufficient benchmark history"
         average = sma(rows, cfg.sma_periods)
-        return rows[-1].close > average, (
-            f"{rows[-1].close:.8f} {'above' if rows[-1].close > average else 'below'} "
+        above = rows[-1].close > average
+        detail = (
+            f"{rows[-1].close:.8f} {'above' if above else 'below'} "
             f"SMA{cfg.sma_periods} {average:.8f}"
         )
+        if not above:
+            return False, detail
+        if cfg.require_no_lower_lows:
+            structure = self._candles(ticker, cfg.structure_granularity_seconds, as_of)
+            if len(structure) < cfg.structure_lower_lows_bars:
+                return False, f"{detail}; insufficient 4h history"
+            lows = [c.low for c in structure[-cfg.structure_lower_lows_bars :]]
+            if all(later < earlier for earlier, later in zip(lows[:-1], lows[1:], strict=True)):
+                joined = " > ".join(f"{low:.8f}" for low in lows)
+                return False, f"{detail}; 4h consecutive lower lows ({joined})"
+            detail = f"{detail}; 4h lows not consecutively lower"
+        return True, detail
 
     def _confirmation(
         self, ticker: str, strategy: StrategyConfig, tier: str, as_of: int

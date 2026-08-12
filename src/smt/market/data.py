@@ -352,7 +352,11 @@ class MarketData:
         )
 
     def regime_ok(self) -> tuple[bool, str]:
-        """True when the benchmark (BTC) is above its trend moving average."""
+        """True when the benchmark is in a RISK-ON state for new bull entries.
+
+        Requires daily close above SMA(sma_periods). When configured, also
+        rejects consecutive lower lows on the structure timeframe (default 4h).
+        """
         cfg = self.cfg.regime
         if not cfg.enabled:
             return True, "regime filter disabled"
@@ -374,7 +378,37 @@ class MarketData:
             f"{cfg.benchmark_product_id} {last:.2f} "
             f"{'above' if above else 'below'} SMA{cfg.sma_periods} {trend:.2f}"
         )
-        return above, detail
+        if not above:
+            return False, detail
+
+        if cfg.require_no_lower_lows:
+            structure = self.candles(cfg.benchmark_product_id, cfg.structure_granularity_seconds)
+            ok, structure_detail = _no_consecutive_lower_lows(
+                structure, cfg.structure_lower_lows_bars
+            )
+            if not ok:
+                if structure_detail.startswith("insufficient"):
+                    return (not cfg.fail_closed), (
+                        f"{detail}; 4h structure unavailable ({structure_detail})"
+                    )
+                return False, f"{detail}; {structure_detail}"
+            detail = f"{detail}; {structure_detail}"
+        return True, detail
 
     def close(self) -> None:
         self._client.close()
+
+
+def _no_consecutive_lower_lows(candles: list[Candle], bars: int) -> tuple[bool, str]:
+    """Return False when the last ``bars`` lows are strictly decreasing."""
+    if bars < 2:
+        return True, "lower-lows check disabled"
+    if len(candles) < bars:
+        return False, f"insufficient 4h history ({len(candles)}/{bars})"
+    window = candles[-bars:]
+    lows = [c.low for c in window]
+    decreasing = all(later < earlier for earlier, later in zip(lows[:-1], lows[1:], strict=True))
+    if decreasing:
+        joined = " > ".join(f"{low:.2f}" for low in lows)
+        return False, f"4h consecutive lower lows ({joined})"
+    return True, f"4h lows not consecutively lower (last={lows[-1]:.2f})"

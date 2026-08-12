@@ -55,8 +55,9 @@ social z-score.
 
 A benchmark regime filter (BTC vs its 50-day average) gates entries
 **per strategy**: `intraday` / `swing` only enter in RISK-ON; `bear_rally`
-only enters in RISK-OFF. Every price gate is **fail-closed**: no market data
-means no entry.
+only enters in RISK-OFF. RISK-ON also requires BTC 4h not printing consecutive
+lower lows. Confirmation demands 1h volume z ≥ 1.0. Every price gate is
+**fail-closed**: no market data means no entry.
 
 ### Sparse L3 Sonnet review
 

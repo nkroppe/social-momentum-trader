@@ -159,8 +159,11 @@ def test_intraday_and_swing_rules_are_structurally_distinct():
     assert not strategies["intraday"].entry.require_compression
     assert strategies["swing"].entry.trigger_granularity_seconds == 3_600
     assert strategies["swing"].entry.bias_granularity_seconds == 14_400
-    assert strategies["swing"].entry.require_compression
+    # Ledger-backed: compression is no longer a hard swing gate.
+    assert not strategies["swing"].entry.require_compression
     assert not strategies["swing"].entry.allow_vwap_pullback
+    assert strategies["bear_rally"].regime_mode == "risk_off_only"
+    assert strategies["bear_rally"].entry.setup_family == "bear_rally"
 
 
 class _SetupMarket:
