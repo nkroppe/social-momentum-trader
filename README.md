@@ -53,9 +53,10 @@ When position capacity is scarce, candidates are ranked only by deterministic
 price evidence (setup quality, conviction, relative volume, ticker), never by
 social z-score.
 
-A benchmark regime filter (BTC vs its 50-day average) blocks *all* new entries
-in a broad downtrend. Every price gate is **fail-closed**: no market data means
-no entry.
+A benchmark regime filter (BTC vs its 50-day average) gates entries
+**per strategy**: `intraday` / `swing` only enter in RISK-ON; `bear_rally`
+only enters in RISK-OFF. Every price gate is **fail-closed**: no market data
+means no entry.
 
 ### Sparse L3 Sonnet review
 
@@ -76,16 +77,20 @@ Each Sunday report also queues a Sonnet reflection over closed trades and
 current rules. Recommendations are persisted and sent as an advisory Telegram
 message; they are never applied automatically.
 
-## Two strategies, one capital pool
+## Strategies, one capital pool
 
-The bot runs **two methodologies simultaneously** on a configurable capital
-split (default 50/50) so you can compare which performs best over the soak:
+The bot runs **three methodologies** on a configurable capital split (default
+40/40/20 for intraday / swing / bear_rally). Bull strategies only take new
+entries when BTC is above its 50-day SMA; bear_rally only when BTC is below it
+(so idle capital sits in cash in the "wrong" regime).
 
 Intraday targets 50% off at 1.5R with a 6-hour hard time-stop and a tighter
 4-hour stale stop if price never reaches +1R. Swing targets 50% off at 2R with
-48-hour/24-hour equivalents. After the partial, the remainder uses a
-Chandelier ATR stop that only ratchets upward and cannot fall below a
-cost-adjusted breakeven floor.
+48-hour/24-hour equivalents. `bear_rally` trades short-lived RISK-OFF relief
+rallies on BTC/ETH/SOL (RSI reclaim, failed breakdown, relative-strength
+bounce) with faster partials (1.0R) and tighter stops. After the partial, the
+remainder uses a Chandelier ATR stop that only ratchets upward and cannot fall
+below a cost-adjusted breakeven floor.
 
 Position size starts from a 0.5% equity risk budget divided by the candidate's
 structure-stop percentage. The result is capped by the hard max-position

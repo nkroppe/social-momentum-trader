@@ -138,7 +138,7 @@ def test_both_strategies_simulate_end_to_end(tmp_path):
 
     strategies = get_strategies().enabled()
     names = {s.name for s in strategies}
-    assert {"intraday", "swing"} <= names  # ships with both
+    assert {"intraday", "swing", "bear_rally"} <= names  # ships with all three
 
     seed_momentum(store, "SOL", strategies)
 

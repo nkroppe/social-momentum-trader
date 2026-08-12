@@ -82,7 +82,7 @@ def _inputs() -> tuple[
     return universe, [strategy], market, RiskConfig(), signals
 
 
-def _always_setup(trigger, _bias, _rules, _tier, _name):
+def _always_setup(trigger, _bias, _rules, _tier, _name, benchmark=None):
     close = trigger[-1].close
     return PriceSetup(
         name="breakout_close",
@@ -95,7 +95,7 @@ def _always_setup(trigger, _bias, _rules, _tier, _name):
     )
 
 
-def _uneconomic_setup(trigger, _bias, _rules, _tier, _name):
+def _uneconomic_setup(trigger, _bias, _rules, _tier, _name, benchmark=None):
     close = trigger[-1].close
     return PriceSetup(
         name="breakout_close",

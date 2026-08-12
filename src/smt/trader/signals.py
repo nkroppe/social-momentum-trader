@@ -1,8 +1,9 @@
 """Price-action-first signal engine with tier-specific social playbooks.
 
-Production candidates always begin with a deterministic multi-timeframe setup:
-EMA 9/21/50 trend alignment, RSI, structure, relative volume, and one of a
-breakout-close, breakout-retest, or permitted intraday VWAP-reclaim pattern.
+Production candidates always begin with a deterministic multi-timeframe setup.
+Bull strategies use EMA 9/21/50 alignment, RSI, and breakout/retest/VWAP
+patterns. The bear_rally strategy uses RISK-OFF-only relief setups (RSI reclaim,
+failed breakdown, relative-strength bounce) on an allowlisted universe.
 Social is then ignored, optional, required, or catalyst-required by liquidity
 tier; it can never create a candidate without the price setup.
 """
@@ -15,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from ..config import (
+    ConfirmationConfig,
     EntryRulesConfig,
     MarketConfig,
     SignalsConfig,
@@ -148,8 +150,20 @@ class SignalEvaluation:
 
 _SETUP_QUALITY = {
     "breakout_retest": 3,
+    "failed_breakdown": 3,
+    "rsi_reclaim": 2,
     "vwap_pullback": 2,
+    "rs_bounce": 2,
     "breakout_close": 1,
+}
+
+_SETUP_CONVICTION = {
+    "breakout_close": 0.85,
+    "breakout_retest": 1.0,
+    "vwap_pullback": 0.90,
+    "rsi_reclaim": 0.90,
+    "failed_breakdown": 0.95,
+    "rs_bounce": 0.85,
 }
 
 
@@ -195,18 +209,82 @@ def _retest_setup(
     return None
 
 
-def detect_price_setup(
+def _chase_blocked(trigger: list[Candle], rules: EntryRulesConfig) -> bool:
+    lookback = min(rules.chase_lookback_bars, len(trigger) - 1)
+    if lookback <= 0 or trigger[-1].close <= 0 or trigger[-1 - lookback].close <= 0:
+        return False
+    chase_ret = trigger[-1].close / trigger[-1 - lookback].close - 1.0
+    return chase_ret > rules.max_chase_return_pct
+
+
+def _finalize_setup(
+    *,
+    setup_name: str,
+    trigger: list[Candle],
+    bias: list[Candle],
+    rules: EntryRulesConfig,
+    strategy_name: str,
+    breakout_level: float,
+    stop_reference: float,
+    rel_vol: float,
+    trigger_rsi: float,
+    trigger_emas: tuple[float, float, float],
+    bias_emas: tuple[float, float, float],
+    compressed: bool,
+    extra_metadata: dict[str, str | float | bool] | None = None,
+) -> PriceSetup | None:
+    latest = trigger[-1]
+    high, low = structure_levels(trigger, rules.structure_lookback)
+    atr_abs = atr(trigger, 14)
+    structure_stop = stop_reference - atr_abs * rules.stop_atr_buffer
+    stop_pct = (latest.close - structure_stop) / latest.close if latest.close > 0 else 0.0
+    if stop_pct < rules.min_stop_pct:
+        stop_pct = rules.min_stop_pct
+        structure_stop = latest.close * (1.0 - stop_pct)
+    if stop_pct > rules.max_stop_pct or structure_stop <= 0 or structure_stop >= latest.close:
+        return None
+
+    conviction = _SETUP_CONVICTION.get(setup_name, 0.8)
+    if compressed:
+        conviction = min(conviction + 0.05, 1.0)
+    metadata: dict[str, str | float | bool] = {
+        "setup": setup_name,
+        "strategy": strategy_name,
+        "trigger_ts": str(latest.ts),
+        "breakout_level": breakout_level,
+        "structure_high": high,
+        "structure_low": low,
+        "relative_volume": rel_vol,
+        "rsi": trigger_rsi,
+        "ema9": trigger_emas[0],
+        "ema21": trigger_emas[1],
+        "ema50": trigger_emas[2],
+        "bias_ema9": bias_emas[0],
+        "bias_ema21": bias_emas[1],
+        "bias_ema50": bias_emas[2],
+        "compressed": compressed,
+        "price_conviction": conviction,
+    }
+    if extra_metadata:
+        metadata.update(extra_metadata)
+    return PriceSetup(
+        name=setup_name,
+        entry_price=latest.close,
+        structure_stop=structure_stop,
+        stop_pct=stop_pct,
+        atr_pct=(atr_abs / latest.close) if latest.close > 0 else 0.0,
+        conviction=conviction,
+        metadata=metadata,
+    )
+
+
+def _detect_bull_breakout_setup(
     trigger: list[Candle],
     bias: list[Candle],
     rules: EntryRulesConfig,
     tier: TierConfig,
     strategy_name: str,
 ) -> PriceSetup | None:
-    """Detect a long setup from fully deterministic OHLCV rules."""
-    needed = max(51, rules.breakout_lookback + rules.retest_window + 2)
-    if len(trigger) < needed or len(bias) < 50:
-        return None
-
     trigger_stack, trigger_emas = _ema_stack(trigger)
     bias_stack, bias_emas = _ema_stack(bias)
     if rules.require_trigger_ema_stack and not trigger_stack:
@@ -270,48 +348,246 @@ def detect_price_setup(
     if rules.require_compression and not compressed:
         return None
 
-    atr_abs = atr(trigger, 14)
-    structure_stop = stop_reference - atr_abs * rules.stop_atr_buffer
-    stop_pct = (latest.close - structure_stop) / latest.close
-    if stop_pct < rules.min_stop_pct:
-        stop_pct = rules.min_stop_pct
-        structure_stop = latest.close * (1.0 - stop_pct)
-    if stop_pct > rules.max_stop_pct or structure_stop <= 0:
+    return _finalize_setup(
+        setup_name=setup_name,
+        trigger=trigger,
+        bias=bias,
+        rules=rules,
+        strategy_name=strategy_name,
+        breakout_level=breakout_level,
+        stop_reference=stop_reference,
+        rel_vol=rel_vol,
+        trigger_rsi=trigger_rsi,
+        trigger_emas=trigger_emas,
+        bias_emas=bias_emas,
+        compressed=compressed,
+    )
+
+
+def _rsi_reclaim_setup(
+    trigger: list[Candle],
+    rules: EntryRulesConfig,
+    min_relative_volume: float,
+) -> tuple[float, float, float] | None:
+    """Return reclaim RSI, stop reference, and relative volume when present."""
+    lookback = rules.rsi_lookback_bars
+    if len(trigger) < rules.rsi_periods + lookback + 1:
+        return None
+    latest = trigger[-1]
+    if latest.close < latest.open:
+        return None
+    rel_vol = relative_volume(trigger, rules.volume_lookback)
+    if rel_vol < min_relative_volume:
         return None
 
-    conviction = {
-        "breakout_close": 0.85,
-        "breakout_retest": 1.0,
-        "vwap_pullback": 0.90,
-    }[setup_name]
-    if compressed:
-        conviction = min(conviction + 0.05, 1.0)
-    metadata: dict[str, str | float | bool] = {
-        "setup": setup_name,
-        "strategy": strategy_name,
-        "trigger_ts": str(latest.ts),
-        "breakout_level": breakout_level,
-        "structure_high": high,
-        "structure_low": low,
-        "relative_volume": rel_vol,
-        "rsi": trigger_rsi,
-        "ema9": trigger_emas[0],
-        "ema21": trigger_emas[1],
-        "ema50": trigger_emas[2],
-        "bias_ema9": bias_emas[0],
-        "bias_ema21": bias_emas[1],
-        "bias_ema50": bias_emas[2],
-        "compressed": compressed,
-    }
-    return PriceSetup(
-        name=setup_name,
-        entry_price=latest.close,
-        structure_stop=structure_stop,
-        stop_pct=stop_pct,
-        atr_pct=(atr_abs / latest.close) if latest.close > 0 else 0.0,
-        conviction=conviction,
-        metadata=metadata,
+    rsi_values: list[float] = []
+    for end in range(len(trigger) - lookback, len(trigger)):
+        rsi_values.append(rsi(trigger[: end + 1], rules.rsi_periods))
+    if not rsi_values:
+        return None
+    prior = rsi_values[:-1]
+    if not prior or min(prior) > rules.rsi_oversold_max:
+        return None
+    if rsi_values[-1] < rules.rsi_reclaim_min:
+        return None
+    if latest.close <= trigger[-2].high:
+        return None
+    stop_reference = min(c.low for c in trigger[-lookback:])
+    return rsi_values[-1], stop_reference, rel_vol
+
+
+def _failed_breakdown_setup(
+    trigger: list[Candle],
+    rules: EntryRulesConfig,
+    min_relative_volume: float,
+) -> tuple[float, float, float] | None:
+    """Return breakdown level, sweep low, and relative volume when reclaimed."""
+    needed = rules.failed_breakdown_lookback + rules.retest_window + 2
+    if len(trigger) < needed:
+        return None
+    latest = trigger[-1]
+    if latest.close < latest.open:
+        return None
+    structure = trigger[
+        -(rules.failed_breakdown_lookback + rules.retest_window + 1) : -rules.retest_window
+    ]
+    if len(structure) < 5:
+        return None
+    level = min(c.low for c in structure)
+    if level <= 0:
+        return None
+    sweep_low = level
+    swept = False
+    for candle in trigger[-rules.retest_window - 1 : -1]:
+        if candle.low < level:
+            swept = True
+            sweep_low = min(sweep_low, candle.low)
+    if not swept:
+        return None
+    if latest.close <= level:
+        return None
+    rel_vol = relative_volume(trigger, rules.volume_lookback)
+    if rel_vol < min_relative_volume:
+        return None
+    return level, sweep_low, rel_vol
+
+
+def _rs_bounce_setup(
+    trigger: list[Candle],
+    benchmark: list[Candle],
+    rules: EntryRulesConfig,
+    min_relative_volume: float,
+) -> tuple[float, float, float, float] | None:
+    """Return RS edge, reclaim level, stop reference, and relative volume."""
+    lookback = rules.rs_lookback_bars
+    if len(trigger) < lookback + 2 or len(benchmark) < lookback + 2:
+        return None
+    latest = trigger[-1]
+    if latest.close < latest.open:
+        return None
+    asset_base = trigger[-1 - lookback].close
+    bench_base = benchmark[-1 - lookback].close
+    if asset_base <= 0 or bench_base <= 0 or benchmark[-1].close <= 0:
+        return None
+    asset_ret = latest.close / asset_base - 1.0
+    bench_ret = benchmark[-1].close / bench_base - 1.0
+    rs_edge = asset_ret - bench_ret
+    if rs_edge < rules.rs_min_outperformance_pct:
+        return None
+
+    rel_vol = relative_volume(trigger, rules.volume_lookback)
+    if rel_vol < min_relative_volume:
+        return None
+
+    ema9 = ema(trigger, 9)
+    vwap = rolling_vwap(trigger, rules.vwap_periods)
+    tolerance_ema = ema9 * rules.retest_tolerance_pct
+    tolerance_vwap = vwap * rules.retest_tolerance_pct
+    reclaim_level = 0.0
+    if ema9 > 0 and latest.low <= ema9 + tolerance_ema and latest.close > ema9:
+        reclaim_level = ema9
+    elif vwap > 0 and latest.low <= vwap + tolerance_vwap and latest.close > vwap:
+        reclaim_level = vwap
+    else:
+        return None
+    stop_reference = min(c.low for c in trigger[-rules.retest_window :])
+    return rs_edge, reclaim_level, stop_reference, rel_vol
+
+
+def _detect_bear_rally_setup(
+    trigger: list[Candle],
+    bias: list[Candle],
+    rules: EntryRulesConfig,
+    tier: TierConfig,
+    strategy_name: str,
+    benchmark: list[Candle] | None = None,
+) -> PriceSetup | None:
+    if _chase_blocked(trigger, rules):
+        return None
+
+    _, trigger_emas = _ema_stack(trigger)
+    _, bias_emas = _ema_stack(bias)
+    trigger_rsi = rsi(trigger, rules.rsi_periods)
+    compressed = volatility_compression(
+        trigger,
+        rules.compression_lookback,
+        rules.compression_recent,
+        rules.compression_ratio_max,
     )
+    min_rvol = tier.min_relative_volume
+
+    if rules.allow_failed_breakdown:
+        failed = _failed_breakdown_setup(trigger, rules, min_rvol)
+        if failed is not None:
+            level, sweep_low, rel_vol = failed
+            setup = _finalize_setup(
+                setup_name="failed_breakdown",
+                trigger=trigger,
+                bias=bias,
+                rules=rules,
+                strategy_name=strategy_name,
+                breakout_level=level,
+                stop_reference=sweep_low,
+                rel_vol=rel_vol,
+                trigger_rsi=trigger_rsi,
+                trigger_emas=trigger_emas,
+                bias_emas=bias_emas,
+                compressed=compressed,
+            )
+            if setup is not None:
+                return setup
+
+    if rules.allow_rsi_reclaim:
+        reclaim = _rsi_reclaim_setup(trigger, rules, min_rvol)
+        if reclaim is not None:
+            reclaim_rsi, stop_reference, rel_vol = reclaim
+            setup = _finalize_setup(
+                setup_name="rsi_reclaim",
+                trigger=trigger,
+                bias=bias,
+                rules=rules,
+                strategy_name=strategy_name,
+                breakout_level=trigger[-1].close,
+                stop_reference=stop_reference,
+                rel_vol=rel_vol,
+                trigger_rsi=reclaim_rsi,
+                trigger_emas=trigger_emas,
+                bias_emas=bias_emas,
+                compressed=compressed,
+                extra_metadata={"rsi_reclaim": reclaim_rsi},
+            )
+            if setup is not None:
+                return setup
+
+    if rules.allow_rs_bounce and benchmark is not None:
+        bounce = _rs_bounce_setup(trigger, benchmark, rules, min_rvol)
+        if bounce is not None:
+            rs_edge, reclaim_level, stop_reference, rel_vol = bounce
+            setup = _finalize_setup(
+                setup_name="rs_bounce",
+                trigger=trigger,
+                bias=bias,
+                rules=rules,
+                strategy_name=strategy_name,
+                breakout_level=reclaim_level,
+                stop_reference=stop_reference,
+                rel_vol=rel_vol,
+                trigger_rsi=trigger_rsi,
+                trigger_emas=trigger_emas,
+                bias_emas=bias_emas,
+                compressed=compressed,
+                extra_metadata={"rs_edge": rs_edge},
+            )
+            if setup is not None:
+                return setup
+    return None
+
+
+def detect_price_setup(
+    trigger: list[Candle],
+    bias: list[Candle],
+    rules: EntryRulesConfig,
+    tier: TierConfig,
+    strategy_name: str,
+    benchmark: list[Candle] | None = None,
+) -> PriceSetup | None:
+    """Detect a long setup from fully deterministic OHLCV rules."""
+    needed = max(51, rules.breakout_lookback + rules.retest_window + 2)
+    if rules.setup_family == "bear_rally":
+        needed = max(
+            needed,
+            rules.rsi_periods + rules.rsi_lookback_bars + 2,
+            rules.failed_breakdown_lookback + rules.retest_window + 2,
+            rules.rs_lookback_bars + 2,
+        )
+    if len(trigger) < needed or len(bias) < 50:
+        return None
+
+    if rules.setup_family == "bear_rally":
+        return _detect_bear_rally_setup(
+            trigger, bias, rules, tier, strategy_name, benchmark=benchmark
+        )
+    return _detect_bull_breakout_setup(trigger, bias, rules, tier, strategy_name)
 
 
 class SignalEngine:
@@ -370,8 +646,16 @@ class SignalEngine:
 
         return GateResult(True, "social confirmed")
 
+    def _confirmation_cfg(self) -> ConfirmationConfig:
+        """Merge strategy-local confirmation overrides onto market defaults."""
+        base = self.market_cfg.confirmation
+        overrides = self.strategy.confirmation.model_dump(exclude_none=True)
+        if not overrides:
+            return base
+        return base.model_copy(update=overrides)
+
     def _trend_ok(self, snap: TechnicalSnapshot | None) -> GateResult:
-        conf = self.market_cfg.confirmation
+        conf = self._confirmation_cfg()
         if not conf.enabled:
             return GateResult(True, "trend gate not evaluated", evaluated=False)
         if snap is None:
@@ -392,7 +676,7 @@ class SignalEngine:
         return GateResult(True, "trend confirmed")
 
     def _direction_ok(self, snap: TechnicalSnapshot | None, tier: TierConfig) -> GateResult:
-        conf = self.market_cfg.confirmation
+        conf = self._confirmation_cfg()
         if not conf.enabled or not conf.require_positive_return:
             return GateResult(True, "direction gate not evaluated", evaluated=False)
         if snap is None:
@@ -427,6 +711,7 @@ class SignalEngine:
         )
 
     def _regime(self) -> tuple[bool, str]:
+        """Return (risk_on, detail). risk_on means BTC is above its trend SMA."""
         if self.market is None:
             return True, "regime not evaluated"
         return self.market.regime_ok()
@@ -451,6 +736,11 @@ class SignalEngine:
             )
         trigger = self.market.candles(product_id, rules.trigger_granularity_seconds)
         bias = self.market.candles(product_id, rules.bias_granularity_seconds)
+        benchmark: list[Candle] | None = None
+        if rules.setup_family == "bear_rally" and rules.allow_rs_bounce:
+            bench_product = self.market_cfg.regime.benchmark_product_id
+            if product_id != bench_product:
+                benchmark = self.market.candles(bench_product, rules.trigger_granularity_seconds)
         latest = trigger[-1] if trigger else None
         trigger_ts = latest.ts if latest is not None else fallback_ts
         features: dict[str, str | float | bool] = {
@@ -468,6 +758,13 @@ class SignalEngine:
                 }
             )
         needed = max(51, rules.breakout_lookback + rules.retest_window + 2)
+        if rules.setup_family == "bear_rally":
+            needed = max(
+                needed,
+                rules.rsi_periods + rules.rsi_lookback_bars + 2,
+                rules.failed_breakdown_lookback + rules.retest_window + 2,
+                rules.rs_lookback_bars + 2,
+            )
         if len(trigger) < needed or len(bias) < 50:
             return _PriceSetupResult(
                 None,
@@ -477,7 +774,14 @@ class SignalEngine:
                 trigger_close=latest.close if latest is not None else 0.0,
                 features=features,
             )
-        setup = detect_price_setup(trigger, bias, rules, tier, self.strategy.name)
+        setup = detect_price_setup(
+            trigger,
+            bias,
+            rules,
+            tier,
+            self.strategy.name,
+            benchmark=benchmark,
+        )
         if setup is not None:
             features.update(setup.metadata)
         return _PriceSetupResult(
@@ -492,13 +796,13 @@ class SignalEngine:
     # ---- Entry point --------------------------------------------------------
 
     def candidates(self, scores: list[ScoreResult]) -> list[TradeCandidate]:
-        regime_ok, regime_detail = self._regime()
-        if not regime_ok:
+        risk_on, regime_detail = self._regime()
+        if not self.strategy.regime_allows_entries(risk_on):
             log.info("[%s] regime gate: no new entries (%s)", self.strategy.name, regime_detail)
             return []
 
         out: list[TradeCandidate] = []
-        self._candidate_regime = (regime_ok, regime_detail)
+        self._candidate_regime = (risk_on, regime_detail)
         try:
             for s in scores:
                 cand = self._evaluate(s)
@@ -512,13 +816,13 @@ class SignalEngine:
 
     def _evaluate(self, s: ScoreResult) -> TradeCandidate | None:
         cached_regime = vars(self).get("_candidate_regime")
-        regime_ok, regime_detail = cached_regime if cached_regime is not None else self._regime()
-        return self._evaluate_with_audit(s, regime_ok, regime_detail).candidate
+        risk_on, regime_detail = cached_regime if cached_regime is not None else self._regime()
+        return self._evaluate_with_audit(s, risk_on, regime_detail).candidate
 
     def evaluations(self, scores: list[ScoreResult]) -> list[SignalEvaluation]:
         """Evaluate every scored symbol, including all non-candidate outcomes."""
-        regime_ok, regime_detail = self._regime()
-        rows = [self._evaluate_with_audit(score, regime_ok, regime_detail) for score in scores]
+        risk_on, regime_detail = self._regime()
+        rows = [self._evaluate_with_audit(score, risk_on, regime_detail) for score in scores]
         return rows
 
     def ranked_candidates(self, evaluations: list[SignalEvaluation]) -> list[TradeCandidate]:
@@ -532,10 +836,11 @@ class SignalEngine:
     def _evaluate_with_audit(
         self,
         s: ScoreResult,
-        regime_ok: bool,
+        risk_on: bool,
         regime_detail: str,
     ) -> SignalEvaluation:
         st = self.strategy
+        regime_allows = st.regime_allows_entries(risk_on)
         granularity = st.entry.trigger_granularity_seconds
         fallback_ts = int(time.time()) // granularity * granularity - granularity
         tier_name = self.universe.tier_of(s.ticker, self.signals.default_tier)
@@ -553,6 +858,8 @@ class SignalEngine:
             "directional_posts": s.directional_posts,
             "social_engagement": s.engagement_total,
             "social_baseline_kind": s.baseline_kind,
+            "regime_mode": st.regime_mode,
+            "risk_on": risk_on,
         }
 
         def result(
@@ -593,7 +900,7 @@ class SignalEngine:
                 trigger_closed_at=datetime.fromtimestamp(trigger_ts + granularity, tz=UTC),
                 outcome_status=outcome_status,
                 outcome_reason=outcome_reason,
-                regime_status="passed" if regime_ok else "blocked",
+                regime_status="passed" if regime_allows else "blocked",
                 regime_reason=regime_detail,
                 price_status=price_status,
                 price_reason=price_reason,
@@ -617,11 +924,28 @@ class SignalEngine:
                 price_reason="symbol is not tradeable",
             )
 
+        if st.allowed_tickers and s.ticker.upper() not in st.allowed_tickers:
+            return result(
+                price_result=None,
+                outcome_status="filtered",
+                outcome_reason=f"ticker {s.ticker} not in strategy allowlist",
+                price_status="filtered",
+                price_reason=f"allowed_tickers={st.allowed_tickers}",
+            )
+        if st.allowed_tiers and tier_name not in st.allowed_tiers:
+            return result(
+                price_result=None,
+                outcome_status="filtered",
+                outcome_reason=f"tier {tier_name} not in strategy allowlist",
+                price_status="filtered",
+                price_reason=f"allowed_tiers={st.allowed_tiers}",
+            )
+
         # Fetch the trigger identity even during a regime block so every symbol
         # gets exactly one prospective row for that closed candle.
         price_result = self._price_setup(product_id, tier)
         price_setup = price_result.setup
-        if not regime_ok:
+        if not regime_allows:
             return result(
                 price_result=price_result,
                 outcome_status="regime_blocked",

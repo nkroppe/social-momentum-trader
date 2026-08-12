@@ -261,12 +261,18 @@ _INHERITED_FIELDS = (
 class EntryRulesConfig(BaseModel):
     """Deterministic price-action rules for one holding methodology."""
 
+    # bull_breakout: EMA stack + RSI floor + breakout/retest/VWAP.
+    # bear_rally: RISK-OFF relief setups (RSI reclaim, failed breakdown, RS bounce).
+    setup_family: Literal["bull_breakout", "bear_rally"] = "bull_breakout"
     trigger_granularity_seconds: int = 900
     bias_granularity_seconds: int = 3_600
     breakout_lookback: int = 20
     structure_lookback: int = 20
     rsi_periods: int = 14
     rsi_min: float = 55.0
+    rsi_oversold_max: float = 35.0
+    rsi_reclaim_min: float = 45.0
+    rsi_lookback_bars: int = 8
     volume_lookback: int = 20
     compression_lookback: int = 20
     compression_recent: int = 5
@@ -278,6 +284,14 @@ class EntryRulesConfig(BaseModel):
     allow_vwap_pullback: bool = True
     require_trigger_ema_stack: bool = True
     require_bias_ema_stack: bool = True
+    allow_rsi_reclaim: bool = True
+    allow_failed_breakdown: bool = True
+    allow_rs_bounce: bool = True
+    failed_breakdown_lookback: int = 20
+    rs_lookback_bars: int = 16
+    rs_min_outperformance_pct: float = 0.01
+    max_chase_return_pct: float = 0.05
+    chase_lookback_bars: int = 4
     stop_atr_buffer: float = 0.25
     min_stop_pct: float = 0.005
     max_stop_pct: float = 0.15
@@ -287,11 +301,15 @@ class EntryRulesConfig(BaseModel):
         "breakout_lookback",
         "structure_lookback",
         "rsi_periods",
+        "rsi_lookback_bars",
         "volume_lookback",
         "compression_lookback",
         "compression_recent",
         "retest_window",
         "vwap_periods",
+        "failed_breakdown_lookback",
+        "rs_lookback_bars",
+        "chase_lookback_bars",
     )
     @classmethod
     def _positive_period(cls, v: int) -> int:
@@ -305,7 +323,19 @@ class EntryRulesConfig(BaseModel):
             raise ValueError("entry stop bounds must satisfy 0 < min <= max")
         if not 0 < self.max_entry_slippage_pct <= 0.05:
             raise ValueError("max_entry_slippage_pct must be within 0..5%")
+        if not 0 <= self.rsi_oversold_max <= self.rsi_reclaim_min <= 100:
+            raise ValueError("rsi_oversold_max must be <= rsi_reclaim_min within 0..100")
+        if self.max_chase_return_pct < 0 or self.rs_min_outperformance_pct < 0:
+            raise ValueError("chase/RS thresholds must be non-negative")
         return self
+
+
+class StrategyConfirmationConfig(BaseModel):
+    """Optional per-strategy overrides of market.yaml confirmation gates."""
+
+    require_above_sma: bool | None = None
+    require_positive_return: bool | None = None
+    min_volume_zscore: float | None = None
 
 
 class StrategyConfig(BaseModel):
@@ -318,6 +348,14 @@ class StrategyConfig(BaseModel):
     name: str
     enabled: bool = True
     allocation: float = 0.5  # fraction of total equity this strategy manages
+    # risk_on_only: enter only when BTC > SMA50 (default bull strategies).
+    # risk_off_only: enter only when BTC <= SMA50 (bear_rally).
+    # always: ignore the benchmark gate.
+    regime_mode: Literal["risk_on_only", "risk_off_only", "always"] = "risk_on_only"
+    # Empty lists mean no extra filter (full tradeable universe).
+    allowed_tickers: list[str] = Field(default_factory=list)
+    allowed_tiers: list[str] = Field(default_factory=list)
+    confirmation: StrategyConfirmationConfig = Field(default_factory=StrategyConfirmationConfig)
 
     # Exit params
     take_profit_pct: float
@@ -368,6 +406,16 @@ class StrategyConfig(BaseModel):
             raise ValueError(f"time_stop_hours must be in 1..{MAX_TIME_STOP_HOURS}")
         return v
 
+    @field_validator("allowed_tickers")
+    @classmethod
+    def _normalize_tickers(cls, values: list[str]) -> list[str]:
+        return [str(value).strip().upper() for value in values if str(value).strip()]
+
+    @field_validator("allowed_tiers")
+    @classmethod
+    def _normalize_tiers(cls, values: list[str]) -> list[str]:
+        return [str(value).strip().lower() for value in values if str(value).strip()]
+
     @model_validator(mode="after")
     def _valid_exit_times(self) -> StrategyConfig:
         if self.stale_time_stop_hours <= 0:
@@ -395,6 +443,14 @@ class StrategyConfig(BaseModel):
         if v not in ("atr", "fixed"):
             raise ValueError("exit_style must be 'atr' or 'fixed'")
         return v
+
+    def regime_allows_entries(self, risk_on: bool) -> bool:
+        """Whether the BTC SMA regime state permits new entries for this strategy."""
+        if self.regime_mode == "always":
+            return True
+        if self.regime_mode == "risk_off_only":
+            return not risk_on
+        return risk_on
 
 
 class StrategiesConfig(BaseModel):

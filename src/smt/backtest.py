@@ -314,6 +314,9 @@ class BacktestEngine:
         self, ticker: str, strategy: StrategyConfig, tier: str, as_of: int
     ) -> tuple[bool, str]:
         cfg = self.market.confirmation
+        overrides = strategy.confirmation.model_dump(exclude_none=True)
+        if overrides:
+            cfg = cfg.model_copy(update=overrides)
         if not cfg.enabled:
             return True, "disabled"
         rows = self._candles(ticker, self.market.candle_granularity_seconds, as_of)
@@ -369,15 +372,41 @@ class BacktestEngine:
             "notional": "",
         }
         self.opportunities.append(row)
-        regime_ok, reason = self._regime(as_of)
-        if not regime_ok:
+        risk_on, reason = self._regime(as_of)
+        if not strategy.regime_allows_entries(risk_on):
             row["status"] = "regime_blocked"
             row["reason"] = reason
             return None
         needed = max(51, strategy.entry.breakout_lookback + strategy.entry.retest_window + 2)
+        if strategy.entry.setup_family == "bear_rally":
+            needed = max(
+                needed,
+                strategy.entry.rsi_periods + strategy.entry.rsi_lookback_bars + 2,
+                strategy.entry.failed_breakdown_lookback + strategy.entry.retest_window + 2,
+                strategy.entry.rs_lookback_bars + 2,
+            )
         if len(trigger) < needed or len(bias) < 50:
             row["status"] = "insufficient_data"
             row["reason"] = f"trigger={len(trigger)} bias={len(bias)}"
+            return None
+        benchmark = None
+        if strategy.entry.setup_family == "bear_rally" and strategy.entry.allow_rs_bounce:
+            bench_product = self.market.regime.benchmark_product_id
+            bench_ticker = next(
+                (name for name, product in self.products.items() if product == bench_product),
+                None,
+            )
+            if bench_ticker is not None and bench_ticker != ticker:
+                benchmark = self._candles(
+                    bench_ticker, strategy.entry.trigger_granularity_seconds, as_of
+                )
+        if strategy.allowed_tickers and ticker.upper() not in strategy.allowed_tickers:
+            row["status"] = "filtered"
+            row["reason"] = f"ticker {ticker} not in strategy allowlist"
+            return None
+        if strategy.allowed_tiers and tier_name not in strategy.allowed_tiers:
+            row["status"] = "filtered"
+            row["reason"] = f"tier {tier_name} not in strategy allowlist"
             return None
         setup = detect_price_setup(
             trigger,
@@ -385,6 +414,7 @@ class BacktestEngine:
             strategy.entry,
             self.signals.tier(tier_name),
             strategy.name,
+            benchmark=benchmark,
         )
         if setup is None:
             row["reason"] = "no qualifying deterministic price setup"
