@@ -164,6 +164,59 @@ class MarketData:
             return False, f"latest candle is {age:.1f}s old (max {limit:.1f}s)"
         return True, "ok"
 
+    def fill_candle_gaps(
+        self,
+        candles: list[Candle],
+        granularity: int,
+        *,
+        max_fill_bars: int | None = None,
+    ) -> tuple[list[Candle], int]:
+        """Insert flat zero-volume bars for short Coinbase omissions.
+
+        Thin products often skip empty minutes instead of publishing a
+        zero-volume candle. PAPER bar walks need exact continuity, so we
+        synthesize missing slots from the prior close — but only up to
+        ``paper_bar_gap_fill_max_bars`` consecutive missing minutes. Larger
+        holes are left intact so ``validate_candles`` still fails closed.
+        """
+        limit = (
+            self.cfg.paper_bar_gap_fill_max_bars if max_fill_bars is None else max_fill_bars
+        )
+        if len(candles) < 2 or limit <= 0 or granularity <= 0:
+            return list(candles), 0
+
+        filled: list[Candle] = [candles[0]]
+        inserted = 0
+        for candle in candles[1:]:
+            previous = filled[-1]
+            delta = candle.ts - previous.ts
+            if delta == granularity:
+                filled.append(candle)
+                continue
+            if delta <= 0 or delta % granularity:
+                # Duplicate, out-of-order, or unaligned — leave for validation.
+                filled.append(candle)
+                continue
+            missing = delta // granularity - 1
+            if missing > limit:
+                filled.append(candle)
+                continue
+            price = previous.close
+            for step in range(1, missing + 1):
+                filled.append(
+                    Candle(
+                        ts=previous.ts + step * granularity,
+                        low=price,
+                        high=price,
+                        open=price,
+                        close=price,
+                        volume=0.0,
+                    )
+                )
+                inserted += 1
+            filled.append(candle)
+        return filled, inserted
+
     def _usable_cached_candles(self, cached: _Cached | None, granularity: int) -> list[Candle]:
         if cached is None:
             return []
@@ -240,6 +293,18 @@ class MarketData:
         parsed.sort(key=lambda c: c.ts)
         # Strategies act on candle closes, never a still-forming Coinbase bar.
         parsed = [candle for candle in parsed if candle.ts + gran <= time.time()]
+        if (
+            gran == self.cfg.paper_bar_granularity_seconds
+            and self.cfg.paper_bar_gap_fill_enabled
+        ):
+            parsed, inserted = self.fill_candle_gaps(parsed, gran)
+            if inserted:
+                log.info(
+                    "market: filled %s missing %ss candle(s) for %s",
+                    inserted,
+                    gran,
+                    product_id,
+                )
         valid, detail = self.validate_candles(parsed, gran)
         if not valid:
             log.warning("market: rejected %s candles for %s: %s", gran, product_id, detail)

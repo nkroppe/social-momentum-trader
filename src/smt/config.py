@@ -776,6 +776,10 @@ class MarketConfig(BaseModel):
     paper_bar_granularity_seconds: int = 60
     paper_bar_max_age_seconds: float = 300.0
     paper_bar_cache_ttl_seconds: float = 10.0
+    # Coinbase omits empty 1m slots on thin books. Fill short holes with flat
+    # zero-volume bars so PAPER can walk time; longer holes still fail closed.
+    paper_bar_gap_fill_enabled: bool = True
+    paper_bar_gap_fill_max_bars: int = 5
     paper_max_spread_bps: float = 40.0
     paper_min_top_level_notional_usd: float = 100.0
     paper_max_top_level_participation: float = 0.50
@@ -806,6 +810,8 @@ class MarketConfig(BaseModel):
             raise ValueError("price_cache_ttl_seconds cannot exceed paper_quote_max_age_seconds")
         if self.paper_bar_cache_ttl_seconds > self.paper_bar_max_age_seconds:
             raise ValueError("paper_bar_cache_ttl_seconds cannot exceed paper_bar_max_age_seconds")
+        if self.paper_bar_gap_fill_max_bars < 0:
+            raise ValueError("paper_bar_gap_fill_max_bars cannot be negative")
         if not 0 < self.paper_max_top_level_participation <= 0.50:
             raise ValueError("paper_max_top_level_participation must be within 0..0.50")
         if self.paper_max_spread_bps > 1_000 or self.paper_adverse_slippage_bps > 1_000:

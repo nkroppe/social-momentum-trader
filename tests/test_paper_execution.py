@@ -124,6 +124,65 @@ def test_candle_validation_rejects_stale_and_gapped_windows():
         stale_market.paper_bars("BTC-USD")
 
 
+def test_fill_candle_gaps_synthesizes_short_omissions():
+    market, _ = _market(paper_bar_gap_fill_max_bars=5)
+    base = int(time.time()) // 60 * 60 - 600
+    sparse = [
+        Candle(base, 99, 101, 100, 100.5, 5),
+        Candle(base + 180, 99, 101, 100.5, 101, 8),  # missing two minutes
+    ]
+
+    filled, inserted = market.fill_candle_gaps(sparse, 60)
+
+    assert inserted == 2
+    assert [c.ts for c in filled] == [base, base + 60, base + 120, base + 180]
+    assert filled[1].volume == 0.0
+    assert filled[1].close == pytest.approx(100.5)
+    assert filled[2].open == pytest.approx(100.5)
+    assert market.validate_candles(filled, 60, now=base + 240)[0] is True
+
+
+def test_fill_candle_gaps_leaves_long_holes_for_fail_closed():
+    market, _ = _market(paper_bar_gap_fill_max_bars=2)
+    base = int(time.time()) // 60 * 60 - 600
+    sparse = [
+        Candle(base, 99, 101, 100, 100, 5),
+        Candle(base + 300, 99, 101, 100, 100, 5),  # 4 missing minutes > max 2
+    ]
+
+    filled, inserted = market.fill_candle_gaps(sparse, 60)
+
+    assert inserted == 0
+    assert filled == sparse
+    assert market.validate_candles(filled, 60, now=base + 360)[0] is False
+
+
+def test_paper_bars_accept_coinbase_sparse_minutes_after_gap_fill():
+    minute = int(time.time()) // 60 * 60
+    # Contiguous walk with one omitted empty minute in the middle.
+    rows = [_bar_row(ts) for ts in range(minute - 300, minute - 60, 60)]
+    del rows[2]  # create a 120s hole
+    market, _ = _market(rows=rows, paper_bar_gap_fill_max_bars=5)
+
+    bars = market.paper_bars("HYPE-USD")
+
+    assert bars
+    assert market.validate_candles(bars, 60)[0] is True
+    assert any(bar.volume == 0.0 for bar in bars)
+
+
+def test_paper_bars_still_fail_when_gap_exceeds_fill_cap():
+    minute = int(time.time()) // 60 * 60
+    rows = [
+        _bar_row(minute - 480),
+        _bar_row(minute - 60),  # 6 missing minutes
+    ]
+    market, _ = _market(rows=rows, paper_bar_gap_fill_max_bars=3)
+
+    with pytest.raises(MarketDataUnavailable, match="paper bars unavailable"):
+        market.paper_bars("PUMP-USD")
+
+
 @pytest.mark.parametrize(
     ("book", "notional", "reason"),
     [
@@ -246,7 +305,7 @@ def test_legacy_paper_trade_initializes_cursor_without_replaying_old_bar(tmp_pat
 
 
 def test_paper_exit_uses_fresh_quote_when_bar_walk_is_unavailable(tmp_path):
-    market, client = _market()
+    market, client = _market(paper_bar_gap_fill_max_bars=1)
     broker = PaperBroker(market=market)
     store = make_store(tmp_path)
     strategy = make_strategy(advanced_exit_enabled=False, exit_style="fixed")
@@ -261,6 +320,7 @@ def test_paper_exit_uses_fresh_quote_when_bar_walk_is_unavailable(tmp_path):
     )
     candidate = TradeCandidate("BTC", "BTC-USD", 5.0, 20, 3, "x", strategy.name)
     trade = manager.open_position(candidate, 500.0, strategy)
+    # First + last only: gap exceeds fill cap so the 1m walk stays unavailable.
     client.candle_rows = [
         client.candle_rows[0],
         client.candle_rows[-1],

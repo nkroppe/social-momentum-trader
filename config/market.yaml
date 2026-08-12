@@ -18,6 +18,10 @@ paper_quote_max_age_seconds: 10
 paper_bar_granularity_seconds: 60
 paper_bar_max_age_seconds: 300       # public closed-candle endpoint can lag several minutes
 paper_bar_cache_ttl_seconds: 10
+# Thin Coinbase books omit empty minutes. Fill up to N missing 1m bars with
+# flat zero-volume candles; larger holes still fail closed.
+paper_bar_gap_fill_enabled: true
+paper_bar_gap_fill_max_bars: 5
 paper_max_spread_bps: 40
 paper_min_top_level_notional_usd: 100
 paper_max_top_level_participation: 0.50
