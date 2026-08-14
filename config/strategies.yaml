@@ -118,8 +118,10 @@ strategies:
     allowed_tickers: [BTC, ETH, SOL]
     confirmation:
       require_above_sma: false
-      require_positive_return: true
-      min_volume_zscore: 1.0
+      # failed_breakdown / RSI reclaim are reversals; a green 1h return
+      # fights the setup (gen-5 SOL died on 1h return -0.16% < 0.50%).
+      require_positive_return: false
+      min_volume_zscore: 0.0
     exit_style: atr
     atr_take_profit_mult: 1.5
     atr_stop_loss_mult: 1.0
@@ -144,7 +146,7 @@ strategies:
     scorer_bucket_minutes: 30
     scorer_lookback_buckets: 8
     confirm_lookback_hours: 1
-    confirm_min_return_pct: 0.005
+    confirm_min_return_pct: 0.0
     entry:
       setup_family: bear_rally
       trigger_granularity_seconds: 900

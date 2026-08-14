@@ -345,7 +345,7 @@ class BacktestEngine:
         if cfg.require_above_sma and latest.close <= average:
             return False, "below confirmation SMA"
         vol_z = volume_zscore(rows, cfg.volume_periods)
-        if vol_z < cfg.min_volume_zscore:
+        if cfg.min_volume_zscore > 0 and vol_z < cfg.min_volume_zscore:
             return False, "confirmation volume rejected"
         floor = max(
             strategy.confirm_min_return_pct,

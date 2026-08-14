@@ -78,7 +78,7 @@ def _market_data_checks() -> list[CheckResult]:
                     paper_unready.append((spec.tier, f"{ticker}:quote unavailable"))
                 elif quote.spread_bps > market_cfg.paper_max_spread_bps:
                     paper_unready.append((spec.tier, f"{ticker}:spread {quote.spread_bps:.1f}bps"))
-                elif quote.ask_notional < market_cfg.paper_min_top_level_notional_usd:
+                elif quote.ask_notional < market_cfg.min_top_level_notional_usd(spec.tier):
                     paper_unready.append(
                         (spec.tier, f"{ticker}:ask depth ${quote.ask_notional:.2f}")
                     )

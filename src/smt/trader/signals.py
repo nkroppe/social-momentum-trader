@@ -709,7 +709,7 @@ class SignalEngine:
                 False, f"price {snap.price:.6f} below SMA{conf.sma_periods} {snap.sma:.6f}"
             )
 
-        if snap.volume_z < conf.min_volume_zscore:
+        if conf.min_volume_zscore > 0 and snap.volume_z < conf.min_volume_zscore:
             return GateResult(False, f"volume z={snap.volume_z:.2f} < {conf.min_volume_zscore:.2f}")
 
         return GateResult(True, "trend confirmed")

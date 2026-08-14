@@ -6,7 +6,7 @@ import math
 import time
 from dataclasses import dataclass
 
-from ..config import MarketConfig
+from ..config import MarketConfig, UniverseConfig
 from ..market import TopOfBookQuote
 
 
@@ -33,11 +33,17 @@ class ExecutionEstimate:
 class ExecutionCostEstimator:
     """Model fee, spread, adverse slippage, and level-1 depth consistently."""
 
-    def __init__(self, fee_pct_per_side: float, market_cfg: MarketConfig):
+    def __init__(
+        self,
+        fee_pct_per_side: float,
+        market_cfg: MarketConfig,
+        universe: UniverseConfig | None = None,
+    ):
         if not 0 <= fee_pct_per_side < 1:
             raise ValueError("fee_pct_per_side must be within 0..<1")
         self.fee_pct_per_side = fee_pct_per_side
         self.market_cfg = market_cfg
+        self.universe = universe
 
     @property
     def adverse_slippage_fraction(self) -> float:
@@ -77,10 +83,13 @@ class ExecutionCostEstimator:
         participation = qty / size
         if not enforce:
             return participation
-        if level_notional < self.market_cfg.paper_min_top_level_notional_usd:
+        min_notional = self.market_cfg.min_top_level_notional_usd(
+            self.universe.tier_of_product(quote.product_id) if self.universe is not None else None
+        )
+        if level_notional < min_notional:
             raise ExecutionCostError(
                 f"{quote.product_id}: {side} depth ${level_notional:.2f} below "
-                f"${self.market_cfg.paper_min_top_level_notional_usd:.2f}"
+                f"${min_notional:.2f}"
             )
         if participation > self.market_cfg.paper_max_top_level_participation:
             raise ExecutionCostError(

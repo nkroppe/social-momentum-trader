@@ -504,6 +504,13 @@ class UniverseConfig(BaseModel):
         spec = self.symbols.get(ticker)
         return spec.tier if spec else default
 
+    def tier_of_product(self, product_id: str) -> str | None:
+        """Liquidity tier for a Coinbase product id, or None if unknown."""
+        for spec in self.symbols.values():
+            if spec.product_id == product_id:
+                return spec.tier
+        return None
+
 
 class RedditSource(BaseModel):
     enabled: bool = False
@@ -792,6 +799,14 @@ class MarketConfig(BaseModel):
     paper_bar_gap_fill_max_bars: int = 5
     paper_max_spread_bps: float = 40.0
     paper_min_top_level_notional_usd: float = 100.0
+    paper_min_top_level_notional_by_tier: dict[str, float] = Field(
+        default_factory=lambda: {
+            "major": 100.0,
+            "large": 100.0,
+            "mid": 40.0,
+            "micro": 25.0,
+        }
+    )
     paper_max_top_level_participation: float = 0.50
     paper_adverse_slippage_bps: float = 5.0
     candle_max_age_multiplier: float = 1.10
@@ -800,6 +815,14 @@ class MarketConfig(BaseModel):
     sizing: VolSizingConfig = Field(default_factory=VolSizingConfig)
     price_action_enabled: bool = True
     price_action_fail_closed: bool = True
+
+    def min_top_level_notional_usd(self, tier: str | None = None) -> float:
+        """Visible top-of-book notional required to model a PAPER fill."""
+        if tier:
+            floor = self.paper_min_top_level_notional_by_tier.get(tier.lower())
+            if floor is not None:
+                return floor
+        return self.paper_min_top_level_notional_usd
 
     @model_validator(mode="after")
     def _valid_market_freshness(self) -> MarketConfig:
@@ -816,6 +839,12 @@ class MarketConfig(BaseModel):
         }
         if any(value <= 0 for value in positive.values()):
             raise ValueError("paper freshness, liquidity, and slippage settings must be positive")
+        allowed_tiers = {"major", "large", "mid", "micro"}
+        for tier, floor in self.paper_min_top_level_notional_by_tier.items():
+            if tier.lower() not in allowed_tiers:
+                raise ValueError(f"unknown paper depth tier {tier!r}")
+            if floor <= 0:
+                raise ValueError("tiered paper min top-level notional must be positive")
         if self.price_cache_ttl_seconds > self.paper_quote_max_age_seconds:
             raise ValueError("price_cache_ttl_seconds cannot exceed paper_quote_max_age_seconds")
         if self.paper_bar_cache_ttl_seconds > self.paper_bar_max_age_seconds:

@@ -409,7 +409,11 @@ class DashboardService:
         if protective_floor <= 0 or trade.qty <= 0:
             return 0.0
         risk_reference = min(protective_floor, mark)
-        costs = ExecutionCostEstimator(self.risk_cfg.assumed_fee_pct_per_side, self.market_cfg)
+        costs = ExecutionCostEstimator(
+            self.risk_cfg.assumed_fee_pct_per_side,
+            self.market_cfg,
+            universe=self.universe,
+        )
         quote = self._quote_for_heat(trade.product_id, mark)
         try:
             sell = costs.estimate_sell(

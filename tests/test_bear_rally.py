@@ -12,7 +12,7 @@ from smt.config import (
     get_signals,
     get_strategies,
 )
-from smt.market import Candle
+from smt.market import Candle, TechnicalSnapshot
 from smt.scorer import ScoreResult
 from smt.trader.signals import SignalEngine, detect_price_setup
 
@@ -76,8 +76,45 @@ def test_strategies_yaml_loads_bear_rally():
     assert bear.allowed_tickers == ["BTC", "ETH", "SOL"]
     assert bear.entry.setup_family == "bear_rally"
     assert bear.confirmation.require_above_sma is False
+    assert bear.confirmation.require_positive_return is False
+    assert bear.confirmation.min_volume_zscore == 0.0
+    assert bear.confirm_min_return_pct == 0.0
     total = sum(s.allocation for s in enabled.values())
     assert total <= 1.0 + 1e-9
+
+
+def test_bear_rally_confirmation_allows_negative_1h_return():
+    """Reversal setups must not require a green trailing return."""
+    strategy = make_strategy(
+        "bear_rally",
+        confirmation=StrategyConfirmationConfig(
+            require_above_sma=False,
+            require_positive_return=False,
+            min_volume_zscore=0.0,
+        ),
+        confirm_min_return_pct=0.0,
+        entry=_bear_entry(),
+    )
+    engine = SignalEngine(
+        strategy,
+        make_universe(),
+        get_signals(),
+        None,
+        get_market(),
+    )
+    snap = TechnicalSnapshot(
+        "BTC-USD",
+        True,
+        price=90.0,
+        sma=100.0,
+        trailing_return=-0.0016,
+        volume_z=-0.21,
+    )
+    major = get_signals().tier("major")
+    direction = engine._direction_ok(snap, major)  # noqa: SLF001 - gate unit test
+    trend = engine._trend_ok(snap)  # noqa: SLF001 - gate unit test
+    assert direction.passed
+    assert trend.passed
 
 
 def test_regime_mode_matrix():

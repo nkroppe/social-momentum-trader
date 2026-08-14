@@ -283,6 +283,37 @@ def test_production_price_setup_also_requires_confirmation_snapshot(snapshot):
     assert engine.candidates([_score("BTC")]) == []
 
 
+def test_zero_volume_z_floor_does_not_block_below_average_volume():
+    universe = UniverseConfig(symbols={"BTC": {"product_id": "BTC-USD", "tier": "major"}})
+    signals = SignalsConfig(
+        tiers={
+            "major": TierConfig(
+                social_policy="ignored",
+                min_relative_volume=1.5,
+                retest_policy="preferred",
+            )
+        }
+    )
+    market_cfg = MarketConfig()
+    assert market_cfg.confirmation.min_volume_zscore == 0.0
+    snap = TechnicalSnapshot(
+        "BTC-USD",
+        True,
+        price=120,
+        sma=100,
+        trailing_return=0.03,
+        volume_z=-0.21,
+    )
+    engine = SignalEngine(
+        make_strategy(),
+        universe,
+        signals,
+        _SetupMarket(snap),  # type: ignore[arg-type]
+        market_cfg,
+    )
+    assert engine._trend_ok(snap).passed  # noqa: SLF001 - gate unit test
+
+
 def test_price_action_fail_closed_controls_missing_setup_data():
     universe = UniverseConfig(symbols={"BTC": {"product_id": "BTC-USD", "tier": "major"}})
     signals = SignalsConfig(tiers={"major": TierConfig(social_policy="ignored")})

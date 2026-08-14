@@ -424,7 +424,11 @@ class TradeManager:
             )
         remaining_entry_fee = trade.entry_fee_paid * (trade.qty / original_qty)
         entry_fee_per_unit = remaining_entry_fee / trade.qty
-        costs = ExecutionCostEstimator(strategy.assumed_fee_pct_per_side, self.market_cfg)
+        costs = ExecutionCostEstimator(
+            strategy.assumed_fee_pct_per_side,
+            self.market_cfg,
+            universe=self.universe,
+        )
         breakeven_floor = costs.cost_adjusted_breakeven(
             trade.entry_price,
             entry_fee_per_unit,

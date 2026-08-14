@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 import uuid
 
-from ..config import MarketConfig, get_market, get_risk
+from ..config import MarketConfig, UniverseConfig, get_market, get_risk, get_universe
 from ..logging_setup import get_logger
 from ..market import Candle, MarketData, MarketDataUnavailable, TopOfBookQuote
 from .broker import Fill
@@ -48,6 +48,7 @@ class PaperBroker:
         *,
         offline_simulation: bool = False,
         market_cfg: MarketConfig | None = None,
+        universe: UniverseConfig | None = None,
     ):
         self._rng = random.Random(seed)
         self._prices: dict[str, float] = dict(_BASE_PRICES)
@@ -59,7 +60,11 @@ class PaperBroker:
             raise ValueError("deployed PAPER requires MarketData; use offline_simulation=True")
         self._cfg = market_cfg or (market.cfg if market is not None else get_market())
         self._fee_pct = get_risk().assumed_fee_pct_per_side
-        self._costs = ExecutionCostEstimator(self._fee_pct, self._cfg)
+        self._costs = ExecutionCostEstimator(
+            self._fee_pct,
+            self._cfg,
+            universe=universe if universe is not None else get_universe(),
+        )
         self._last_closed_bar: dict[str, int] = {}
 
     def _fresh_quote(self, product_id: str) -> TopOfBookQuote:

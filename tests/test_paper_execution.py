@@ -11,7 +11,7 @@ import pytest
 from _helpers import make_store, make_strategy, make_universe
 from sqlalchemy import inspect
 
-from smt.config import MarketConfig, Settings, get_risk
+from smt.config import MarketConfig, Settings, UniverseConfig, get_risk
 from smt.market import Candle, MarketData, MarketDataUnavailable, TopOfBookQuote
 from smt.models import ExitReason
 from smt.trader.manager import TradeManager
@@ -199,6 +199,33 @@ def test_paper_entry_rejects_unexecutable_top_of_book(book, notional, reason):
 
     with pytest.raises(PaperOrderRejected, match=reason):
         broker.open_long("BTC-USD", notional, 110.0, 90.0)
+
+
+def test_paper_min_top_level_notional_is_tiered():
+    cfg = MarketConfig()
+    assert cfg.min_top_level_notional_usd("major") == pytest.approx(100.0)
+    assert cfg.min_top_level_notional_usd("large") == pytest.approx(100.0)
+    assert cfg.min_top_level_notional_usd("mid") == pytest.approx(40.0)
+    assert cfg.min_top_level_notional_usd("micro") == pytest.approx(25.0)
+    assert cfg.min_top_level_notional_usd(None) == pytest.approx(100.0)
+
+
+def test_paper_entry_allows_micro_depth_that_fails_major_floor():
+    universe = UniverseConfig(
+        symbols={
+            "BTC": {"product_id": "BTC-USD", "tier": "major"},
+            "PUMP": {"product_id": "PUMP-USD", "tier": "micro"},
+        }
+    )
+    # $50 visible ask — below the $100 major floor, above the $25 micro floor.
+    market, _ = _market(book=_book(bid=99.99, ask=100.0, size=0.5))
+    major = PaperBroker(market=market, universe=universe)
+    micro = PaperBroker(market=market, universe=universe)
+
+    with pytest.raises(PaperOrderRejected, match="ask depth"):
+        major.open_long("BTC-USD", 20.0, 110.0, 90.0)
+    fill = micro.open_long("PUMP-USD", 20.0, 110.0, 90.0)
+    assert fill.qty > 0
 
 
 def test_paper_fills_buy_ask_and_sell_bid_with_adverse_slippage():

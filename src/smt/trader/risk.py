@@ -79,6 +79,9 @@ class RiskGate:
         self.risk = risk if risk is not None else get_risk()
         self.universe = universe
 
+    def _costs(self, fee_pct_per_side: float) -> ExecutionCostEstimator:
+        return ExecutionCostEstimator(fee_pct_per_side, self.market_cfg, universe=self.universe)
+
     def size_position(
         self, candidate: TradeCandidate, strategy: StrategyConfig, equity_alloc: float
     ) -> tuple[float, str]:
@@ -171,7 +174,7 @@ class RiskGate:
         notional_usd: float,
         quote: TopOfBookQuote,
     ) -> tuple[RiskDecision | None, ExecutionEstimate | None]:
-        costs = ExecutionCostEstimator(strategy.assumed_fee_pct_per_side, self.market_cfg)
+        costs = self._costs(strategy.assumed_fee_pct_per_side)
         try:
             buy = costs.estimate_buy(quote, notional_usd)
         except ExecutionCostError as exc:
@@ -243,7 +246,7 @@ class RiskGate:
         marks: dict[str, float],
     ) -> PortfolioProjection:
         equity = self._portfolio_equity_value(strategy, equity_alloc)
-        costs = ExecutionCostEstimator(self.risk.assumed_fee_pct_per_side, self.market_cfg)
+        costs = self._costs(self.risk.assumed_fee_pct_per_side)
         existing_heat = 0.0
         gross = 0.0
         symbol = 0.0
