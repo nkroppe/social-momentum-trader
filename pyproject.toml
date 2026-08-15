@@ -49,9 +49,6 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/smt"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"src/smt/dashboard/static" = "smt/dashboard/static"
-
 [tool.ruff]
 line-length = 100
 target-version = "py312"
