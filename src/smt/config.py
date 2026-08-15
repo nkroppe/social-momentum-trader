@@ -289,6 +289,9 @@ class EntryRulesConfig(BaseModel):
     allow_vwap_pullback: bool = True
     require_trigger_ema_stack: bool = True
     require_bias_ema_stack: bool = True
+    # When the full 9>21>50 bias stack is off, still refuse a clearly bearish
+    # 9<21<50 stack so swing can fire in a grind without longing into 4h dump.
+    reject_bearish_bias_stack: bool = False
     allow_rsi_reclaim: bool = True
     allow_failed_breakdown: bool = True
     allow_rs_bounce: bool = True

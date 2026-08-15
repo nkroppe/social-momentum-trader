@@ -60,6 +60,23 @@ def _candles(count: int = 70, *, step: float = 0.2, volume: float = 100.0) -> li
     return rows
 
 
+def _down_candles(count: int = 70, *, step: float = 0.2, volume: float = 100.0) -> list[Candle]:
+    rows: list[Candle] = []
+    for i in range(count):
+        close = 100.0 + (count - 1 - i) * step
+        rows.append(
+            Candle(
+                ts=i * 900,
+                open=close + 0.05,
+                high=close + 0.10,
+                low=close - 0.10,
+                close=close,
+                volume=volume,
+            )
+        )
+    return rows
+
+
 def _direct_breakout() -> list[Candle]:
     rows = _candles()
     prior_high = max(c.high for c in rows[-21:-1])
@@ -151,6 +168,22 @@ def test_direct_breakout_and_required_retest_are_separate_setups():
     assert retest.metadata["relative_volume"] == pytest.approx(3.0)
 
 
+def test_swing_bias_rejects_bearish_stack_without_requiring_bullish_stack():
+    rules = EntryRulesConfig(
+        require_compression=False,
+        allow_vwap_pullback=False,
+        require_bias_ema_stack=False,
+        reject_bearish_bias_stack=True,
+        rsi_min=50,
+    )
+    preferred = TierConfig(
+        social_policy="ignored", min_relative_volume=1.5, retest_policy="preferred"
+    )
+    trigger = _direct_breakout()
+    assert detect_price_setup(trigger, _candles(), rules, preferred, "swing") is not None
+    assert detect_price_setup(trigger, _down_candles(), rules, preferred, "swing") is None
+
+
 def test_intraday_and_swing_rules_are_structurally_distinct():
     strategies = {strategy.name: strategy for strategy in get_strategies().enabled()}
     assert strategies["intraday"].entry.trigger_granularity_seconds == 900
@@ -159,9 +192,13 @@ def test_intraday_and_swing_rules_are_structurally_distinct():
     assert not strategies["intraday"].entry.require_compression
     assert strategies["swing"].entry.trigger_granularity_seconds == 3_600
     assert strategies["swing"].entry.bias_granularity_seconds == 14_400
-    # Ledger-backed: compression is no longer a hard swing gate.
+    # Ledger-backed: compression is no longer a hard gate. Gen-5 grind: RSI 50
+    # and refuse a bearish 4h stack instead of requiring a full bullish stack.
     assert not strategies["swing"].entry.require_compression
     assert not strategies["swing"].entry.allow_vwap_pullback
+    assert strategies["swing"].entry.rsi_min == 50
+    assert not strategies["swing"].entry.require_bias_ema_stack
+    assert strategies["swing"].entry.reject_bearish_bias_stack
     assert strategies["bear_rally"].regime_mode == "risk_off_only"
     assert strategies["bear_rally"].entry.setup_family == "bear_rally"
 

@@ -147,6 +147,50 @@ def test_count_trigger_persists_observation_then_samples_posts(tmp_path, monkeyp
     assert collector.budget.reads_used == 1
 
 
+def test_setup_sample_persists_posts_and_respects_cooldown(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    store = make_store(tmp_path)
+    cfg = XSource(enabled=True, keywords=["$SOL"], sample_size=25, count_window_minutes=30)
+    collector = XCollector(Settings(x_bearer_token="token"), cfg, make_universe(), store=store)
+    search_payload = {
+        "data": [
+            {
+                "id": "999",
+                "text": "$SOL has a strong breakout with real momentum",
+                "created_at": "2026-08-14T20:00:00Z",
+                "author_id": "42",
+                "lang": "en",
+                "public_metrics": {"like_count": 4},
+            }
+        ],
+        "includes": {
+            "users": [
+                {
+                    "id": "42",
+                    "username": "analyst",
+                    "verified": True,
+                    "created_at": "2020-01-01T00:00:00Z",
+                    "public_metrics": {
+                        "followers_count": 5000,
+                        "following_count": 100,
+                        "tweet_count": 900,
+                    },
+                }
+            ]
+        },
+    }
+    with patch("httpx.Client.get", return_value=_response(search_payload)) as get:
+        events = collector.sample_for_ticker("SOL")
+        again = collector.sample_for_ticker("SOL")
+    assert len(events) == 1
+    assert events[0].ticker == "SOL"
+    assert again == []
+    assert get.call_count == 1
+    inserted = store.add_events(events)
+    assert inserted == 1
+    assert store.recent_social_events("SOL", 1)[0].external_id == "999"
+
+
 def test_duplicate_aligned_count_window_reuses_without_spend_or_sample(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     store = make_store(tmp_path)

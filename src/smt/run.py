@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .config import (
@@ -192,6 +192,7 @@ class Runner:
         self._digest_interval_s = self.ops.soak.digest_interval_hours * 3600
         self._killed_notified = False
         self._halt_notified: set[str] = set()
+        self._setup_sample_cooldown_s = max(self.sources.x.count_window_minutes, 1) * 60
 
         if self.broker.name == "paper" and not self.offline:
             self.soak.ensure_started(
@@ -273,6 +274,36 @@ class Runner:
             log.info("ingested %d new events", total)
         return total
 
+    def _ensure_social_sample(self, ticker: str) -> None:
+        """Persist a post sample when a candidate has no recent social_events."""
+        recent = self.store.recent_social_events(ticker, limit=1)
+        if recent:
+            created = recent[0].created_at
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=UTC)
+            age = (utcnow() - created).total_seconds()
+            if age < self._setup_sample_cooldown_s:
+                return
+        for collector in getattr(self, "collectors", ()) or ():
+            sample = getattr(collector, "sample_for_ticker", None)
+            if sample is None:
+                continue
+            try:
+                events = sample(ticker)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("setup sample %s failed: %s", ticker, exc)
+                continue
+            if not events:
+                continue
+            inserted = self.store.add_events(events)
+            log.info(
+                "setup-triggered sample %s: %d events (%d new)",
+                ticker,
+                len(events),
+                inserted,
+            )
+            return
+
     def evaluate_and_trade(self) -> None:
         """Evaluate each strategy independently against its own allocation."""
         for st in self.strategies:
@@ -312,6 +343,7 @@ class Runner:
 
             equity_alloc = self.manager.allocation_equity(st)
             for cand in candidates:
+                self._ensure_social_sample(cand.ticker)
                 self._audit_candidate(cand, risk_status="not_evaluated")
                 llm_passed = self.llm.review_candidate(cand)
                 if cand.opportunity_key:

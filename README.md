@@ -28,12 +28,14 @@ X recent counts (30m) -> anomaly-triggered 25-post samples -> quality metadata
 
 Every production entry starts with price. Intraday uses a 15-minute trigger and
 1-hour bias; swing uses a 1-hour trigger and a deterministically aggregated
-4-hour bias. Both require EMA 9/21/50 alignment, RSI(14) >= 55, N-bar structure,
-and tier-relative volume. The completed setup must then pass the configured
-SMA, trailing-return, and volume-z confirmation gates. Setups are
-breakout-and-close or breakout-retest; majors and SOL may also use a
-rolling-VWAP reclaim intraday. Swing rules are separate: compression is
-required and VWAP pullbacks are disabled.
+4-hour bias. Both require trigger EMA 9/21/50 alignment, N-bar structure, and
+tier-relative volume. Intraday also requires RSI(14) >= 55 and a bullish 1h
+EMA stack. Swing uses RSI(14) >= 50 and only rejects a bearish 4h stack (it
+does not require a full 9>21>50 bias in a grind). The completed setup must
+then pass the configured SMA, trailing-return, and volume-z confirmation
+gates. Setups are breakout-and-close or breakout-retest; majors and SOL may
+also use a rolling-VWAP reclaim intraday. Swing disables VWAP pullbacks;
+compression is a ranking preference, not a hard gate.
 
 The tier playbook is evaluated only after the price setup. With
 `social_decision_mode: shadow` (the shipped default), these are counterfactual

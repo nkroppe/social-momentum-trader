@@ -90,7 +90,9 @@ strategies:
       breakout_lookback: 20
       structure_lookback: 20
       rsi_periods: 14
-      rsi_min: 55
+      # Gen-5: 0/336 swing setups in 31 RISK-ON hours. RSI 55 + full 4h stack
+      # never fired in a two-day grind; 50 still requires constructive momentum.
+      rsi_min: 50
       volume_lookback: 20
       compression_lookback: 20
       compression_recent: 5
@@ -103,7 +105,8 @@ strategies:
       vwap_periods: 32
       allow_vwap_pullback: false
       require_trigger_ema_stack: true
-      require_bias_ema_stack: true
+      require_bias_ema_stack: false
+      reject_bearish_bias_stack: true
       stop_atr_buffer: 0.50
       min_stop_pct: 0.01
       max_stop_pct: 0.15

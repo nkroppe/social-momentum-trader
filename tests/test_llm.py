@@ -97,7 +97,7 @@ def test_judge_is_sparse_non_blocking_and_cached(tmp_path):
     judge.close()
 
 
-def test_new_social_context_invalidates_cached_approval(tmp_path):
+def test_same_setup_reuses_cache_when_posts_change(tmp_path):
     cfg = _cfg(tmp_path)
     provider = FakeProvider(
         {
@@ -123,13 +123,14 @@ def test_new_social_context_invalidates_cached_approval(tmp_path):
             {"text": "credible exploit report", "created_at": "2026-08-09T01:10:00Z"}
         ],
     }
-    assert judge.evaluate(changed).pending
-    assert _wait_for_judge(judge, changed).approved
-    assert provider.calls == 2
+    reused = judge.evaluate(changed)
+    assert not reused.pending
+    assert reused.approved
+    assert provider.calls == 1
     judge.close()
 
 
-def test_new_social_context_does_not_queue_behind_stale_jobs_unbounded(tmp_path):
+def test_same_setup_does_not_queue_second_call_while_pending(tmp_path):
     started = threading.Event()
     release = threading.Event()
 
@@ -151,69 +152,60 @@ def test_new_social_context_does_not_queue_behind_stale_jobs_unbounded(tmp_path)
     )
     judge = SparseL3Judge(_cfg(tmp_path), provider=provider)
     first = {
-        "ticker": "CAP",
-        "strategy": "swing",
-        "tier": "micro",
-        "setup_id": "CAP:swing:123",
+        "ticker": "HYPE",
+        "strategy": "intraday",
+        "tier": "mid",
+        "setup_id": "HYPE:intraday:123",
         "recent_social_posts": [{"text": "first"}],
     }
     changed = {**first, "recent_social_posts": [{"text": "new adverse context"}]}
     assert judge.evaluate(first).pending
     assert started.wait(1)
-    assert judge.evaluate(changed).pending
-    # At most one running stale call plus the newest queued context.
-    assert len(judge._pending) == 2
+    second = judge.evaluate(changed)
+    assert second.pending
+    assert len(judge._pending) == 1
     assert provider.calls == 1
     release.set()
     assert _wait_for_judge(judge, changed).approved
-    assert provider.calls == 2
+    assert provider.calls == 1
     judge.close()
 
 
-def test_poll_harvests_latest_context_and_suppresses_stale_result(tmp_path):
+def test_new_trigger_candle_queues_a_fresh_review(tmp_path):
     started = threading.Event()
     release = threading.Event()
 
-    class ContextProvider(FakeProvider):
-        def complete_json(self, _instruction, payload):
+    class BlockingProvider(FakeProvider):
+        def complete_json(self, instruction, payload):
             self.calls += 1
-            text = payload["recent_social_posts"][0]["text"]
-            if text == "old":
-                started.set()
-                release.wait(2)
-            return {
-                "veto": text == "new",
-                "catalyst_score": 0.1 if text == "new" else 0.9,
-                "confidence": 0.9,
-                "narrative": text,
-                "reason": text,
-            }
+            started.set()
+            release.wait(2)
+            return self.response
 
-    provider = ContextProvider({})
+    provider = BlockingProvider(
+        {
+            "veto": False,
+            "catalyst_score": 0.8,
+            "confidence": 0.8,
+            "narrative": "valid",
+            "reason": "valid",
+        }
+    )
     judge = SparseL3Judge(_cfg(tmp_path), provider=provider)
     first = {
-        "ticker": "CAP",
-        "strategy": "swing",
-        "tier": "micro",
-        "setup_id": "CAP:swing:123",
-        "recent_social_posts": [{"text": "old"}],
+        "ticker": "HYPE",
+        "strategy": "intraday",
+        "tier": "mid",
+        "setup_id": "HYPE:intraday:100",
+        "recent_social_posts": [{"text": "first"}],
     }
-    changed = {**first, "recent_social_posts": [{"text": "new"}]}
-    old_pending = judge.evaluate(first)
-    assert old_pending.pending and started.wait(1)
-    new_pending = judge.evaluate(changed)
-    assert new_pending.pending
+    nxt = {**first, "setup_id": "HYPE:intraday:200"}
+    assert judge.evaluate(first).pending
+    assert started.wait(1)
+    assert judge.evaluate(nxt).pending
+    assert len(judge._pending) == 2
     release.set()
-
-    completed = []
-    for _ in range(100):
-        completed.extend(judge.poll_completed())
-        if completed:
-            break
-        time.sleep(0.01)
-    assert [decision.key for decision in completed] == [new_pending.key]
-    assert completed[0].veto is True
-    assert completed[0].narrative == "new"
+    assert _wait_for_judge(judge, nxt).approved
     judge.close()
 
 

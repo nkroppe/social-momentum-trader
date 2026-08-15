@@ -184,6 +184,10 @@ def _ema_stack(candles: list[Candle]) -> tuple[bool, tuple[float, float, float]]
     return all(values) and values[0] > values[1] > values[2], values
 
 
+def _bearish_ema_stack(values: tuple[float, float, float]) -> bool:
+    return all(values) and values[0] < values[1] < values[2]
+
+
 def _retest_setup(
     candles: list[Candle], rules: EntryRulesConfig, min_relative_volume: float
 ) -> tuple[float, float, float, int] | None:
@@ -290,6 +294,8 @@ def _detect_bull_breakout_setup(
     if rules.require_trigger_ema_stack and not trigger_stack:
         return None
     if rules.require_bias_ema_stack and not bias_stack:
+        return None
+    if rules.reject_bearish_bias_stack and _bearish_ema_stack(bias_emas):
         return None
 
     trigger_rsi = rsi(trigger, rules.rsi_periods)
