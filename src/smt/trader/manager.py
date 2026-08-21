@@ -251,7 +251,8 @@ class TradeManager:
         self.strategies[strategy.name] = strategy
         trade = self.store.add_trade(trade)
         log.info(
-            "OPENED[%s] %s qty=%.8f entry=%.6f tp=%.6f sl=%.6f notional=$%.2f (%s)",
+            "OPENED[%s] %s qty=%.8f entry=%.6f tp=%.6f sl=%.6f "
+            "notional=$%.2f profile=%s policy=%s (%s)",
             strategy.name,
             trade.ticker,
             trade.qty,
@@ -259,6 +260,8 @@ class TradeManager:
             tp,
             sl,
             notional_usd,
+            trade.exit_profile_label,
+            trade.config_fingerprint[:12],
             exit_note,
         )
         if self.trade_alerts.on_open:

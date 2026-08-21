@@ -24,6 +24,18 @@ def test_soak_tracker_starts_and_measures_days(tmp_path):
     assert "READY" in tracker.summary_line(14)
 
 
+def test_soak_tracker_resets_when_policy_fingerprint_changes(tmp_path):
+    tracker = SoakTracker(tmp_path / "soak.json")
+    first = tracker.ensure_started("paper", "a" * 64)
+    unchanged = tracker.ensure_started("paper", "a" * 64)
+    assert unchanged.started_at == first.started_at
+
+    changed = tracker.ensure_started("paper", "b" * 64)
+    assert changed.config_fingerprint == "b" * 64
+    assert changed.started_at >= first.started_at
+    assert "policy: bbbbbbbbbbbb" in tracker.summary_line(14)
+
+
 def test_preflight_dev_passes():
     results = run_preflight("dev")
     assert all_passed(results)

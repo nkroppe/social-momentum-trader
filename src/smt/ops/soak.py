@@ -113,4 +113,8 @@ class SoakTracker:
             if self.meets_minimum(min_days)
             else f"need {min_days - int(days)} more day(s)"
         )
-        return f"Soak started: {started} | elapsed: {days:.1f}d / {min_days}d min | {ready}"
+        policy = state.config_fingerprint[:12] if state and state.config_fingerprint else "legacy"
+        return (
+            f"Soak started: {started} | elapsed: {days:.1f}d / {min_days}d min | "
+            f"{ready} | policy: {policy}"
+        )

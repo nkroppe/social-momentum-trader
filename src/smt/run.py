@@ -160,7 +160,10 @@ class Runner:
             self.soak.ensure_started("paper", self.policy_identity.fingerprint)
 
         mode = "LIVE" if self.broker.name == "coinbase" else "PAPER"
-        names = ", ".join(f"{st.name}({st.allocation:.0%})" for st in self.strategies)
+        names = ", ".join(
+            f"{st.name}({st.allocation:.0%}, exit={st.exit.label})"
+            for st in self.strategies
+        )
         log.info(
             "Config dir=%s | reddit=%s x=%s mock=%s",
             CONFIG_DIR,

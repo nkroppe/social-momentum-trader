@@ -80,18 +80,23 @@ def _cmd_status(_args: argparse.Namespace) -> int:
 
     r = Runner()
     print(f"Mode  : {'LIVE' if r.settings.live else 'PAPER'}")
+    print(f"Policy: {r.policy_identity.fingerprint[:12]}")
     print(f"Total equity : ${r.manager.equity():.2f}")
     for st in r.strategies:
         open_trades = r.store.open_trades(st.name)
         alloc_eq = r.manager.allocation_equity(st)
         print(
             f"\n[{st.name}] allocation={st.allocation:.0%} "
-            f"alloc_equity=${alloc_eq:.2f} open={len(open_trades)}"
+            f"alloc_equity=${alloc_eq:.2f} open={len(open_trades)} "
+            f"exit={st.exit.label}"
         )
         for t in open_trades:
             print(
                 f"  - {t.ticker:<6} qty={t.qty:.6f} entry={t.entry_price:.6f} "
-                f"tp={t.take_profit:.6f} sl={t.stop_loss:.6f}"
+                f"tp={t.take_profit:.6f} sl={t.stop_loss:.6f} "
+                f"mfe={t.mfe_r:.2f}R held={t.hold_hours:.1f}h "
+                f"profile={t.exit_profile_label or 'legacy'} "
+                f"policy={(t.config_fingerprint or 'legacy')[:12]}"
             )
     return 0
 

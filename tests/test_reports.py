@@ -110,6 +110,11 @@ def _closed_trade(store, ticker, pnl, *, strategy="intraday", closed_at, notiona
         entry_notional=notional,
         take_profit=110.0,
         stop_loss=95.0,
+        highest_price=110.0,
+        initial_risk_per_unit=5.0,
+        exit_profile_label="intraday_trend_v2",
+        config_fingerprint="a" * 64,
+        exit_snapshot='{"label":"intraday_trend_v2"}',
         time_stop_at=closed_at,
         exit_price=100.0 + pnl,
         exit_reason=ExitReason.TAKE_PROFIT if pnl >= 0 else ExitReason.STOP_LOSS,
@@ -186,6 +191,8 @@ def test_sell_alert_reports_profit_and_loss(tmp_path):
     subject, body = trade_closed_alert(win)
     assert "PROFIT" in subject and "+15.40" in subject
     assert "P/L: $+15.40 (+6.16%)" in body
+    assert "MFE: 2.00R" in body
+    assert "Exit profile: intraday_trend_v2" in body
 
     loss = _closed_trade(store, "BTC", -8.10, closed_at=end)
     subject, _ = trade_closed_alert(loss)
@@ -199,6 +206,8 @@ def test_buy_alert_carries_the_exit_levels(tmp_path):
     assert subject.startswith("BUY SOL")
     assert "Take-profit" in body and "Stop-loss" in body
     assert "PAPER" in body
+    assert "Exit profile: intraday_trend_v2" in body
+    assert "Policy: aaaaaaaaaaaa" in body
 
 
 def test_trade_alerts_can_be_switched_off():

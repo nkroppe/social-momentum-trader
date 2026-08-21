@@ -20,9 +20,7 @@ def _aware(dt: datetime) -> datetime:
 
 
 def _hold_hours(trade: Trade) -> float:
-    if trade.closed_at is None:
-        return 0.0
-    return max((_aware(trade.closed_at) - _aware(trade.opened_at)).total_seconds() / 3600.0, 0.0)
+    return trade.hold_hours
 
 
 def _pnl_pct(trade: Trade) -> float:
@@ -33,7 +31,8 @@ def format_trade_row(trade: Trade) -> str:
     reason = trade.exit_reason.value if trade.exit_reason else "?"
     return (
         f"{trade.ticker:<5} {trade.strategy:<9} {reason:<12} "
-        f"${trade.realized_pnl:>8,.2f}  {_pnl_pct(trade):>+7.2%}  {_hold_hours(trade):>5.1f}h"
+        f"${trade.realized_pnl:>8,.2f}  {_pnl_pct(trade):>+7.2%}  "
+        f"{_hold_hours(trade):>5.1f}h  MFE {trade.mfe_r:>4.1f}R"
     )
 
 
@@ -48,6 +47,8 @@ def trade_opened_alert(trade: Trade, notional: float, exit_note: str) -> tuple[s
             f"Stop-loss: ${trade.stop_loss:,.6f}",
             f"Time-stop: {_aware(trade.time_stop_at):%Y-%m-%d %H:%M} UTC",
             f"Mode: {'LIVE' if trade.is_live else 'PAPER'}",
+            f"Exit profile: {trade.exit_profile_label or 'legacy'}",
+            f"Policy: {(trade.config_fingerprint or 'legacy')[:12]}",
             f"Levels: {exit_note}",
         ]
     )
@@ -70,6 +71,9 @@ def trade_closed_alert(trade: Trade) -> tuple[str, str]:
             f"P/L: ${pnl:+,.2f} ({_pnl_pct(trade):+.2%})",
             f"Fees: ${trade.fees_paid:,.2f}",
             f"Held: {_hold_hours(trade):.1f}h",
+            f"MFE: {trade.mfe_r:.2f}R",
+            f"Exit profile: {trade.exit_profile_label or 'legacy'}",
+            f"Policy: {(trade.config_fingerprint or 'legacy')[:12]}",
             f"Mode: {'LIVE' if trade.is_live else 'PAPER'}",
         ]
     )
@@ -92,6 +96,7 @@ def trade_partial_alert(
             f"Entry: ${trade.entry_price:,.6f}",
             f"Partial P/L: ${partial_pnl:+,.2f}",
             f"Trailing stop: ${trade.trailing_stop:,.6f}",
+            f"Exit profile: {trade.exit_profile_label or 'legacy'}",
             f"Mode: {'LIVE' if trade.is_live else 'PAPER'}",
         ]
     )
