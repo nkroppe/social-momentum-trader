@@ -45,6 +45,31 @@ def test_per_strategy_allocation_sizing(tmp_path):
     assert d_swing.notional_usd == pytest.approx(1500.0 * 0.10 * mid_mult)
 
 
+def test_production_exit_profiles_match_selected_redesign():
+    strategies = {strategy.name: strategy for strategy in get_strategies().enabled()}
+    intraday = strategies["intraday"]
+    assert intraday.allocation == pytest.approx(0.4)
+    assert intraday.exit.label == "intraday_trend_v2"
+    assert intraday.partial_take_profit_fraction == pytest.approx(0.25)
+    assert intraday.time_stop_hours == 12
+    assert intraday.exit.trail_granularity_seconds == 3_600
+
+    swing = strategies["swing"]
+    assert swing.allocation == pytest.approx(0.4)
+    assert swing.exit.label == "swing_trend_v2"
+    assert swing.partial_take_profit_fraction == pytest.approx(0.25)
+    assert swing.time_stop_hours == 120
+    assert swing.exit.trail_granularity_seconds == 14_400
+
+    bear = strategies["bear_rally"]
+    assert bear.allocation == pytest.approx(0.2)
+    assert bear.regime_mode == "risk_off_only"
+    assert bear.allowed_tickers == ["BTC", "ETH", "SOL"]
+    assert bear.exit.label == "bear_reversion_v2"
+    assert bear.partial_take_profit_fraction == pytest.approx(0.5)
+    assert bear.time_stop_hours == 6
+
+
 def test_volatility_scaling_shrinks_high_vol_positions(tmp_path):
     """A high-ATR asset gets a smaller notional than a calm one."""
     store = make_store(tmp_path)
@@ -132,7 +157,7 @@ def test_both_strategies_simulate_end_to_end(tmp_path):
 
     strategies = get_strategies().enabled()
     names = {s.name for s in strategies}
-    assert {"intraday", "swing"} <= names  # ships with both
+    assert {"intraday", "swing", "bear_rally"} <= names
 
     seed_momentum(store, "SOL", strategies)
 
@@ -160,13 +185,13 @@ def test_both_strategies_simulate_end_to_end(tmp_path):
     broker.set_price("SOL-USD", highest_tp * 1.05)
     manager.manage_open_trades()
 
-    for name in ("intraday", "swing"):
+    for name in ("intraday", "swing", "bear_rally"):
         closed = store.closed_trades_for("SOL", name)
         assert closed, f"{name} should have a closed trade"
         assert closed[-1].exit_reason == ExitReason.TAKE_PROFIT
 
     # Stats are reported per strategy.
-    for name in ("intraday", "swing"):
+    for name in ("intraday", "swing", "bear_rally"):
         stats = store.strategy_stats(name)
         assert stats["closed_trades"] == 1
 
@@ -180,11 +205,10 @@ def test_allocation_sum_validation():
 
 
 def test_time_stop_cap_validation():
-    """time_stop_hours beyond the 72h cap is rejected."""
+    """The selected 120h swing is accepted, but longer holds are rejected."""
     with pytest.raises(ValueError):
-        make_strategy("swing", time_stop_hours=100)
-    # And a within-range custom value is accepted.
-    assert make_strategy("swing", time_stop_hours=72).time_stop_hours == 72
+        make_strategy("swing", time_stop_hours=121)
+    assert make_strategy("swing", time_stop_hours=120).time_stop_hours == 120
 
 
 def test_unique_external_id_dedup(tmp_path):

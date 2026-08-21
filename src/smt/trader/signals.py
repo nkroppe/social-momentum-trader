@@ -371,7 +371,26 @@ class SignalEngine:
     def _regime(self) -> tuple[bool, str]:
         if self.market is None:
             return True, "regime not evaluated"
-        return self.market.regime_ok()
+        state_reader = getattr(self.market, "regime_state", None)
+        if callable(state_reader):
+            state, detail = state_reader()
+            allowed = (
+                self.strategy.regime_mode == "any"
+                or state == "any"
+                or (
+                    self.strategy.regime_mode == "risk_on_only"
+                    and state == "risk_on"
+                )
+                or (
+                    self.strategy.regime_mode == "risk_off_only"
+                    and state == "risk_off"
+                )
+            )
+            return allowed, f"{state}: {detail}"
+        risk_on, detail = self.market.regime_ok()
+        if self.strategy.regime_mode == "risk_off_only":
+            return not risk_on, detail
+        return risk_on, detail
 
     def _price_setup(self, product_id: str, tier: TierConfig) -> PriceSetup | None:
         if not self.market_cfg.price_action_enabled:
@@ -403,6 +422,8 @@ class SignalEngine:
             return None
 
         st = self.strategy
+        if st.allowed_tickers and s.ticker not in st.allowed_tickers:
+            return None
         tier_name = self.universe.tier_of(s.ticker, self.signals.default_tier)
         tier = self.signals.tier(tier_name)
         spec = self.universe.symbols[s.ticker]

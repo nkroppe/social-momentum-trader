@@ -193,11 +193,11 @@ class MarketData:
             detail="ok",
         )
 
-    def regime_ok(self) -> tuple[bool, str]:
-        """True when the benchmark (BTC) is above its trend moving average."""
+    def regime_state(self) -> tuple[str, str]:
+        """Return risk_on, risk_off, any, or unavailable for strategy gating."""
         cfg = self.cfg.regime
         if not cfg.enabled:
-            return True, "regime filter disabled"
+            return "any", "regime filter disabled"
 
         candles = self.candles(cfg.benchmark_product_id, cfg.granularity_seconds)
         if len(candles) < cfg.sma_periods:
@@ -205,19 +205,25 @@ class MarketData:
                 f"{cfg.benchmark_product_id}: only {len(candles)} candles, "
                 f"need {cfg.sma_periods}"
             )
-            return (not cfg.fail_closed), detail
+            return ("unavailable" if cfg.fail_closed else "any"), detail
 
         trend = sma(candles, cfg.sma_periods)
         last = candles[-1].close
         if trend <= 0:
-            return (not cfg.fail_closed), "benchmark SMA unavailable"
+            state = "unavailable" if cfg.fail_closed else "any"
+            return state, "benchmark SMA unavailable"
 
         above = last > trend
         detail = (
             f"{cfg.benchmark_product_id} {last:.2f} "
             f"{'above' if above else 'below'} SMA{cfg.sma_periods} {trend:.2f}"
         )
-        return above, detail
+        return ("risk_on" if above else "risk_off"), detail
+
+    def regime_ok(self) -> tuple[bool, str]:
+        """Backward-compatible bull-strategy regime gate."""
+        state, detail = self.regime_state()
+        return state in {"risk_on", "any"}, detail
 
     def close(self) -> None:
         self._client.close()
