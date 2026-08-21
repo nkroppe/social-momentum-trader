@@ -27,6 +27,7 @@ from .ops import Alerter, KillSwitch
 from .ops.reports import build_weekly_report
 from .ops.schedule import WeeklyScheduler
 from .ops.soak import SoakTracker
+from .policy import trading_policy_identity
 from .scorer import MomentumScorer
 from .store import Store
 from .trader.broker import build_broker
@@ -55,6 +56,7 @@ class Runner:
         self.signals = get_signals()
         self.llm_cfg = get_llm()
         self.strategies = get_strategies().enabled()
+        self.policy_identity = trading_policy_identity(self.strategies)
         self.offline = offline
 
         self.market_cfg = get_market()
@@ -135,6 +137,7 @@ class Runner:
             alerter=self.alerter,
             trade_alerts=self.ops.trade_alerts,
             strategies=self.strategies,
+            policy_fingerprint=self.policy_identity.fingerprint,
         )
         self.soak = SoakTracker(Path(self.ops.soak.state_file))
         self.weekly = WeeklyScheduler(self.ops.weekly_report)
@@ -154,7 +157,7 @@ class Runner:
         self._halt_notified: set[str] = set()
 
         if self.broker.name == "paper":
-            self.soak.ensure_started("paper")
+            self.soak.ensure_started("paper", self.policy_identity.fingerprint)
 
         mode = "LIVE" if self.broker.name == "coinbase" else "PAPER"
         names = ", ".join(f"{st.name}({st.allocation:.0%})" for st in self.strategies)
@@ -176,13 +179,16 @@ class Runner:
             )
             log.info("Universe tiers: %s", tiers)
         log.info(
-            "Runner ready in %s mode (broker=%s) strategies=[%s]",
+            "Runner ready in %s mode (broker=%s) policy=%s strategies=[%s]",
             mode,
             self.broker.name,
+            self.policy_identity.fingerprint[:12],
             names,
         )
         self.store.add_security_event(
-            "startup", f"mode={mode} broker={self.broker.name} strategies=[{names}]"
+            "startup",
+            f"mode={mode} broker={self.broker.name} "
+            f"policy={self.policy_identity.fingerprint[:12]} strategies=[{names}]",
         )
 
     def _enforce_live_latches(self) -> None:

@@ -7,9 +7,11 @@ Capital is tracked per strategy via independent allocation equity.
 
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 
 from ..config import (
+    ExitProfileConfig,
     MarketConfig,
     Settings,
     StrategyConfig,
@@ -22,8 +24,16 @@ from ..market import MarketData, atr, horizon_volatility
 from ..models import ExitReason, Trade, TradeStatus, utcnow
 from ..ops.alerts import Alerter
 from ..ops.reports import trade_closed_alert, trade_opened_alert, trade_partial_alert
+from ..policy import strategy_exit_snapshot, trading_policy_identity
 from ..store import Store
 from .broker import Broker
+from .exit_policy import (
+    ExitPlan,
+    ExitState,
+    compute_exit_levels,
+    legacy_exit_profile,
+    step_quote,
+)
 from .signals import TradeCandidate
 
 log = get_logger("smt.manager")
@@ -41,6 +51,7 @@ class TradeManager:
         alerter: Alerter | None = None,
         trade_alerts: TradeAlertsConfig | None = None,
         strategies: list[StrategyConfig] | None = None,
+        policy_fingerprint: str = "",
     ):
         self.settings = settings
         self.universe = universe
@@ -51,6 +62,7 @@ class TradeManager:
         self.alerter = alerter
         self.trade_alerts = trade_alerts if trade_alerts is not None else TradeAlertsConfig()
         self.strategies = {strategy.name: strategy for strategy in (strategies or [])}
+        self.policy_fingerprint = policy_fingerprint
 
     # ---- Notifications -------------------------------------------------------
 
@@ -125,52 +137,18 @@ class TradeManager:
     def exit_levels(
         self, entry_price: float, candidate: TradeCandidate, strategy: StrategyConfig
     ) -> tuple[float, float, str]:
-        """Take-profit and stop-loss prices for this entry.
-
-        Under ATR sizing the targets track each asset's own volatility over this
-        strategy's holding period. A single fixed percentage cannot fit a
-        universe spanning BTC and a sub-cent token: it makes BTC exits
-        unreachable (so nearly every trade ends on the time stop at a random
-        price) while sitting inside the noise band of the micro cap (so it stops
-        out on nothing).
-        """
-        if 0 < candidate.structure_stop < entry_price:
-            sl = round(candidate.structure_stop, 8)
-            risk_per_unit = entry_price - sl
-            tp = round(entry_price + risk_per_unit * strategy.partial_take_profit_r, 8)
-            return (
-                tp,
-                sl,
-                f"structure stop={candidate.stop_pct:.2%} "
-                f"partial={strategy.partial_take_profit_r:.2f}R",
-            )
-
-        tp_pct = strategy.take_profit_pct
-        sl_pct = strategy.stop_loss_pct
-        note = "fixed"
-
-        if strategy.exit_style == "atr":
-            atr_pct = candidate.atr_pct or self._atr_pct(candidate.product_id, entry_price)
-            if atr_pct > 0:
-                horizon_vol = self.horizon_volatility(atr_pct, strategy)
-                sl_pct = horizon_vol * strategy.atr_stop_loss_mult
-                sl_pct = max(strategy.atr_min_stop_pct, min(sl_pct, strategy.atr_max_stop_pct))
-                # Derive TP from the clamped stop so the reward:risk ratio holds.
-                rr = strategy.atr_take_profit_mult / max(strategy.atr_stop_loss_mult, 1e-9)
-                tp_pct = sl_pct * rr
-                note = f"atr={atr_pct:.2%}/bar horizon={horizon_vol:.2%}"
-            else:
-                note = "fixed (no ATR history)"
-
-        # A target inside round-trip costs is not a trade worth taking.
-        min_tp = 3.0 * strategy.assumed_fee_pct_per_side
-        if tp_pct < min_tp:
-            tp_pct = min_tp
-            note += " tp raised to fee floor"
-
-        tp = round(entry_price * (1 + tp_pct), 8)
-        sl = round(entry_price * (1 - sl_pct), 8)
-        return tp, sl, f"{note} tp={tp_pct:.2%} sl={sl_pct:.2%}"
+        """Take-profit and stop-loss prices for this entry."""
+        atr_pct = candidate.atr_pct or self._atr_pct(candidate.product_id, entry_price)
+        horizon_vol = self.horizon_volatility(atr_pct, strategy) if atr_pct > 0 else 0.0
+        return compute_exit_levels(
+            entry_price=entry_price,
+            structure_stop=candidate.structure_stop,
+            structure_stop_pct=candidate.stop_pct,
+            atr_pct=atr_pct,
+            horizon_vol_pct=horizon_vol,
+            assumed_fee_pct_per_side=strategy.assumed_fee_pct_per_side,
+            profile=strategy.exit,
+        )
 
     def open_position(
         self,
@@ -179,18 +157,12 @@ class TradeManager:
         strategy: StrategyConfig,
         risk_budget_usd: float = 0.0,
     ) -> Trade:
+        opened_at = utcnow()
         entry_price = self.broker.current_price(candidate.product_id)
         tp, sl, exit_note = self.exit_levels(entry_price, candidate, strategy)
 
         fill = self.broker.open_long(candidate.product_id, notional_usd, tp, sl)
-        if 0 < candidate.structure_stop < fill.price:
-            sl = round(candidate.structure_stop, 8)
-            tp = round(
-                fill.price + (fill.price - sl) * strategy.partial_take_profit_r,
-                8,
-            )
-        else:
-            tp, sl, exit_note = self.exit_levels(fill.price, candidate, strategy)
+        tp, sl, exit_note = self.exit_levels(fill.price, candidate, strategy)
         initial_risk = max(fill.price - sl, 0.0)
         actual_risk = initial_risk * fill.qty
         fill_slippage = (
@@ -225,7 +197,10 @@ class TradeManager:
                 initial_risk_per_unit=initial_risk,
                 entry_fee_paid=fill.fee,
                 setup=candidate.setup,
-                time_stop_at=utcnow(),
+                config_fingerprint=self._fingerprint_for(strategy),
+                exit_profile_label=strategy.exit.label,
+                exit_snapshot=strategy_exit_snapshot(strategy),
+                time_stop_at=opened_at,
                 exit_price=unwind.price,
                 exit_reason=ExitReason.ENTRY_RISK,
                 realized_pnl=(unwind.price - fill.price) * fill.qty - fees,
@@ -265,9 +240,13 @@ class TradeManager:
             trailing_stop=0.0,
             entry_fee_paid=fill.fee,
             setup=candidate.setup,
-            time_stop_at=utcnow() + timedelta(hours=strategy.time_stop_hours),
+            config_fingerprint=self._fingerprint_for(strategy),
+            exit_profile_label=strategy.exit.label,
+            exit_snapshot=strategy_exit_snapshot(strategy),
+            time_stop_at=opened_at + timedelta(hours=strategy.time_stop_hours),
             fees_paid=fill.fee,
             broker_entry_order_id=fill.order_id,
+            opened_at=opened_at,
         )
         self.strategies[strategy.name] = strategy
         trade = self.store.add_trade(trade)
@@ -319,23 +298,41 @@ class TradeManager:
     def _strategy_for(self, trade: Trade) -> StrategyConfig | None:
         return self.strategies.get(trade.strategy)
 
-    def _chandelier_stop(self, trade: Trade, strategy: StrategyConfig) -> float:
+    def _fingerprint_for(self, strategy: StrategyConfig) -> str:
+        if self.policy_fingerprint:
+            return self.policy_fingerprint
+        strategies = list(self.strategies.values())
+        if strategy.name not in self.strategies:
+            strategies.append(strategy)
+        return trading_policy_identity(strategies).fingerprint
+
+    def _profile_for(self, trade: Trade) -> ExitProfileConfig:
+        if trade.exit_snapshot and trade.exit_snapshot != "{}":
+            try:
+                return ExitProfileConfig.model_validate(json.loads(trade.exit_snapshot))
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                log.error("invalid exit snapshot for trade %s: %s", trade.id, exc)
+        return legacy_exit_profile(trade.strategy)
+
+    def _trail_atr(self, trade: Trade, profile: ExitProfileConfig) -> float:
         atr_abs = 0.0
         if self.market is not None:
-            candles = self.market.candles(
-                trade.product_id, strategy.entry.trigger_granularity_seconds
-            )
+            candles = self.market.candles(trade.product_id, profile.trail_granularity_seconds)
             atr_abs = atr(candles, self.market_cfg.atr_periods)
         if atr_abs <= 0:
             atr_abs = trade.initial_risk_per_unit
+        return atr_abs
+
+    def _chandelier_stop(self, trade: Trade, profile: ExitProfileConfig) -> float:
+        atr_abs = self._trail_atr(trade, profile)
         if atr_abs <= 0:
             return trade.trailing_stop
-        proposed = trade.highest_price - strategy.chandelier_atr_mult * atr_abs
+        proposed = trade.highest_price - profile.chandelier_atr_mult * atr_abs
         return max(trade.trailing_stop, trade.stop_loss, proposed)
 
-    def _take_partial(self, trade: Trade, strategy: StrategyConfig) -> None:
+    def _take_partial(self, trade: Trade, profile: ExitProfileConfig) -> None:
         original_qty = trade.original_qty or trade.qty
-        partial_qty = min(original_qty * strategy.partial_take_profit_fraction, trade.qty)
+        partial_qty = min(original_qty * profile.partial_take_profit_fraction, trade.qty)
         if partial_qty <= 0 or partial_qty >= trade.qty:
             return
         fill = self.broker.close_long(trade.product_id, partial_qty)
@@ -346,7 +343,7 @@ class TradeManager:
         trade.qty = max(trade.qty - fill.qty, 0.0)
         trade.partial_taken = True
         trade.highest_price = max(trade.highest_price, fill.price)
-        trade.trailing_stop = self._chandelier_stop(trade, strategy)
+        trade.trailing_stop = self._chandelier_stop(trade, profile)
         self.store.update_trade(trade)
         log.info(
             "PARTIAL[%s] %s qty=%.8f exit=%.6f pnl=$%.2f trail=%.6f",
@@ -382,57 +379,52 @@ class TradeManager:
 
             price = self.broker.current_price(trade.product_id)
 
-            strategy = self._strategy_for(trade)
+            profile = self._profile_for(trade)
             advanced_paper = (
-                strategy is not None
-                and strategy.advanced_exit_enabled
+                profile.advanced_exit_enabled
                 and self.broker.name == "paper"
                 and trade.setup not in ("", "offline_social")
             )
-            if advanced_paper:
-                trade.highest_price = max(trade.highest_price or trade.entry_price, price)
-
-                if price <= trade.stop_loss:
-                    self._close(trade, price, ExitReason.STOP_LOSS)
-                    continue
-
-                if not trade.partial_taken and price >= trade.take_profit:
-                    self._take_partial(trade, strategy)
-                    continue
-
-                if trade.partial_taken:
-                    prior_trail = trade.trailing_stop
-                    trade.trailing_stop = self._chandelier_stop(trade, strategy)
-                    if price <= trade.trailing_stop:
-                        self._close(trade, price, ExitReason.TRAILING_STOP)
-                        continue
-                    if trade.trailing_stop != prior_trail:
-                        self.store.update_trade(trade)
-                else:
-                    opened = trade.opened_at
-                    opened = (
-                        opened if opened.tzinfo else opened.replace(tzinfo=utcnow().tzinfo)
-                    )
-                    stale_at = opened + timedelta(hours=strategy.stale_time_stop_hours)
-                    one_r = trade.entry_price + trade.initial_risk_per_unit
-                    if utcnow() >= stale_at and trade.highest_price < one_r:
-                        self._close(trade, price, ExitReason.TIME_STOP)
-                        continue
-
-                if utcnow() >= tstop:
-                    self._close(trade, price, ExitReason.TIME_STOP)
-                else:
-                    self.store.update_trade(trade)
+            effective = profile.model_copy(update={"advanced_exit_enabled": advanced_paper})
+            opened = trade.opened_at
+            opened = opened if opened.tzinfo else opened.replace(tzinfo=utcnow().tzinfo)
+            plan = ExitPlan(
+                stop_loss=trade.stop_loss,
+                take_profit=trade.take_profit,
+                initial_risk_per_unit=trade.initial_risk_per_unit,
+                profile=effective,
+                stale_stop_at=opened + timedelta(hours=effective.stale_time_stop_hours),
+                time_stop_at=tstop,
+                note=trade.exit_profile_label,
+            )
+            state = ExitState(
+                entry_price=trade.entry_price,
+                qty=trade.qty,
+                original_qty=trade.original_qty or trade.qty,
+                highest_price=trade.highest_price or trade.entry_price,
+                partial_taken=trade.partial_taken,
+                trailing_stop=trade.trailing_stop,
+            )
+            step = step_quote(
+                state=state,
+                plan=plan,
+                price=price,
+                atr_abs=self._trail_atr(trade, effective),
+                now=utcnow(),
+            )
+            trade.highest_price = step.highest_price
+            trade.trailing_stop = step.trailing_stop
+            if step.action.kind == "partial":
+                self._take_partial(trade, effective)
                 continue
-
-            # TP/SL: simulated in paper; server-side in live (skip to avoid double close).
-            if not self.broker.server_side_brackets:
-                if price >= trade.take_profit:
-                    self._close(trade, trade.take_profit, ExitReason.TAKE_PROFIT)
+            if step.action.kind == "close":
+                # LIVE server-side brackets own TP/SL; app closes only timed/kill exits.
+                if self.broker.server_side_brackets and step.action.reason in {
+                    ExitReason.TAKE_PROFIT,
+                    ExitReason.STOP_LOSS,
+                    ExitReason.TRAILING_STOP,
+                }:
                     continue
-                if price <= trade.stop_loss:
-                    self._close(trade, trade.stop_loss, ExitReason.STOP_LOSS)
-                    continue
-
-            if utcnow() >= tstop:
-                self._close(trade, price, ExitReason.TIME_STOP)
+                self._close(trade, step.action.reference_price, step.action.reason)
+                continue
+            self.store.update_trade(trade)

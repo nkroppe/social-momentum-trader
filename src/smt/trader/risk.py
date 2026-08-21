@@ -18,6 +18,7 @@ from ..config import MarketConfig, SignalsConfig, StrategyConfig, get_market, ge
 from ..logging_setup import get_logger
 from ..models import utcnow
 from ..store import Store
+from .exit_policy import first_partial_net_profit
 from .signals import TradeCandidate
 
 log = get_logger("smt.risk")
@@ -215,6 +216,24 @@ class RiskGate:
                 f"position notional ${notional:.2f} < min ${st.min_order_notional_usd:.2f} "
                 f"({sizing_note})",
             )
+
+        if 0 < candidate.structure_stop < candidate.entry_price:
+            target = candidate.entry_price + (
+                candidate.entry_price - candidate.structure_stop
+            ) * st.partial_take_profit_r
+            partial_net = first_partial_net_profit(
+                entry_price=candidate.entry_price,
+                target_price=target,
+                notional_usd=notional,
+                partial_fraction=st.partial_take_profit_fraction,
+                fee_pct_per_side=st.assumed_fee_pct_per_side,
+            )
+            if partial_net <= 0:
+                return RiskDecision(
+                    False,
+                    0.0,
+                    f"first partial not positively economic (net=${partial_net:.2f})",
+                )
 
         return RiskDecision(
             True,
