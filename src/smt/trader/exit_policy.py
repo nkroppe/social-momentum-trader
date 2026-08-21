@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from ..config import ExitProfileConfig
@@ -140,6 +140,10 @@ def _mfe_r(state: ExitState, initial_risk_per_unit: float, current_high: float) 
     return max(current_high - state.entry_price, 0.0) / initial_risk_per_unit
 
 
+def _aware(value: datetime) -> datetime:
+    return value if value.tzinfo else value.replace(tzinfo=UTC)
+
+
 def chandelier_stop(
     *,
     state: ExitState,
@@ -232,9 +236,10 @@ def step_quote(
             )
 
     progress = _mfe_r(state, plan.initial_risk_per_unit, high)
+    comparable_now = _aware(now)
     stale = (
         not state.partial_taken
-        and now >= plan.stale_stop_at
+        and comparable_now >= _aware(plan.stale_stop_at)
         and progress < plan.profile.stale_mfe_r
     )
     if stale:
@@ -243,7 +248,7 @@ def step_quote(
             high,
             trail,
         )
-    if now >= plan.time_stop_at:
+    if comparable_now >= _aware(plan.time_stop_at):
         return ExitStep(
             ExitAction("close", ExitReason.TIME_STOP, price, state.qty),
             high,

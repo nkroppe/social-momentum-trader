@@ -317,7 +317,11 @@ def test_replay_adapter_emits_same_partial_and_trailing_actions():
             ),
         ],
     )
-    assert [(action.kind, action.reason, action.reference_price, action.qty) for action in result.actions] == [
+    observed = [
+        (action.kind, action.reason, action.reference_price, action.qty)
+        for action in result.actions
+    ]
+    assert observed == [
         ("partial", ExitReason.TAKE_PROFIT, 115.0, 2.5),
         ("close", ExitReason.TRAILING_STOP, 105.0, 7.5),
     ]
