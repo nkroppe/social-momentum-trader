@@ -29,7 +29,9 @@ X recent counts (30m) -> anomaly-triggered 25-post samples -> quality metadata
 Every production entry starts with price. Intraday uses a 15-minute trigger and
 1-hour bias; swing uses a 1-hour trigger and a deterministically aggregated
 4-hour bias. Both require EMA 9/21/50 alignment, RSI(14) >= 55, N-bar structure,
-and tier-relative volume. Setups are breakout-and-close or breakout-retest;
+and tier-relative volume. The smaller bear-rally sleeve uses 15-minute relief
+breakouts/retests in BTC, ETH, and SOL only while the benchmark is risk-off.
+Setups are breakout-and-close or breakout-retest;
 majors and SOL may also use a rolling-VWAP reclaim intraday. Swing rules are
 separate: compression is required and VWAP pullbacks are disabled.
 
@@ -48,8 +50,9 @@ in shadow mode it cannot close the gate or change size either.
 Retests are preferred for majors/large and required for mid/micro. Relative
 volume is at least 1.5x for major/large and 2.0x for mid/micro.
 
-A benchmark regime filter (BTC vs its 50-day average) blocks *all* new entries
-in a broad downtrend. Every price gate is **fail-closed**: no market data means
+A benchmark regime filter (BTC vs its 50-day average) allows intraday/swing
+trend entries only in risk-on conditions and bear-rally entries only in
+risk-off conditions. Every price gate is **fail-closed**: no market data means
 no entry.
 
 ### Sparse L3 Sonnet review
@@ -71,15 +74,16 @@ Each Sunday report also queues a Sonnet reflection over closed trades and
 current rules. Recommendations are persisted and sent as an advisory Telegram
 message; they are never applied automatically.
 
-## Two strategies, one capital pool
+## Three strategies, one capital pool
 
-The bot runs **two methodologies simultaneously** on a configurable capital
-split (default 50/50) so you can compare which performs best over the soak:
+The bot runs **three methodologies simultaneously** on a configurable capital
+split (40% intraday, 40% swing, 20% bear rally):
 
-Intraday targets 50% off at 1.5R with a 6-hour hard time-stop and a tighter
-4-hour stale stop if price never reaches +1R. Swing targets 50% off at 2R with
-48-hour/24-hour equivalents. After the partial, the remainder uses a
-Chandelier ATR stop that only ratchets upward.
+Intraday takes 25% off at 1.5R, trails 75% at 2.5x one-hour ATR, exits stale
+after four hours below 0.5R MFE, and has a 12-hour hard stop. Swing takes 25%
+off at 2R, trails at 3x four-hour ATR, and uses 24-hour stale / 120-hour hard
+stops. Bear rally takes 50% off at 1R, trails at 2x 15-minute ATR, and uses
+two-hour stale / six-hour hard stops. Chandelier stops only ratchet upward.
 
 Position size starts from a 0.5% equity risk budget divided by the candidate's
 structure-stop percentage. The result is capped by the hard max-position
@@ -87,10 +91,10 @@ percentage, liquidity tier, volatility, and setup conviction; no multiplier can
 raise it above the hard cap. Daily and weekly halts include marked unrealized
 P/L and fail conservatively when an open position cannot be quoted.
 
-Each strategy sizes off its **own** allocation half and enforces its **own**
+Each strategy sizes off its **own** allocation and enforces its **own**
 limits (max position %, max open, max trades/day, daily/weekly loss halts,
 cooldown). One strategy hitting a limit or loss-halt does **not** affect the
-other. A ticker may be held by both strategies independently; every trade is
+another. A ticker may be held by multiple strategies independently; every trade is
 tagged with the strategy that opened it. Enabled allocations must sum to <= 1.0.
 
 ## Quick start (paper, no credentials needed)
@@ -100,7 +104,7 @@ tagged with the strategy that opened it. Enabled allocations must sum to <= 1.0.
 python -m venv .venv && . .venv/Scripts/activate   # Windows PowerShell: .venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
 
-# 2) Prove the whole pipeline (BOTH strategies) with a deterministic demo
+# 2) Prove the whole pipeline (all enabled strategies) with a deterministic demo
 smt simulate --ticker SOL
 
 # 3) Compare strategy performance side by side

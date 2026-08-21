@@ -322,8 +322,9 @@ def _cmd_soak_reset(args: argparse.Namespace) -> int:
     """Restart the soak clock after changing entry or exit logic."""
     from pathlib import Path
 
-    from .config import get_ops, get_security
+    from .config import get_ops, get_security, get_strategies
     from .ops.soak import SoakTracker
+    from .policy import trading_policy_identity
 
     tracker = SoakTracker(Path(get_ops().soak.state_file))
     min_days = get_security().min_paper_soak_days
@@ -335,16 +336,17 @@ def _cmd_soak_reset(args: argparse.Namespace) -> int:
             print("Aborted.")
             return 1
 
-    state = tracker.restart("paper")
+    fingerprint = trading_policy_identity(get_strategies().enabled()).fingerprint
+    state = tracker.restart("paper", fingerprint)
     print(f"Soak clock reset. New start: {state.started_at.isoformat()}")
     return 0
 
 
 def _cmd_simulate(args: argparse.Namespace) -> int:
-    """Deterministic end-to-end demo exercising BOTH strategies.
+    """Deterministic end-to-end demo exercising all enabled strategies.
 
-    Seeds one ticker with baseline + multi-source burst so intraday AND swing
-    each open their own independent position, then forces the price to each
+    Seeds one ticker with baseline + multi-source burst so each eligible
+    strategy opens an independent position, then forces the price to each
     take-profit and closes them. Proves ingest -> score -> per-strategy signal
     -> per-strategy risk/allocation -> paper fill -> exit, with no credentials.
     """
@@ -408,7 +410,7 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
 
     print("\nComparison after simulation:")
     _cmd_compare(args)
-    print("\nSimulation complete: BOTH strategies exercised end-to-end.")
+    print("\nSimulation complete: enabled strategies exercised end-to-end.")
     return 0
 
 

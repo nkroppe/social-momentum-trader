@@ -104,7 +104,7 @@ class TradeManager:
         """Current equity of this strategy's independent allocation.
 
         = its starting slice + its own realized PnL + MTM of its open trades.
-        This keeps the two strategies' capital fully independent.
+        This keeps strategy capital slices fully independent.
         """
         if self.broker.name == "coinbase":
             try:
