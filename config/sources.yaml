@@ -31,8 +31,6 @@ x:
     - "$HYPE"
     - "$ZEC"
     - "$PUMP"
-    - "$BICO"
-    - "$CAP"
   counts_enabled: true
   count_window_minutes: 30
   count_granularity: minute

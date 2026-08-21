@@ -1,25 +1,38 @@
-# Two trading methodologies running simultaneously with a capital split.
+# Trading methodologies running simultaneously with a capital split.
 # Any field omitted here inherits from config/risk.yaml (global defaults).
-# Enabled allocations must sum to <= 1.0. time_stop_hours is capped at 72.
+# Enabled allocations must sum to <= 1.0. time_stop_hours is capped at 120.
 #
 # Exits are ATR-based: targets scale to each asset's own volatility AND to this
 # strategy's holding period, so the same multipliers work for a 6h BTC trade and
 # a 48h micro-cap swing. take_profit_pct and stop_loss_pct below are only the
 # fallback when exit_style is "fixed" or when no candle history is available.
+#
+# Regime modes:
+#   risk_on_only  - enter only when BTC daily close > SMA50 (bull strategies)
+#   risk_off_only - enter only when BTC daily close <= SMA50 (bear_rally)
+# Capital for gated strategies sits idle in the "wrong" regime.
 
 strategies:
-  # Hours-to-intraday horizon.
+  # Hours-to-intraday horizon. Active in RISK-ON.
   intraday:
     enabled: true
-    allocation: 0.5
-    exit_style: atr
-    atr_take_profit_mult: 2.0
-    atr_stop_loss_mult: 1.0
-    take_profit_pct: 0.06
-    stop_loss_pct: 0.03
-    time_stop_hours: 6
-    stale_time_stop_hours: 4
-    partial_take_profit_r: 1.5
+    allocation: 0.40
+    regime_mode: risk_on_only
+    exit:
+      label: intraday_trend_v2
+      mode: partial_trail
+      exit_style: atr
+      atr_take_profit_mult: 2.0
+      atr_stop_loss_mult: 1.0
+      take_profit_pct: 0.06
+      stop_loss_pct: 0.03
+      partial_take_profit_fraction: 0.25
+      partial_take_profit_r: 1.5
+      chandelier_atr_mult: 2.5
+      trail_granularity_seconds: 3600
+      stale_time_stop_hours: 4
+      stale_mfe_r: 0.5
+      time_stop_hours: 12
     signal_min_zscore: 2.5
     signal_min_distinct_sources: 1   # X-only soak; raise to 2 when Reddit is added
     signal_min_distinct_authors: 3   # real confirmation while running one source
@@ -31,6 +44,7 @@ strategies:
     # Intraday is a 15m trigger aligned to a 1h EMA bias. Direct breakouts,
     # retests, and (tier-permitting) VWAP reclaim pullbacks are distinct setups.
     entry:
+      setup_family: bull_breakout
       trigger_granularity_seconds: 900
       bias_granularity_seconds: 3600
       breakout_lookback: 20
@@ -55,16 +69,23 @@ strategies:
   # 1-3 day swing: longer hold, wider targets, stricter entry, longer lookback.
   swing:
     enabled: true
-    allocation: 0.5
-    exit_style: atr
-    # Same multipliers as intraday: the 48h horizon already widens the targets.
-    atr_take_profit_mult: 2.0
-    atr_stop_loss_mult: 1.0
-    take_profit_pct: 0.15
-    stop_loss_pct: 0.07
-    time_stop_hours: 48          # configurable up to 72
-    stale_time_stop_hours: 24
-    partial_take_profit_r: 2.0
+    allocation: 0.40
+    regime_mode: risk_on_only
+    exit:
+      label: swing_trend_v2
+      mode: partial_trail
+      exit_style: atr
+      atr_take_profit_mult: 2.0
+      atr_stop_loss_mult: 1.0
+      take_profit_pct: 0.15
+      stop_loss_pct: 0.07
+      partial_take_profit_fraction: 0.25
+      partial_take_profit_r: 2.0
+      chandelier_atr_mult: 3.0
+      trail_granularity_seconds: 14400
+      stale_time_stop_hours: 24
+      stale_mfe_r: 0.5
+      time_stop_hours: 120
     signal_min_zscore: 3.0
     signal_min_distinct_sources: 1   # X-only soak; raise to 2 when Reddit is added
     signal_min_distinct_authors: 5
@@ -76,23 +97,106 @@ strategies:
     # Swing waits for a 1h trigger with a 4h bias. Coinbase has no native 4h
     # granularity, so the market layer aggregates UTC-aligned 1h bars.
     entry:
+      setup_family: bull_breakout
       trigger_granularity_seconds: 3600
       bias_granularity_seconds: 14400
       breakout_lookback: 20
       structure_lookback: 20
       rsi_periods: 14
-      rsi_min: 55
+      # Gen-5: 0/336 swing setups in 31 RISK-ON hours. RSI 55 + full 4h stack
+      # never fired in a two-day grind; 50 still requires constructive momentum.
+      rsi_min: 50
       volume_lookback: 20
       compression_lookback: 20
       compression_recent: 5
       compression_ratio_max: 0.80
-      require_compression: true
+      # Gen-3 ledger: swing produced 0 setups while intraday produced all near
+      # misses; keep compression as a soft preference via ranking, not a hard gate.
+      require_compression: false
       retest_window: 4
       retest_tolerance_pct: 0.005
       vwap_periods: 32
       allow_vwap_pullback: false
       require_trigger_ema_stack: true
-      require_bias_ema_stack: true
+      require_bias_ema_stack: false
+      reject_bearish_bias_stack: true
       stop_atr_buffer: 0.50
       min_stop_pct: 0.01
       max_stop_pct: 0.15
+
+  # RISK-OFF relief-rally momentum on liquid majors/large only. Default state in
+  # a bear is cash (this slice sits idle until BTC is below SMA50). Does not
+  # short; harvests short-lived upside impulses then exits fast.
+  bear_rally:
+    enabled: true
+    allocation: 0.20
+    regime_mode: risk_off_only
+    allowed_tickers: [BTC, ETH, SOL]
+    confirmation:
+      require_above_sma: false
+      # failed_breakdown / RSI reclaim are reversals; a green 1h return
+      # fights the setup (gen-5 SOL died on 1h return -0.16% < 0.50%).
+      require_positive_return: false
+      min_volume_zscore: 0.0
+    exit:
+      label: bear_reversion_v2
+      mode: bounded_target
+      advanced_exit_enabled: true
+      exit_style: atr
+      atr_take_profit_mult: 1.5
+      atr_stop_loss_mult: 1.0
+      take_profit_pct: 0.04
+      stop_loss_pct: 0.02
+      partial_take_profit_fraction: 0.50
+      partial_take_profit_r: 1.0
+      chandelier_atr_mult: 2.0
+      trail_granularity_seconds: 900
+      stale_time_stop_hours: 2
+      stale_mfe_r: 0.5
+      time_stop_hours: 6
+    risk_per_trade_pct: 0.003
+    max_open_positions: 2
+    max_trades_per_day: 4
+    daily_loss_halt_pct: -0.03
+    weekly_loss_halt_pct: -0.08
+    cooldown_minutes_after_stop: 180
+    signal_min_zscore: 0.0
+    signal_min_distinct_sources: 0
+    signal_min_distinct_authors: 0
+    signal_min_mentions: 0
+    signal_min_bullish_ratio: 0.0
+    scorer_bucket_minutes: 30
+    scorer_lookback_buckets: 8
+    confirm_lookback_hours: 1
+    confirm_min_return_pct: 0.0
+    entry:
+      setup_family: bear_rally
+      trigger_granularity_seconds: 900
+      bias_granularity_seconds: 3600
+      breakout_lookback: 20
+      structure_lookback: 20
+      rsi_periods: 14
+      rsi_min: 0
+      rsi_oversold_max: 35
+      rsi_reclaim_min: 45
+      rsi_lookback_bars: 8
+      volume_lookback: 20
+      require_compression: false
+      retest_window: 3
+      retest_tolerance_pct: 0.004
+      vwap_periods: 32
+      allow_vwap_pullback: false
+      require_trigger_ema_stack: false
+      require_bias_ema_stack: false
+      allow_rsi_reclaim: true
+      allow_failed_breakdown: true
+      allow_rs_bounce: true
+      failed_breakdown_lookback: 20
+      rs_lookback_bars: 16
+      rs_min_outperformance_pct: 0.01
+      max_chase_return_pct: 0.04
+      chase_lookback_bars: 4
+      stop_atr_buffer: 0.25
+      min_stop_pct: 0.008
+      max_stop_pct: 0.04
+      max_entry_slippage_pct: 0.005

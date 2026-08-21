@@ -2,6 +2,7 @@
 
 from .alerts import Alerter
 from .killswitch import KillSwitch
+from .performance import EquityPoint, PerformanceTrade, calculate_performance
 from .preflight import CheckResult, all_passed, run_preflight
 from .reports import (
     build_weekly_report,
@@ -11,15 +12,20 @@ from .reports import (
 )
 from .schedule import WeeklyScheduler
 from .soak import SoakTracker
+from .telegram_control import TelegramControl
 
 __all__ = [
     "Alerter",
     "KillSwitch",
+    "TelegramControl",
+    "EquityPoint",
+    "PerformanceTrade",
     "SoakTracker",
     "WeeklyScheduler",
     "CheckResult",
     "all_passed",
     "run_preflight",
+    "calculate_performance",
     "build_weekly_report",
     "trade_closed_alert",
     "trade_opened_alert",

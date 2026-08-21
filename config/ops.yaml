@@ -5,8 +5,9 @@ soak:
   digest_interval_hours: 24
 
 preflight:
-  # Production VPS profile requires real Reddit + X (mock disabled in sources.yaml).
-  require_reddit: true
+  # Reddit access is intentionally disabled pending API approval; X is the
+  # production social source and mock data must remain disabled.
+  require_reddit: false
   require_x: true
   require_alert_channel: true
   require_postgres: true
@@ -16,6 +17,15 @@ trade_alerts:
   enabled: true
   on_open: true
   on_close: true
+
+# Phone control via the same Telegram bot/chat used for alerts.
+# Exact messages only, from TELEGRAM_CHAT_ID:
+#   KILL  -> flatten all positions and pause new entries
+#   START -> clear the kill switch and resume trading
+telegram_control:
+  enabled: true
+  state_file: ./data/telegram_control.json
+  request_timeout_seconds: 5
 
 # Scheduled performance summary. Sent on local wall-clock time, so the hour
 # stays put across daylight saving rather than drifting with UTC.

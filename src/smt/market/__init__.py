@@ -1,6 +1,6 @@
 """Market data: candles, technicals, and the regime filter."""
 
-from .data import MarketData, TechnicalSnapshot
+from .data import MarketData, MarketDataUnavailable, TechnicalSnapshot, TopOfBookQuote
 from .indicators import (
     Candle,
     aggregate_candles,
@@ -19,7 +19,9 @@ from .indicators import (
 
 __all__ = [
     "MarketData",
+    "MarketDataUnavailable",
     "TechnicalSnapshot",
+    "TopOfBookQuote",
     "Candle",
     "aggregate_candles",
     "atr",

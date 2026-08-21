@@ -48,6 +48,16 @@ docker compose ps
 docker compose logs -f trader
 ```
 
+The `dashboard` service listens on **127.0.0.1:8080** only. Set `DASHBOARD_TOKEN`
+in `.env` before starting. From your laptop:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 smt@YOUR_VPS_IP
+```
+
+Then open `http://127.0.0.1:8080` and paste the token. Do not bind 8080 to the
+public interface.
+
 ## 4. Preflight checks
 
 ```bash
@@ -68,6 +78,8 @@ Monitor daily:
 docker compose exec trader smt compare
 docker compose exec trader smt soak-report
 ```
+
+Or open the dashboard over the SSH tunnel (`http://127.0.0.1:8080`).
 
 Daily email digests are sent automatically when SMTP is configured (every 24h by default).
 

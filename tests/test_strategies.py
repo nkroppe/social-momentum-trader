@@ -127,12 +127,18 @@ def test_both_strategies_simulate_end_to_end(tmp_path):
     universe = make_universe()
     settings = _settings()
     broker = PaperBroker(seed=3)
-    gate = RiskGate(store)
     manager = TradeManager(settings, universe, store, broker)
+    gate = RiskGate(
+        store,
+        mark_price=broker.current_price,
+        quote=broker.execution_quote,
+        portfolio_equity=lambda: manager.equity(),
+        universe=universe,
+    )
 
     strategies = get_strategies().enabled()
     names = {s.name for s in strategies}
-    assert {"intraday", "swing"} <= names  # ships with both
+    assert {"intraday", "swing", "bear_rally"} <= names  # ships with all three
 
     seed_momentum(store, "SOL", strategies)
 
@@ -180,11 +186,11 @@ def test_allocation_sum_validation():
 
 
 def test_time_stop_cap_validation():
-    """time_stop_hours beyond the 72h cap is rejected."""
+    """time_stop_hours supports five-day swings but rejects longer holds."""
     with pytest.raises(ValueError):
-        make_strategy("swing", time_stop_hours=100)
+        make_strategy("swing", time_stop_hours=121)
     # And a within-range custom value is accepted.
-    assert make_strategy("swing", time_stop_hours=72).time_stop_hours == 72
+    assert make_strategy("swing", time_stop_hours=120).time_stop_hours == 120
 
 
 def test_unique_external_id_dedup(tmp_path):

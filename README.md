@@ -14,8 +14,8 @@ is the broker. **Paper mode is the default**.
 X recent counts (30m) -> anomaly-triggered 25-post samples -> quality metadata
    -> count-based attention z-score -> multi-timeframe price setup
    -> SHADOW tier social policy + SHADOW sparse L3 Sonnet review
-   -> HARD RISK GATE (per strategy)
-   -> PAPER partial profit + Chandelier trailing stop -> manage exits
+   -> HARD RISK GATE (strategy + global portfolio heat/exposure)
+   -> executable PAPER fill -> partial profit + protected Chandelier runner
 ```
 
 - **Direction:** long-only spot (USD pairs on an allowlist).
@@ -28,10 +28,14 @@ X recent counts (30m) -> anomaly-triggered 25-post samples -> quality metadata
 
 Every production entry starts with price. Intraday uses a 15-minute trigger and
 1-hour bias; swing uses a 1-hour trigger and a deterministically aggregated
-4-hour bias. Both require EMA 9/21/50 alignment, RSI(14) >= 55, N-bar structure,
-and tier-relative volume. Setups are breakout-and-close or breakout-retest;
-majors and SOL may also use a rolling-VWAP reclaim intraday. Swing rules are
-separate: compression is required and VWAP pullbacks are disabled.
+4-hour bias. Both require trigger EMA 9/21/50 alignment, N-bar structure, and
+tier-relative volume. Intraday also requires RSI(14) >= 55 and a bullish 1h
+EMA stack. Swing uses RSI(14) >= 50 and only rejects a bearish 4h stack (it
+does not require a full 9>21>50 bias in a grind). The completed setup must
+then pass the configured SMA, trailing-return, and volume-z confirmation
+gates. Setups are breakout-and-close or breakout-retest; majors and SOL may
+also use a rolling-VWAP reclaim intraday. Swing disables VWAP pullbacks;
+compression is a ranking preference, not a hard gate.
 
 The tier playbook is evaluated only after the price setup. With
 `social_decision_mode: shadow` (the shipped default), these are counterfactual
@@ -41,16 +45,22 @@ outcomes for audit and do not affect orders:
 - **Large (SOL):** price is hard; constructive social can boost conviction and
   sufficiently bearish social can veto.
 - **Mid (HYPE/ZEC):** price setup plus required social confirmation.
-- **Micro (PUMP/BICO/CAP):** social catalyst plus a hard price breakout/retest.
+- **Micro (PUMP):** social catalyst plus a hard price breakout/retest.
 
 Social attention can never open a trade without a qualifying price trigger, and
 in shadow mode it cannot close the gate or change size either.
 Retests are preferred for majors/large and required for mid/micro. Relative
 volume is at least 1.5x for major/large and 2.0x for mid/micro.
+When position capacity is scarce, candidates are ranked only by deterministic
+price evidence (setup quality, conviction, relative volume, ticker), never by
+social z-score.
 
-A benchmark regime filter (BTC vs its 50-day average) blocks *all* new entries
-in a broad downtrend. Every price gate is **fail-closed**: no market data means
-no entry.
+A benchmark regime filter (BTC vs its 50-day average) gates entries
+**per strategy**: `intraday` / `swing` only enter in RISK-ON; `bear_rally`
+only enters in RISK-OFF. RISK-ON also requires BTC 4h not printing consecutive
+lower lows. Setup relative volume is the volume gate; the extra 1h volume-z
+confirmation is off. Every price gate is
+**fail-closed**: no market data means no entry.
 
 ### Sparse L3 Sonnet review
 
@@ -71,27 +81,69 @@ Each Sunday report also queues a Sonnet reflection over closed trades and
 current rules. Recommendations are persisted and sent as an advisory Telegram
 message; they are never applied automatically.
 
-## Two strategies, one capital pool
+## Strategies, one capital pool
 
-The bot runs **two methodologies simultaneously** on a configurable capital
-split (default 50/50) so you can compare which performs best over the soak:
+The bot runs **three methodologies** on a configurable capital split (default
+40/40/20 for intraday / swing / bear_rally). Bull strategies only take new
+entries when BTC is above its 50-day SMA; bear_rally only when BTC is below it
+(so idle capital sits in cash in the "wrong" regime).
 
 Intraday targets 50% off at 1.5R with a 6-hour hard time-stop and a tighter
 4-hour stale stop if price never reaches +1R. Swing targets 50% off at 2R with
-48-hour/24-hour equivalents. After the partial, the remainder uses a
-Chandelier ATR stop that only ratchets upward.
+48-hour/24-hour equivalents. `bear_rally` trades short-lived RISK-OFF relief
+rallies on BTC/ETH/SOL (RSI reclaim, failed breakdown, relative-strength
+bounce) with faster partials (1.0R) and tighter stops. After the partial, the
+remainder uses a Chandelier ATR stop that only ratchets upward and cannot fall
+below a cost-adjusted breakeven floor.
 
 Position size starts from a 0.5% equity risk budget divided by the candidate's
 structure-stop percentage. The result is capped by the hard max-position
 percentage, liquidity tier, volatility, and setup conviction; no multiplier can
 raise it above the hard cap. Daily and weekly halts include marked unrealized
 P/L and fail conservatively when an open position cannot be quoted.
+Before entry, the first partial must remain profitable after modeled fees,
+spread, slippage, and visible-depth constraints. Across both strategies, global
+limits cap open heat at 2%, gross exposure at 50%, combined exposure per ticker
+at 10%, and aggregate micro exposure at 15%.
 
 Each strategy sizes off its **own** allocation half and enforces its **own**
 limits (max position %, max open, max trades/day, daily/weekly loss halts,
 cooldown). One strategy hitting a limit or loss-halt does **not** affect the
 other. A ticker may be held by both strategies independently; every trade is
-tagged with the strategy that opened it. Enabled allocations must sum to <= 1.0.
+tagged with the strategy that opened it, while the global limits still see both
+positions. Enabled allocations must sum to <= 1.0.
+
+### PAPER execution and research evidence
+
+Deployed PAPER does not use synthetic or last-candle fallback prices. Entries
+require a fresh, contiguous one-minute feed and a fresh Coinbase level-1 book.
+Buys fill at ask plus adverse slippage; sells fill at bid minus adverse
+slippage. Entries are rejected when spread exceeds 40 bps, visible top-level
+depth is insufficient, or the order would consume more than 50% of that level.
+Stops and targets walk each newly closed one-minute bar exactly once; a bar that
+touches both is resolved stop-first. Synthetic prices remain explicit to
+`smt simulate` and tests only.
+
+Every closed trigger candle creates a versioned prospective opportunity record,
+including rejected/no-setup outcomes. Candidate rows are enriched with
+social/Sonnet, risk, execution, and trade linkage, then labeled prospectively
+with 1h/4h/24h/72h return, MAE, and MFE when enough future candles exist.
+
+For network-free price-only research, provide contiguous UTC OHLCV files named
+`PRODUCT-ID.csv` with the exact header
+`timestamp,open,high,low,close,volume`, then run:
+
+```bash
+smt backtest --data-dir data/candles --symbols BTC ETH SOL \
+  --start 2025-01-01T00:00:00Z --end 2026-01-01T00:00:00Z \
+  --output-dir data/backtest
+```
+
+Replay decisions occur after candle close and fills occur no earlier than the
+next bar. Artifacts include the policy/data manifest, opportunities, trades,
+equity curve, after-cost metrics, and simple price baselines. This command does
+not backtest social or Sonnet because complete point-in-time histories do not
+exist.
 
 ## Quick start (paper, no credentials needed)
 
@@ -111,6 +163,10 @@ smt score
 
 # 5) Run the loop in paper mode
 smt run
+
+# 6) Optional: monitoring dashboard (read-only)
+pip install -e ".[dashboard]"
+smt dashboard
 ```
 
 With no `.env`, it uses **SQLite** and a **mock** social feed, so the loop and
@@ -158,7 +214,8 @@ so the code does not hard-code a stale model version.
 
 `init_db()` runs lightweight, idempotent SQLite/Postgres migrations. Social
 counts, richer X author/engagement metadata, and stable shadow-decision audit
-records are persisted alongside the existing trade migration fields.
+records are persisted alongside the prospective opportunity ledger and existing
+trade migration fields.
 Existing open trades are conservatively backfilled from their stored entry and
 stop. No manual migration step is required.
 
@@ -209,7 +266,10 @@ docker compose logs -f trader
 ```
 
 During the paper soak, the bot tracks elapsed days in `data/soak.json`, sends
-daily digest alerts, and blocks live mode until the minimum soak is met.
+daily digest alerts, and blocks live mode until the minimum soak is met. The
+clock is bound to a canonical SHA-256 of the resolved trading policy. A relevant
+strategy, risk, market, signal, universe, source, or LLM policy change starts a
+new generation automatically while retaining bounded prior-generation history.
 
 ## Ops commands
 
@@ -222,11 +282,40 @@ smt soak-report         # soak progress + strategy comparison
 smt preview             # live exit levels + position size per symbol
 smt weekly-report       # preview this week's P/L (--send to deliver, --last for prior week)
 smt shadow-report       # social + Sonnet readiness evidence (--days N, --send)
-smt soak-reset          # restart the soak clock after changing signal logic
+smt dashboard           # read-only web UI on http://127.0.0.1:8080
+smt backtest ...        # deterministic local price-only replay; never calls network
+smt soak-reset          # intentional restart; policy changes reset automatically
 ```
 
-Reset the soak clock whenever entry or exit logic changes. Days accumulated
-under different rules do not evidence the system that would go live.
+### Monitoring dashboard
+
+A FastAPI + React dashboard reports open positions, trade history, equity, P&L,
+strategy comparison, opportunity funnel, and risk caps. It is **read-only**
+(no orders, no kill switch).
+
+Local (loopback, token optional):
+
+```bash
+pip install -e ".[dashboard]"
+cd web && npm install && npm run build && cd ..
+smt dashboard
+```
+
+Or keep the API on 8080 and the Vite dev server on 5173 (`npm run dev` in `web/`).
+
+On the VPS, Compose publishes **loopback only**: `127.0.0.1:8080`. Set a long
+`DASHBOARD_TOKEN` in `.env`. Reach it with an SSH tunnel:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 user@your-vps
+# then open http://127.0.0.1:8080 and paste the token
+```
+
+Do not publish port 8080 on `0.0.0.0`.
+
+`smt soak-report` shows the active policy fingerprint, generation, reset reason,
+and changed policy sections. Days accumulated under different rules do not
+evidence the system that would go live; legacy or mismatched state fails closed.
 
 ### Interpreting `shadow-report`
 
@@ -272,6 +361,14 @@ touch control/KILL      # stop entries + flatten positions
 smt kill --reason "..." # same, via CLI
 smt clear-kill          # resume
 ```
+
+From the configured Telegram chat (`TELEGRAM_CHAT_ID`), send an exact message:
+
+- `KILL` — flatten every open position and pause new entries
+- `START` — clear the kill switch and resume trading
+
+Only those exact words (optional surrounding whitespace) from the authorized chat
+are accepted. The bot acknowledges each command with an alert.
 
 ## Safety / status
 

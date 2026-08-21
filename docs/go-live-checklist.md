@@ -4,7 +4,10 @@ Complete **after** a successful 2-week paper soak on the VPS. Every item must be
 
 ## Paper soak complete
 
-- [ ] `smt soak-report` shows ≥ 14 days elapsed (or your configured minimum)
+- [ ] `smt soak-report` shows the current policy fingerprint/generation and ≥ 14 days
+      elapsed (or your configured minimum)
+- [ ] No policy mismatch is reported; trading-policy changes automatically start a new
+      generation, while intentional restarts use `smt soak-reset`
 - [ ] `smt compare` reviewed; intraday vs swing behavior understood
 - [ ] No unexplained errors in `docker compose logs trader` over the soak period
 - [ ] Kill switch tested once (`touch control/KILL`, verify flatten, `smt clear-kill`)
@@ -39,7 +42,8 @@ Complete **after** a successful 2-week paper soak on the VPS. Every item must be
 docker compose exec trader smt doctor --live
 ```
 
-All checks must pass. If any fail, **do not** restart with live mode.
+All checks must pass. Fingerprint mismatch and legacy unversioned soak state fail closed.
+If any check fails, **do not** restart with live mode.
 
 ## First live session
 

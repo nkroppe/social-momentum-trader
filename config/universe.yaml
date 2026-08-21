@@ -38,17 +38,6 @@ symbols:
     # bare symbol needs the $ form. The pumpfun spellings stay unambiguous.
     require_cashtag: true
     aliases: ["pumpfun", "pump.fun", "pump fun", "$pump"]
-  BICO:
-    product_id: BICO-USD
-    tier: micro
-    aliases: ["bico", "biconomy", "$bico"]
-  CAP:
-    product_id: CAP-USD
-    tier: micro
-    # "market cap" / "no cap" / "low cap gem" are constant on crypto Twitter, so
-    # a bare word match here would be almost entirely false positives.
-    require_cashtag: true
-    aliases: ["$cap"]
 
 # Symbols to never trade even if mentioned.
 denylist: []
