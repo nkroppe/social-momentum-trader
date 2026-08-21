@@ -27,6 +27,8 @@ export function PositionsPage() {
                 <th>TP / SL</th>
                 <th>Trail</th>
                 <th>Setup</th>
+                <th>Exit profile</th>
+                <th>MFE / hold</th>
                 <th>Opened</th>
               </tr>
             </thead>
@@ -56,6 +58,17 @@ export function PositionsPage() {
                   <td className="plain">
                     {p.setup || "—"}
                     {p.partial_taken ? ` · partial ${money(p.partial_realized_pnl)}` : ""}
+                  </td>
+                  <td
+                    className="plain"
+                    title={`fingerprint=${p.config_fingerprint}\nsnapshot=${JSON.stringify(p.exit_snapshot)}`}
+                  >
+                    {p.exit_profile_label || "legacy"}
+                    <div className="muted">{p.config_fingerprint.slice(0, 12) || "legacy"}</div>
+                  </td>
+                  <td>
+                    {p.mfe_r.toFixed(2)}R
+                    <div className="muted">{p.hold_hours.toFixed(1)}h</div>
                   </td>
                   <td>{when(p.opened_at)}</td>
                 </tr>

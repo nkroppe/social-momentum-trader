@@ -44,6 +44,7 @@ export function HistoryPage() {
           <option>TAKE_PROFIT</option>
           <option>TRAILING_STOP</option>
           <option>STOP_LOSS</option>
+          <option>STALE_TIME_STOP</option>
           <option>TIME_STOP</option>
           <option>ENTRY_RISK</option>
           <option>KILL_SWITCH</option>
@@ -66,6 +67,8 @@ export function HistoryPage() {
                 <th>P&amp;L</th>
                 <th>Fees</th>
                 <th>Hold</th>
+                <th>MFE</th>
+                <th>Exit profile</th>
                 <th>Setup</th>
               </tr>
             </thead>
@@ -84,6 +87,14 @@ export function HistoryPage() {
                   </td>
                   <td>{t.fees_paid.toFixed(2)}</td>
                   <td>{t.hold_hours != null ? `${t.hold_hours.toFixed(1)}h` : "—"}</td>
+                  <td>{t.mfe_r.toFixed(2)}R</td>
+                  <td
+                    className="plain"
+                    title={`fingerprint=${t.config_fingerprint}\nsnapshot=${JSON.stringify(t.exit_snapshot)}`}
+                  >
+                    {t.exit_profile_label || "legacy"}
+                    <div className="muted">{t.config_fingerprint.slice(0, 12) || "legacy"}</div>
+                  </td>
                   <td className="plain">{t.setup || "—"}</td>
                 </tr>
               ))}

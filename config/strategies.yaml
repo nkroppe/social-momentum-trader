@@ -1,6 +1,6 @@
 # Trading methodologies running simultaneously with a capital split.
 # Any field omitted here inherits from config/risk.yaml (global defaults).
-# Enabled allocations must sum to <= 1.0. time_stop_hours is capped at 72.
+# Enabled allocations must sum to <= 1.0. time_stop_hours is capped at 120.
 #
 # Exits are ATR-based: targets scale to each asset's own volatility AND to this
 # strategy's holding period, so the same multipliers work for a 6h BTC trade and
@@ -18,14 +18,21 @@ strategies:
     enabled: true
     allocation: 0.40
     regime_mode: risk_on_only
-    exit_style: atr
-    atr_take_profit_mult: 2.0
-    atr_stop_loss_mult: 1.0
-    take_profit_pct: 0.06
-    stop_loss_pct: 0.03
-    time_stop_hours: 6
-    stale_time_stop_hours: 4
-    partial_take_profit_r: 1.5
+    exit:
+      label: intraday_trend_v2
+      mode: partial_trail
+      exit_style: atr
+      atr_take_profit_mult: 2.0
+      atr_stop_loss_mult: 1.0
+      take_profit_pct: 0.06
+      stop_loss_pct: 0.03
+      partial_take_profit_fraction: 0.25
+      partial_take_profit_r: 1.5
+      chandelier_atr_mult: 2.5
+      trail_granularity_seconds: 3600
+      stale_time_stop_hours: 4
+      stale_mfe_r: 0.5
+      time_stop_hours: 12
     signal_min_zscore: 2.5
     signal_min_distinct_sources: 1   # X-only soak; raise to 2 when Reddit is added
     signal_min_distinct_authors: 3   # real confirmation while running one source
@@ -64,15 +71,21 @@ strategies:
     enabled: true
     allocation: 0.40
     regime_mode: risk_on_only
-    exit_style: atr
-    # Same multipliers as intraday: the 48h horizon already widens the targets.
-    atr_take_profit_mult: 2.0
-    atr_stop_loss_mult: 1.0
-    take_profit_pct: 0.15
-    stop_loss_pct: 0.07
-    time_stop_hours: 48          # configurable up to 72
-    stale_time_stop_hours: 24
-    partial_take_profit_r: 2.0
+    exit:
+      label: swing_trend_v2
+      mode: partial_trail
+      exit_style: atr
+      atr_take_profit_mult: 2.0
+      atr_stop_loss_mult: 1.0
+      take_profit_pct: 0.15
+      stop_loss_pct: 0.07
+      partial_take_profit_fraction: 0.25
+      partial_take_profit_r: 2.0
+      chandelier_atr_mult: 3.0
+      trail_granularity_seconds: 14400
+      stale_time_stop_hours: 24
+      stale_mfe_r: 0.5
+      time_stop_hours: 120
     signal_min_zscore: 3.0
     signal_min_distinct_sources: 1   # X-only soak; raise to 2 when Reddit is added
     signal_min_distinct_authors: 5
@@ -125,16 +138,22 @@ strategies:
       # fights the setup (gen-5 SOL died on 1h return -0.16% < 0.50%).
       require_positive_return: false
       min_volume_zscore: 0.0
-    exit_style: atr
-    atr_take_profit_mult: 1.5
-    atr_stop_loss_mult: 1.0
-    take_profit_pct: 0.04
-    stop_loss_pct: 0.02
-    time_stop_hours: 6
-    stale_time_stop_hours: 2
-    partial_take_profit_fraction: 0.50
-    partial_take_profit_r: 1.0
-    chandelier_atr_mult: 2.5
+    exit:
+      label: bear_reversion_v2
+      mode: bounded_target
+      advanced_exit_enabled: true
+      exit_style: atr
+      atr_take_profit_mult: 1.5
+      atr_stop_loss_mult: 1.0
+      take_profit_pct: 0.04
+      stop_loss_pct: 0.02
+      partial_take_profit_fraction: 0.50
+      partial_take_profit_r: 1.0
+      chandelier_atr_mult: 2.0
+      trail_granularity_seconds: 900
+      stale_time_stop_hours: 2
+      stale_mfe_r: 0.5
+      time_stop_hours: 6
     risk_per_trade_pct: 0.003
     max_open_positions: 2
     max_trades_per_day: 4

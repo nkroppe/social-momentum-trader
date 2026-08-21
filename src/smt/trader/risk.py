@@ -25,7 +25,7 @@ from ..config import (
     get_signals,
 )
 from ..logging_setup import get_logger
-from ..market import TopOfBookQuote, horizon_volatility
+from ..market import TopOfBookQuote
 from ..models import utcnow
 from ..store import Store
 from .execution import (
@@ -34,6 +34,7 @@ from .execution import (
     ExecutionEstimate,
     conservative_quote,
 )
+from .exit_policy import first_partial_economics, initial_levels
 from .signals import TradeCandidate
 
 log = get_logger("smt.risk")
@@ -154,18 +155,15 @@ class RiskGate:
         strategy: StrategyConfig,
         entry_price: float,
     ) -> float:
-        if 0 < candidate.structure_stop < entry_price:
-            return candidate.structure_stop
-        stop_pct = candidate.stop_pct or strategy.stop_loss_pct
-        if strategy.exit_style == "atr" and candidate.atr_pct > 0:
-            horizon_vol = horizon_volatility(
-                candidate.atr_pct,
-                strategy.time_stop_hours,
-                self.market_cfg.candle_granularity_seconds,
-            )
-            stop_pct = horizon_vol * strategy.atr_stop_loss_mult
-            stop_pct = max(strategy.atr_min_stop_pct, min(stop_pct, strategy.atr_max_stop_pct))
-        return entry_price * (1.0 - stop_pct)
+        levels = initial_levels(
+            entry_price,
+            candidate.structure_stop,
+            strategy.exit_profile,
+            atr_pct=candidate.atr_pct,
+            candle_granularity_seconds=self.market_cfg.candle_granularity_seconds,
+            assumed_fee_pct_per_side=strategy.assumed_fee_pct_per_side,
+        )
+        return levels.stop_loss
 
     def _economic_target_check(
         self,
@@ -182,7 +180,15 @@ class RiskGate:
         if not 0 < candidate.structure_stop < buy.price:
             return None, buy
 
-        target = buy.price + (buy.price - candidate.structure_stop) * strategy.partial_take_profit_r
+        levels = initial_levels(
+            buy.price,
+            candidate.structure_stop,
+            strategy.exit_profile,
+            atr_pct=candidate.atr_pct,
+            candle_granularity_seconds=self.market_cfg.candle_granularity_seconds,
+            assumed_fee_pct_per_side=strategy.assumed_fee_pct_per_side,
+        )
+        target = levels.take_profit
         partial_qty = buy.qty * strategy.partial_take_profit_fraction
         try:
             sell = costs.estimate_sell(
@@ -195,18 +201,24 @@ class RiskGate:
         except ExecutionCostError as exc:
             return RiskDecision(False, 0.0, f"first partial not executable: {exc}"), None
 
-        entry_fee_share = buy.fee * strategy.partial_take_profit_fraction
-        gross_profit = (target - buy.price) * partial_qty
-        execution_and_fee_cost = entry_fee_share + target * partial_qty - sell.net_proceeds
-        net_profit = gross_profit - execution_and_fee_cost
-        if net_profit <= 0:
+        economics = first_partial_economics(
+            entry_price=buy.price,
+            target_price=target,
+            original_qty=buy.qty,
+            current_qty=buy.qty,
+            fraction=strategy.partial_take_profit_fraction,
+            total_entry_fee=buy.fee,
+            modeled_exit_net_proceeds=sell.net_proceeds,
+        )
+        modeled_cost = economics.entry_fee_share + economics.exit_cost
+        if economics.net_profit <= 0:
             return (
                 RiskDecision(
                     False,
                     0.0,
                     "first partial not positively economic: "
-                    f"target=${target:.8f} gross=${gross_profit:.2f} "
-                    f"modeled_cost=${execution_and_fee_cost:.2f} net=${net_profit:.2f} "
+                    f"target=${target:.8f} gross=${economics.gross_profit:.2f} "
+                    f"modeled_cost=${modeled_cost:.2f} net=${economics.net_profit:.2f} "
                     f"spread={quote.spread_bps:.1f}bps "
                     f"slippage={self.market_cfg.paper_adverse_slippage_bps:.1f}bps "
                     f"bid_participation={sell.participation:.1%}",

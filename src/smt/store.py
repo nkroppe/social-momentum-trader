@@ -72,6 +72,9 @@ _TRADE_COLUMNS = (
     ("entry_fee_paid", "FLOAT DEFAULT 0.0"),
     ("setup", "VARCHAR(64) DEFAULT ''"),
     ("last_processed_paper_bar_ts", "BIGINT DEFAULT 0"),
+    ("config_fingerprint", "VARCHAR(64) DEFAULT ''"),
+    ("exit_profile_label", "VARCHAR(64) DEFAULT ''"),
+    ("exit_snapshot", "JSON"),
 )
 
 OPPORTUNITY_LEDGER_VERSION = 1
@@ -164,9 +167,19 @@ class Store:
         self._ensure_columns("signals", _SIGNAL_COLUMNS)
         self._ensure_columns("shadow_decisions", _SHADOW_DECISION_COLUMNS)
         self._ensure_columns("trades", _TRADE_COLUMNS)
+        self._ensure_trade_snapshot_index()
         self._ensure_shadow_trade_index()
         self._ensure_opportunity_indexes()
         self._backfill_advanced_exit_fields()
+
+    def _ensure_trade_snapshot_index(self) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_trades_config_fingerprint "
+                    "ON trades (config_fingerprint)"
+                )
+            )
 
     def _ensure_shadow_trade_index(self) -> None:
         with self.engine.begin() as conn:
@@ -200,7 +213,7 @@ class Store:
         if self.engine.dialect.name != "postgresql":
             return
         with self.engine.begin() as conn:
-            for value in ("TRAILING_STOP", "ENTRY_RISK"):
+            for value in ("TRAILING_STOP", "ENTRY_RISK", "STALE_TIME_STOP"):
                 conn.execute(text(f"ALTER TYPE exitreason ADD VALUE IF NOT EXISTS '{value}'"))
 
     def _backfill_advanced_exit_fields(self) -> None:
@@ -1229,6 +1242,12 @@ class Store:
 
     def update_trade(self, trade: Trade) -> None:
         with self.session() as s:
+            persisted = s.get(Trade, trade.id) if trade.id is not None else None
+            if persisted is not None:
+                immutable = ("config_fingerprint", "exit_profile_label", "exit_snapshot")
+                for field in immutable:
+                    if getattr(persisted, field) != getattr(trade, field):
+                        raise ValueError(f"trade {field} is immutable")
             s.merge(trade)
             s.commit()
 

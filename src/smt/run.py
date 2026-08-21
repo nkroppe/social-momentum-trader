@@ -175,6 +175,7 @@ class Runner:
             alerter=self.alerter,
             trade_alerts=self.ops.trade_alerts,
             strategies=self.strategies,
+            config_fingerprint=self.config_fingerprint,
         )
         self.soak = SoakTracker(Path(self.ops.soak.state_file))
         self.weekly = WeeklyScheduler(self.ops.weekly_report)
@@ -202,7 +203,10 @@ class Runner:
             )
 
         mode = "LIVE" if self.broker.name == "coinbase" else "PAPER"
-        names = ", ".join(f"{st.name}({st.allocation:.0%})" for st in self.strategies)
+        names = ", ".join(
+            f"{st.name}({st.allocation:.0%}, exit={st.exit_profile.label})"
+            for st in self.strategies
+        )
         log.info(
             "Config dir=%s | reddit=%s x=%s mock=%s",
             CONFIG_DIR,
@@ -221,13 +225,16 @@ class Runner:
             )
             log.info("Universe tiers: %s", tiers)
         log.info(
-            "Runner ready in %s mode (broker=%s) strategies=[%s]",
+            "Runner ready in %s mode (broker=%s) policy=%s strategies=[%s]",
             mode,
             self.broker.name,
+            self.config_fingerprint[:12],
             names,
         )
         self.store.add_security_event(
-            "startup", f"mode={mode} broker={self.broker.name} strategies=[{names}]"
+            "startup",
+            f"mode={mode} broker={self.broker.name} "
+            f"policy={self.config_fingerprint[:12]} strategies=[{names}]",
         )
 
     def _enforce_live_latches(self) -> None:

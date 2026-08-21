@@ -31,27 +31,26 @@ weekly_loss_halt_pct: -0.12
 # After a stop-out on a symbol, ignore new signals for it for this many minutes.
 cooldown_minutes_after_stop: 120
 
-# Exit sizing. "atr" scales targets to each asset's own volatility, so one rule
-# fits both BTC (~2% daily range) and a sub-cent token (~15%+). Under "fixed",
-# the flat percentages below are used instead.
-exit_style: atr
-atr_take_profit_mult: 2.0  # TP = entry + 2 x ATR
-atr_stop_loss_mult: 1.0    # SL = entry - 1 x ATR
-atr_min_stop_pct: 0.008    # floor: never stop tighter than 0.8% (fee-dominated)
-atr_max_stop_pct: 0.15     # ceiling: never risk more than 15% on one entry
-
-# PAPER-only professional exit management. LIVE startup is explicitly blocked
-# while enabled because Coinbase bracket replacement parity is not implemented.
-advanced_exit_enabled: true
-partial_take_profit_fraction: 0.50
-partial_take_profit_r: 1.5
-chandelier_atr_mult: 3.0
-stale_time_stop_hours: 4
-
-# Fallback exit parameters, used when exit_style is "fixed" or ATR is unavailable.
-take_profit_pct: 0.06      # +6% target
-stop_loss_pct: 0.03        # -3% stop
-time_stop_hours: 6         # flatten if neither TP nor SL hits within N hours
+# Canonical inherited exit profile. Strategies may override any nested field;
+# legacy flat keys remain accepted by the loader.
+exit:
+  label: default_trend_v2
+  mode: partial_trail
+  exit_style: atr
+  atr_take_profit_mult: 2.0
+  atr_stop_loss_mult: 1.0
+  atr_min_stop_pct: 0.008
+  atr_max_stop_pct: 0.15
+  advanced_exit_enabled: true
+  partial_take_profit_fraction: 0.50
+  partial_take_profit_r: 1.5
+  chandelier_atr_mult: 3.0
+  trail_granularity_seconds: 900
+  stale_time_stop_hours: 4
+  stale_mfe_r: 1.0
+  take_profit_pct: 0.06
+  stop_loss_pct: 0.03
+  time_stop_hours: 6
 
 # Minimum notional per order (avoid dust / fee-dominated trades), USD.
 min_order_notional_usd: 25

@@ -54,6 +54,11 @@ export type Position = {
   trailing_stop: number;
   highest_price: number;
   setup: string;
+  exit_profile_label: string;
+  config_fingerprint: string;
+  exit_snapshot: Record<string, unknown> | null;
+  mfe_r: number;
+  hold_hours: number;
   time_stop_at: string | null;
   opened_at: string;
   tp_distance_pct: number | null;
@@ -76,6 +81,10 @@ export type Trade = {
   fees_paid: number;
   partial_realized_pnl: number;
   setup: string;
+  exit_profile_label: string;
+  config_fingerprint: string;
+  exit_snapshot: Record<string, unknown> | null;
+  mfe_r: number;
   opened_at: string;
   closed_at: string | null;
   hold_hours: number | null;

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from ..config import MarketConfig, UniverseConfig
 from ..market import TopOfBookQuote
+from .exit_policy import fee_aware_breakeven
 
 
 class ExecutionCostError(ValueError):
@@ -88,8 +89,7 @@ class ExecutionCostEstimator:
         )
         if level_notional < min_notional:
             raise ExecutionCostError(
-                f"{quote.product_id}: {side} depth ${level_notional:.2f} below "
-                f"${min_notional:.2f}"
+                f"{quote.product_id}: {side} depth ${level_notional:.2f} below ${min_notional:.2f}"
             )
         if participation > self.market_cfg.paper_max_top_level_participation:
             raise ExecutionCostError(
@@ -174,7 +174,11 @@ class ExecutionCostEstimator:
         )
         if sell_discount <= 0:
             raise ExecutionCostError("modeled sell discount is not positive")
-        return (entry_price + remaining_entry_fee_per_unit) / sell_discount
+        return fee_aware_breakeven(
+            entry_price,
+            remaining_entry_fee_per_unit,
+            sell_discount,
+        )
 
 
 def conservative_quote(

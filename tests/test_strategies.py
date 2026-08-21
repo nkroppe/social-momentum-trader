@@ -186,11 +186,11 @@ def test_allocation_sum_validation():
 
 
 def test_time_stop_cap_validation():
-    """time_stop_hours beyond the 72h cap is rejected."""
+    """time_stop_hours supports five-day swings but rejects longer holds."""
     with pytest.raises(ValueError):
-        make_strategy("swing", time_stop_hours=100)
+        make_strategy("swing", time_stop_hours=121)
     # And a within-range custom value is accepted.
-    assert make_strategy("swing", time_stop_hours=72).time_stop_hours == 72
+    assert make_strategy("swing", time_stop_hours=120).time_stop_hours == 120
 
 
 def test_unique_external_id_dedup(tmp_path):

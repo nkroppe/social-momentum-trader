@@ -28,6 +28,17 @@ from .config import (
 )
 from .market import Candle, atr, sma, trailing_return, volume_zscore
 from .ops.performance import EquityPoint, PerformanceTrade, calculate_performance
+from .trader.exit_policy import (
+    ExitActionKind,
+    active_stop,
+    bar_step,
+    fee_aware_breakeven,
+    first_partial_economics,
+    initial_levels,
+    mfe_r,
+    resolve_profile,
+    time_exit_reason,
+)
 from .trader.signals import PriceSetup, detect_price_setup
 
 CSV_FIELDS = ("timestamp", "open", "high", "low", "close", "volume")
@@ -196,6 +207,7 @@ class Position:
     fees: float
     slippage: float
     highest: float
+    trailing_stop: float = 0.0
     partial_taken: bool = False
     gross_pnl: float = 0.0
     exit_notional: float = 0.0
@@ -204,7 +216,7 @@ class Position:
 
     @property
     def active_stop(self) -> float:
-        return self.stop
+        return active_stop(self.stop, self.trailing_stop, self.partial_taken)
 
 
 @dataclass
@@ -249,6 +261,7 @@ class BacktestEngine:
             self.market.regime.granularity_seconds,
             *(st.entry.trigger_granularity_seconds for st in self.strategies),
             *(st.entry.bias_granularity_seconds for st in self.strategies),
+            *(st.trail_granularity_seconds for st in self.strategies if st.advanced_exit_enabled),
         }
         for seconds in needed:
             if seconds < self.base_seconds or seconds % self.base_seconds:
@@ -591,28 +604,34 @@ class BacktestEngine:
                 row["reason"] = "below minimum order notional"
                 continue
             qty = notional / fill_price
-            target = (
-                fill_price
-                + (fill_price - entry.setup.structure_stop) * strategy.partial_take_profit_r
+            levels = initial_levels(
+                fill_price,
+                entry.setup.structure_stop,
+                strategy.exit_profile,
+                atr_pct=entry.setup.atr_pct,
+                candle_granularity_seconds=self.market.candle_granularity_seconds,
+                assumed_fee_pct_per_side=strategy.assumed_fee_pct_per_side,
             )
+            target = levels.take_profit
             partial_qty = qty * strategy.partial_take_profit_fraction
             projected_sell_price = target * (1.0 - self.slip)
-            projected_entry_fee = (
-                notional * strategy.assumed_fee_pct_per_side * strategy.partial_take_profit_fraction
-            )
             projected_exit_fee = (
                 projected_sell_price * partial_qty * strategy.assumed_fee_pct_per_side
             )
-            projected_gross = (target - fill_price) * partial_qty
-            projected_slippage = (target - projected_sell_price) * partial_qty
-            projected_net = (
-                projected_gross - projected_entry_fee - projected_exit_fee - projected_slippage
+            economics = first_partial_economics(
+                entry_price=fill_price,
+                target_price=target,
+                original_qty=qty,
+                current_qty=qty,
+                fraction=strategy.partial_take_profit_fraction,
+                total_entry_fee=notional * strategy.assumed_fee_pct_per_side,
+                modeled_exit_net_proceeds=projected_sell_price * partial_qty - projected_exit_fee,
             )
-            if projected_net <= 0:
+            if economics.net_profit <= 0:
                 row["status"] = "risk_rejected"
                 row["reason"] = (
                     "first partial not positively economic after configured "
-                    f"fees/slippage (net={projected_net:.8f})"
+                    f"fees/slippage (net={economics.net_profit:.8f})"
                 )
                 continue
             rejection = self._global_rejection(entry, notional, fill_price, qty, marks)
@@ -681,12 +700,16 @@ class BacktestEngine:
         if not final:
             return
         net = position.gross_pnl - position.fees - position.slippage
+        profile = resolve_profile(position.strategy.exit_profile)
+        hold_hours = max(ts - position.opened_at, 0) / 3_600.0
         record = {
             "trade_id": position.trade_id,
             "strategy": position.strategy.name,
             "ticker": position.ticker,
             "product_id": position.product_id,
             "setup": position.setup_name,
+            "exit_profile_label": profile.label,
+            "exit_snapshot": json.dumps(profile.snapshot(), sort_keys=True, separators=(",", ":")),
             "opened_at": _iso(position.opened_at),
             "closed_at": _iso(ts),
             "entry_reference": position.entry_reference,
@@ -701,6 +724,12 @@ class BacktestEngine:
             "modeled_slippage": position.slippage,
             "net_pnl": net,
             "net_r": net / position.initial_risk if position.initial_risk > 0 else 0.0,
+            "mfe_r": mfe_r(
+                position.highest,
+                position.entry_price,
+                position.initial_risk / position.original_qty if position.original_qty > 0 else 0.0,
+            ),
+            "hold_hours": hold_hours,
             "exit_reason": reason,
         }
         self.trades.append(record)
@@ -719,93 +748,87 @@ class BacktestEngine:
         ):
             bar = self.data[position.ticker][index]
             strategy = position.strategy
-            if bar.low <= position.active_stop:
-                reason = "TRAILING_STOP" if position.partial_taken else "STOP_LOSS"
-                self._sell(
-                    position,
-                    position.qty,
-                    position.active_stop,
-                    ts + self.base_seconds,
-                    reason,
-                    final=True,
-                )
-                continue
-            position.highest = max(position.highest, bar.high)
-            advanced = strategy.advanced_exit_enabled
-            if advanced and not position.partial_taken and bar.high >= position.target:
-                partial = position.original_qty * strategy.partial_take_profit_fraction
-                self._sell(
-                    position,
-                    partial,
-                    position.target,
-                    ts + self.base_seconds,
-                    "PARTIAL",
-                    final=False,
-                )
-                position.partial_taken = True
-                remaining_entry_fee = position.entry_fee * (position.qty / position.original_qty)
-                fee_per_unit = remaining_entry_fee / position.qty
-                breakeven = (position.entry_price + fee_per_unit) / (
-                    (1.0 - self.slip) * (1.0 - strategy.assumed_fee_pct_per_side)
-                )
-                position.stop = max(position.stop, breakeven)
-            elif not advanced and bar.high >= position.target:
-                self._sell(
-                    position,
-                    position.qty,
-                    position.target,
-                    ts + self.base_seconds,
-                    "TAKE_PROFIT",
-                    final=True,
-                )
-                continue
-            if advanced and position.partial_taken:
-                trigger = self._candles(
+            profile = resolve_profile(strategy.exit_profile)
+            atr_abs = 0.0
+            if profile.advanced_exit_enabled:
+                trail_rows = self._candles(
                     position.ticker,
-                    strategy.entry.trigger_granularity_seconds,
+                    profile.trail_granularity_seconds,
                     ts + self.base_seconds,
                 )
-                atr_abs = atr(trigger, self.market.atr_periods)
-                if atr_abs > 0:
-                    position.stop = max(
-                        position.stop,
-                        position.highest - strategy.chandelier_atr_mult * atr_abs,
+                atr_abs = atr(trail_rows, self.market.atr_periods)
+            remaining_after_partial = position.qty * (1.0 - profile.partial_take_profit_fraction)
+            post_partial_stop = None
+            if not position.partial_taken and remaining_after_partial > 0:
+                remaining_entry_fee = position.entry_fee * (
+                    remaining_after_partial / position.original_qty
+                )
+                post_partial_stop = fee_aware_breakeven(
+                    position.entry_price,
+                    remaining_entry_fee / remaining_after_partial,
+                    (1.0 - self.slip) * (1.0 - strategy.assumed_fee_pct_per_side),
+                )
+            step = bar_step(
+                profile,
+                low=bar.low,
+                high=bar.high,
+                stop_loss=position.stop,
+                take_profit=position.target,
+                highest_price=position.highest,
+                trailing_stop=position.trailing_stop,
+                partial_taken=position.partial_taken,
+                original_qty=position.original_qty,
+                current_qty=position.qty,
+                atr_absolute=atr_abs,
+                post_partial_stop=post_partial_stop,
+            )
+            position.highest = step.highest_price
+            position.trailing_stop = step.trailing_stop
+            closed = False
+            for action in step.actions:
+                if action.kind == ExitActionKind.PARTIAL:
+                    self._sell(
+                        position,
+                        action.qty,
+                        action.price,
+                        ts + self.base_seconds,
+                        action.reason,
+                        final=False,
                     )
-                if bar.low <= position.stop:
+                    position.partial_taken = True
+                else:
                     self._sell(
                         position,
                         position.qty,
-                        position.stop,
+                        action.price,
                         ts + self.base_seconds,
-                        "TRAILING_STOP",
+                        action.reason,
                         final=True,
                     )
-                    continue
-            held = ts + self.base_seconds - position.opened_at
-            stale = strategy.stale_time_stop_hours * 3600
-            one_r = position.entry_price + (position.initial_risk / position.original_qty)
-            if (
-                advanced
-                and not position.partial_taken
-                and held >= stale
-                and position.highest < one_r
-            ):
-                self._sell(
-                    position,
-                    position.qty,
-                    bar.close,
-                    ts + self.base_seconds,
-                    "STALE_TIME_STOP",
-                    final=True,
-                )
+                    closed = True
+                    break
+            if closed:
                 continue
-            if held >= strategy.time_stop_hours * 3600:
+            held = ts + self.base_seconds - position.opened_at
+            reason = time_exit_reason(
+                profile,
+                held_seconds=held,
+                highest_price=position.highest,
+                entry_price=position.entry_price,
+                initial_risk_per_unit=(
+                    position.initial_risk / position.original_qty
+                    if position.original_qty > 0
+                    else 0.0
+                ),
+                partial_taken=position.partial_taken,
+            )
+            if reason is not None:
                 self._sell(
                     position,
                     position.qty,
                     bar.close,
                     ts + self.base_seconds,
-                    "TIME_STOP",
+                    reason,
                     final=True,
                 )
 
@@ -1117,6 +1140,8 @@ def run_backtest(
             "ticker",
             "product_id",
             "setup",
+            "exit_profile_label",
+            "exit_snapshot",
             "opened_at",
             "closed_at",
             "entry_reference",
@@ -1131,6 +1156,8 @@ def run_backtest(
             "modeled_slippage",
             "net_pnl",
             "net_r",
+            "mfe_r",
+            "hold_hours",
             "exit_reason",
         ]
     )

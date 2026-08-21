@@ -37,6 +37,7 @@ class ExitReason(enum.StrEnum):
     TRAILING_STOP = "TRAILING_STOP"
     STOP_LOSS = "STOP_LOSS"
     ENTRY_RISK = "ENTRY_RISK"
+    STALE_TIME_STOP = "STALE_TIME_STOP"
     TIME_STOP = "TIME_STOP"
     KILL_SWITCH = "KILL_SWITCH"
     NONE = "NONE"
@@ -274,6 +275,9 @@ class Trade(Base):
     entry_fee_paid: Mapped[float] = mapped_column(Float, default=0.0)
     setup: Mapped[str] = mapped_column(String(64), default="")
     last_processed_paper_bar_ts: Mapped[int] = mapped_column(BigInteger, default=0)
+    config_fingerprint: Mapped[str] = mapped_column(String(64), default="", index=True)
+    exit_profile_label: Mapped[str] = mapped_column(String(64), default="")
+    exit_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     time_stop_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
     exit_price: Mapped[float] = mapped_column(Float, default=0.0)

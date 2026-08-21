@@ -77,7 +77,10 @@ def _cmd_score(_args: argparse.Namespace) -> int:
 
 
 def _cmd_status(_args: argparse.Namespace) -> int:
+    from datetime import UTC, datetime
+
     from .run import Runner
+    from .trader.exit_policy import mfe_r
 
     r = Runner()
     print(f"Mode  : {'LIVE' if r.settings.live else 'PAPER'}")
@@ -90,9 +93,20 @@ def _cmd_status(_args: argparse.Namespace) -> int:
             f"alloc_equity=${alloc_eq:.2f} open={len(open_trades)}"
         )
         for t in open_trades:
+            opened = t.opened_at if t.opened_at.tzinfo else t.opened_at.replace(tzinfo=UTC)
+            held = max((datetime.now(UTC) - opened).total_seconds() / 3600.0, 0.0)
+            current_mfe = mfe_r(
+                t.highest_price or t.entry_price,
+                t.entry_price,
+                t.initial_risk_per_unit,
+            )
             print(
                 f"  - {t.ticker:<6} qty={t.qty:.6f} entry={t.entry_price:.6f} "
-                f"tp={t.take_profit:.6f} sl={t.stop_loss:.6f}"
+                f"tp={t.take_profit:.6f} sl={t.stop_loss:.6f} "
+                f"profile={t.exit_profile_label or 'legacy'} "
+                f"fp={(t.config_fingerprint or '-')[:12]} "
+                f"MFE={current_mfe:.2f}R "
+                f"held={held:.1f}h snapshot={t.exit_snapshot}"
             )
     return 0
 
@@ -394,7 +408,9 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
         else:
             print(
                 f"OPENED[{name}] {ticker}: qty={tr.qty:.8f} entry={tr.entry_price:.6f} "
-                f"tp={tr.take_profit:.6f} sl={tr.stop_loss:.6f}"
+                f"tp={tr.take_profit:.6f} sl={tr.stop_loss:.6f} "
+                f"profile={tr.exit_profile_label} fp={tr.config_fingerprint[:12]} "
+                f"snapshot={tr.exit_snapshot}"
             )
 
     # 4) Force price above this ticker's highest TP so its positions all exit.
@@ -412,7 +428,8 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
             t = closed[-1]
             print(
                 f"CLOSED[{st.name}] {ticker}: reason={t.exit_reason.value} "
-                f"exit={t.exit_price:.6f} pnl=${t.realized_pnl:.2f}"
+                f"exit={t.exit_price:.6f} pnl=${t.realized_pnl:.2f} "
+                f"profile={t.exit_profile_label} fp={t.config_fingerprint[:12]}"
             )
 
     print("\nComparison after simulation:")
@@ -426,7 +443,7 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
     try:
         import uvicorn
     except ImportError:
-        print("Install dashboard extras: pip install -e \".[dashboard]\"", file=sys.stderr)
+        print('Install dashboard extras: pip install -e ".[dashboard]"', file=sys.stderr)
         return 2
 
     from .config import get_settings
@@ -438,9 +455,7 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
     host = args.host
     port = args.port
     token = args.token if args.token else settings.dashboard_token
-    must_auth = auth_required(
-        require_auth=settings.dashboard_require_auth, bind_host=host
-    )
+    must_auth = auth_required(require_auth=settings.dashboard_require_auth, bind_host=host)
     if must_auth and not token:
         print(
             "DASHBOARD_TOKEN is required when binding a non-loopback address "

@@ -26,6 +26,7 @@ from ..ops.killswitch import KillSwitch
 from ..ops.soak import SoakTracker
 from ..store import Store
 from ..trader.execution import ExecutionCostError, ExecutionCostEstimator, conservative_quote
+from ..trader.exit_policy import mfe_r
 from .schemas import (
     EquityPoint,
     ExitReasonCount,
@@ -92,9 +93,7 @@ class DashboardService:
         self.store = store
         self.settings = settings
         self.universe = universe if universe is not None else get_universe()
-        self.strategies = (
-            list(strategies) if strategies is not None else get_strategies().enabled()
-        )
+        self.strategies = list(strategies) if strategies is not None else get_strategies().enabled()
         self.risk_cfg = get_risk()
         self.security = get_security()
         self.ops = get_ops()
@@ -216,9 +215,7 @@ class DashboardService:
                 )
             )
         equity, _, _ = self.equity()
-        points.append(
-            EquityPoint(t=iso(utcnow()) or "", equity=equity, realized_pnl=running)
-        )
+        points.append(EquityPoint(t=iso(utcnow()) or "", equity=equity, realized_pnl=running))
         return points
 
     def health(self) -> HealthResponse:
@@ -295,6 +292,18 @@ class DashboardService:
                     trailing_stop=trade.trailing_stop or 0.0,
                     highest_price=trade.highest_price or 0.0,
                     setup=trade.setup or "",
+                    exit_profile_label=trade.exit_profile_label or "legacy",
+                    config_fingerprint=trade.config_fingerprint or "",
+                    exit_snapshot=trade.exit_snapshot,
+                    mfe_r=mfe_r(
+                        trade.highest_price or trade.entry_price,
+                        trade.entry_price,
+                        trade.initial_risk_per_unit,
+                    ),
+                    hold_hours=max(
+                        (_aware(utcnow()) - _aware(trade.opened_at)).total_seconds() / 3600.0,
+                        0.0,
+                    ),
                     time_stop_at=iso(trade.time_stop_at),
                     opened_at=iso(trade.opened_at) or "",
                     tp_distance_pct=tp_dist,
@@ -352,6 +361,14 @@ class DashboardService:
             fees_paid=trade.fees_paid,
             partial_realized_pnl=trade.partial_realized_pnl or 0.0,
             setup=trade.setup or "",
+            exit_profile_label=trade.exit_profile_label or "legacy",
+            config_fingerprint=trade.config_fingerprint or "",
+            exit_snapshot=trade.exit_snapshot,
+            mfe_r=mfe_r(
+                trade.highest_price or trade.entry_price,
+                trade.entry_price,
+                trade.initial_risk_per_unit,
+            ),
             opened_at=iso(trade.opened_at) or "",
             closed_at=iso(trade.closed_at),
             hold_hours=hold,
@@ -424,9 +441,7 @@ class DashboardService:
                 enforce_depth=True,
             )
         except ExecutionCostError:
-            quote = conservative_quote(
-                trade.product_id, mark, self.market_cfg.paper_max_spread_bps
-            )
+            quote = conservative_quote(trade.product_id, mark, self.market_cfg.paper_max_spread_bps)
             sell = costs.estimate_sell(
                 quote,
                 trade.qty,

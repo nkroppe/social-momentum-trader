@@ -132,9 +132,7 @@ def test_weekly_report_totals_only_the_window(tmp_path):
     _closed_trade(store, "ETH", 999.0, closed_at=start - timedelta(hours=1))
     _closed_trade(store, "HYPE", 999.0, closed_at=end + timedelta(hours=1))
 
-    subject, body = build_weekly_report(
-        store, ["intraday", "swing"], start, end, UTC, mode="PAPER"
-    )
+    subject, body = build_weekly_report(store, ["intraday", "swing"], start, end, UTC, mode="PAPER")
 
     assert "+7.30" in subject
     assert "Trades closed:  2" in body
@@ -186,6 +184,10 @@ def test_sell_alert_reports_profit_and_loss(tmp_path):
     subject, body = trade_closed_alert(win)
     assert "PROFIT" in subject and "+15.40" in subject
     assert "P/L: $+15.40 (+6.16%)" in body
+    assert "Exit profile: legacy" in body
+    assert "Config fingerprint: legacy" in body
+    assert "Exit snapshot: null" in body
+    assert "MFE:" in body and "Held:" in body
 
     loss = _closed_trade(store, "BTC", -8.10, closed_at=end)
     subject, _ = trade_closed_alert(loss)
@@ -199,6 +201,10 @@ def test_buy_alert_carries_the_exit_levels(tmp_path):
     assert subject.startswith("BUY SOL")
     assert "Take-profit" in body and "Stop-loss" in body
     assert "PAPER" in body
+    assert "Exit profile: legacy" in body
+    assert "Config fingerprint: legacy" in body
+    assert "Exit snapshot: null" in body
+    assert "MFE:" in body and "Held:" in body
 
 
 def test_trade_alerts_can_be_switched_off():

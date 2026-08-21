@@ -61,6 +61,11 @@ class PositionRow(BaseModel):
     trailing_stop: float
     highest_price: float
     setup: str
+    exit_profile_label: str
+    config_fingerprint: str
+    exit_snapshot: dict | None
+    mfe_r: float
+    hold_hours: float
     time_stop_at: str | None
     opened_at: str
     tp_distance_pct: float | None
@@ -87,6 +92,10 @@ class TradeRow(BaseModel):
     fees_paid: float
     partial_realized_pnl: float
     setup: str
+    exit_profile_label: str
+    config_fingerprint: str
+    exit_snapshot: dict | None
+    mfe_r: float
     opened_at: str
     closed_at: str | None
     hold_hours: float | None

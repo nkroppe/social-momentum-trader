@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .config import (
     MarketConfig,
@@ -21,9 +21,10 @@ from .config import (
     get_strategies,
     get_universe,
 )
-from .llm.config import LLMConfig, get_llm
+if TYPE_CHECKING:
+    from .llm.config import LLMConfig
 
-TRADING_POLICY_SCHEMA_VERSION = 1
+TRADING_POLICY_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -80,6 +81,11 @@ def trading_policy_identity(
     version deliberately invalidates prior evidence if the canonical contract
     itself changes.
     """
+    if llm is None:
+        from .llm.config import get_llm
+
+        llm = get_llm()
+
     sections: dict[str, Any] = {
         "schema": {"version": TRADING_POLICY_SCHEMA_VERSION},
         "strategies": (strategies or get_strategies()).model_dump(mode="json"),
@@ -88,7 +94,7 @@ def trading_policy_identity(
         "signals": (signals or get_signals()).model_dump(mode="json"),
         "universe": (universe or get_universe()).model_dump(mode="json"),
         "sources": _source_policy(sources or get_sources()),
-        "llm": _llm_policy(llm or get_llm()),
+        "llm": _llm_policy(llm),
     }
     manifest = {
         name: hashlib.sha256(_canonical_bytes(value)).hexdigest()[:12]

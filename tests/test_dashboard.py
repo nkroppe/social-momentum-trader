@@ -105,9 +105,7 @@ def test_api_rejects_missing_and_wrong_token(tmp_path):
     store = make_store(tmp_path)
     client = _client(tmp_path, store)
     assert client.get("/api/overview").status_code == 401
-    assert (
-        client.get("/api/overview", headers={"Authorization": "Bearer wrong"}).status_code == 401
-    )
+    assert client.get("/api/overview", headers={"Authorization": "Bearer wrong"}).status_code == 401
 
 
 def test_overview_and_positions_use_injected_marks(tmp_path):
@@ -135,6 +133,11 @@ def test_overview_and_positions_use_injected_marks(tmp_path):
     assert row["mark"] == 110.0
     assert row["mark_ok"] is True
     assert row["unrealized_pnl"] == 20.0
+    assert row["exit_profile_label"] == "legacy"
+    assert row["config_fingerprint"] == ""
+    assert row["exit_snapshot"] is None
+    assert row["mfe_r"] == 0.0
+    assert row["hold_hours"] >= 0.0
 
 
 def test_trades_filter_by_strategy_and_exit_reason(tmp_path):
@@ -154,6 +157,9 @@ def test_trades_filter_by_strategy_and_exit_reason(tmp_path):
     stops = client.get("/api/trades", params={"exit_reason": "STOP_LOSS"}, headers=headers).json()
     assert stops["total"] == 1
     assert stops["trades"][0]["realized_pnl"] == -8.0
+    assert stops["trades"][0]["exit_profile_label"] == "legacy"
+    assert stops["trades"][0]["exit_snapshot"] is None
+    assert stops["trades"][0]["mfe_r"] == 0.0
 
 
 def test_performance_and_risk_and_opportunities(tmp_path):
@@ -277,9 +283,11 @@ def test_live_equity_uses_exchange_reader(tmp_path):
         require_auth=True,
         service=service,
     )
-    body = TestClient(app).get(
-        "/api/overview", headers={"Authorization": "Bearer secret-token"}
-    ).json()
+    body = (
+        TestClient(app)
+        .get("/api/overview", headers={"Authorization": "Bearer secret-token"})
+        .json()
+    )
     assert body["mode"] == "LIVE"
     assert body["equity"] == 12_345.0
     assert body["unrealized_pnl"] == 20.0
@@ -302,7 +310,9 @@ def test_live_equity_falls_back_when_reader_fails(tmp_path):
         require_auth=True,
         service=service,
     )
-    body = TestClient(app).get(
-        "/api/overview", headers={"Authorization": "Bearer secret-token"}
-    ).json()
+    body = (
+        TestClient(app)
+        .get("/api/overview", headers={"Authorization": "Bearer secret-token"})
+        .json()
+    )
     assert body["equity"] == 10_040.0

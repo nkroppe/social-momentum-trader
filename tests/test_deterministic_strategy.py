@@ -951,7 +951,7 @@ def test_stale_trade_closes_early_when_it_never_reaches_one_r(tmp_path):
     broker.set_price("BTC-USD", 102.0)
     manager.manage_open_trades()
     closed = store.closed_trades_for("BTC", strategy.name)[-1]
-    assert closed.exit_reason == ExitReason.TIME_STOP
+    assert closed.exit_reason == ExitReason.STALE_TIME_STOP
     assert closed.setup == "breakout_close"
 
 
