@@ -16,13 +16,18 @@ log = get_logger("smt.soak")
 class SoakState:
     started_at: datetime
     mode: str = "paper"
+    config_fingerprint: str = ""
 
     @classmethod
     def from_dict(cls, data: dict) -> SoakState:
         started = datetime.fromisoformat(data["started_at"])
         if started.tzinfo is None:
             started = started.replace(tzinfo=UTC)
-        return cls(started_at=started, mode=data.get("mode", "paper"))
+        return cls(
+            started_at=started,
+            mode=data.get("mode", "paper"),
+            config_fingerprint=data.get("config_fingerprint", ""),
+        )
 
 
 class SoakTracker:
@@ -44,28 +49,47 @@ class SoakTracker:
     def _save(self, state: SoakState) -> None:
         self.path.write_text(
             json.dumps(
-                {"started_at": state.started_at.isoformat(), "mode": state.mode},
+                {
+                    "started_at": state.started_at.isoformat(),
+                    "mode": state.mode,
+                    "config_fingerprint": state.config_fingerprint,
+                },
                 indent=2,
             ),
             encoding="utf-8",
         )
 
-    def ensure_started(self, mode: str = "paper") -> SoakState:
+    def ensure_started(self, mode: str = "paper", config_fingerprint: str = "") -> SoakState:
         existing = self._load()
         if existing is not None:
+            if config_fingerprint and existing.config_fingerprint != config_fingerprint:
+                log.warning(
+                    "Trading policy changed (%s -> %s); resetting PAPER soak",
+                    existing.config_fingerprint[:12] or "legacy",
+                    config_fingerprint[:12],
+                )
+                return self.restart(mode, config_fingerprint)
             return existing
-        state = SoakState(started_at=datetime.now(UTC), mode=mode)
+        state = SoakState(
+            started_at=datetime.now(UTC),
+            mode=mode,
+            config_fingerprint=config_fingerprint,
+        )
         self._save(state)
         log.info("Paper soak started at %s", state.started_at.isoformat())
         return state
 
-    def restart(self, mode: str = "paper") -> SoakState:
+    def restart(self, mode: str = "paper", config_fingerprint: str = "") -> SoakState:
         """Reset the clock to now.
 
         Used after a change to entry or exit logic: soak days accumulated under
         different rules do not evidence the system that would go live.
         """
-        state = SoakState(started_at=datetime.now(UTC), mode=mode)
+        state = SoakState(
+            started_at=datetime.now(UTC),
+            mode=mode,
+            config_fingerprint=config_fingerprint,
+        )
         self._save(state)
         log.warning("Paper soak clock reset to %s", state.started_at.isoformat())
         return state

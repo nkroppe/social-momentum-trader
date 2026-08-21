@@ -27,6 +27,7 @@ class ExitReason(enum.StrEnum):
     TRAILING_STOP = "TRAILING_STOP"
     STOP_LOSS = "STOP_LOSS"
     ENTRY_RISK = "ENTRY_RISK"
+    STALE_TIME_STOP = "STALE_TIME_STOP"
     TIME_STOP = "TIME_STOP"
     KILL_SWITCH = "KILL_SWITCH"
     NONE = "NONE"
@@ -176,6 +177,9 @@ class Trade(Base):
     trailing_stop: Mapped[float] = mapped_column(Float, default=0.0)
     entry_fee_paid: Mapped[float] = mapped_column(Float, default=0.0)
     setup: Mapped[str] = mapped_column(String(64), default="")
+    config_fingerprint: Mapped[str] = mapped_column(String(64), default="", index=True)
+    exit_profile_label: Mapped[str] = mapped_column(String(64), default="")
+    exit_snapshot: Mapped[str] = mapped_column(Text, default="{}")
     time_stop_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
     exit_price: Mapped[float] = mapped_column(Float, default=0.0)
@@ -186,6 +190,23 @@ class Trade(Base):
     broker_entry_order_id: Mapped[str] = mapped_column(String(64), default="")
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    @property
+    def mfe_r(self) -> float:
+        if self.initial_risk_per_unit <= 0:
+            return 0.0
+        high = max(self.highest_price or self.entry_price, self.entry_price)
+        return max((high - self.entry_price) / self.initial_risk_per_unit, 0.0)
+
+    @property
+    def hold_hours(self) -> float:
+        end = self.closed_at or utcnow()
+        opened = self.opened_at
+        if opened.tzinfo is None:
+            opened = opened.replace(tzinfo=UTC)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=UTC)
+        return max((end - opened).total_seconds() / 3600.0, 0.0)
 
 
 class SecurityEvent(Base):

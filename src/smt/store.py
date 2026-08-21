@@ -67,6 +67,9 @@ _TRADE_COLUMNS = (
     ("trailing_stop", "FLOAT DEFAULT 0.0"),
     ("entry_fee_paid", "FLOAT DEFAULT 0.0"),
     ("setup", "VARCHAR(64) DEFAULT ''"),
+    ("config_fingerprint", "VARCHAR(64) DEFAULT ''"),
+    ("exit_profile_label", "VARCHAR(64) DEFAULT ''"),
+    ("exit_snapshot", "TEXT DEFAULT '{}'"),
 )
 
 
@@ -130,6 +133,7 @@ class Store:
         self._ensure_columns("shadow_decisions", _SHADOW_DECISION_COLUMNS)
         self._ensure_columns("trades", _TRADE_COLUMNS)
         self._ensure_shadow_trade_index()
+        self._ensure_trade_policy_index()
         self._backfill_advanced_exit_fields()
 
     def _ensure_shadow_trade_index(self) -> None:
@@ -141,12 +145,21 @@ class Store:
                 )
             )
 
+    def _ensure_trade_policy_index(self) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_trades_config_fingerprint "
+                    "ON trades (config_fingerprint)"
+                )
+            )
+
     def _ensure_exit_reason_values(self) -> None:
         """Extend the existing PostgreSQL enum before new exits can persist."""
         if self.engine.dialect.name != "postgresql":
             return
         with self.engine.begin() as conn:
-            for value in ("TRAILING_STOP", "ENTRY_RISK"):
+            for value in ("TRAILING_STOP", "ENTRY_RISK", "STALE_TIME_STOP"):
                 conn.execute(text(f"ALTER TYPE exitreason ADD VALUE IF NOT EXISTS '{value}'"))
 
     def _backfill_advanced_exit_fields(self) -> None:

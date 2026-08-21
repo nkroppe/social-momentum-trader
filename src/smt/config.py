@@ -110,23 +110,15 @@ class Settings(BaseSettings):
 # ----------------------------------------------------------------------------
 
 
-class RiskConfig(BaseModel):
-    max_position_pct: float = 0.10
-    risk_per_trade_pct: float = 0.005
-    max_open_positions: int = 3
-    max_trades_per_day: int = 8
-    daily_loss_halt_pct: float = -0.05
-    weekly_loss_halt_pct: float = -0.12
-    cooldown_minutes_after_stop: int = 120
+class ExitProfileConfig(BaseModel):
+    """Resolved exit behavior persisted with every opened trade."""
+
+    label: str = "default_v1"
+    mode: Literal["partial_trail", "bounded_target"] = "partial_trail"
     take_profit_pct: float = 0.06
     stop_loss_pct: float = 0.03
     time_stop_hours: int = 6
-    min_order_notional_usd: float = 25
-    assumed_fee_pct_per_side: float = 0.006
-
-    # Exit sizing. "atr" scales targets to each asset's own volatility so one
-    # rule fits both BTC and a sub-cent token; "fixed" uses the flat pcts above.
-    exit_style: str = "atr"
+    exit_style: Literal["atr", "fixed"] = "atr"
     atr_take_profit_mult: float = 2.0
     atr_stop_loss_mult: float = 1.0
     atr_min_stop_pct: float = 0.008
@@ -135,7 +127,95 @@ class RiskConfig(BaseModel):
     partial_take_profit_fraction: float = 0.50
     partial_take_profit_r: float = 1.5
     chandelier_atr_mult: float = 3.0
+    trail_granularity_seconds: int = 3_600
     stale_time_stop_hours: int = 4
+    stale_mfe_r: float = 1.0
+
+    @field_validator("time_stop_hours")
+    @classmethod
+    def _cap_time_stop(cls, v: int) -> int:
+        if v <= 0 or v > MAX_TIME_STOP_HOURS:
+            raise ValueError(f"time_stop_hours must be in 1..{MAX_TIME_STOP_HOURS}")
+        return v
+
+    @field_validator("partial_take_profit_fraction")
+    @classmethod
+    def _partial_fraction(cls, v: float) -> float:
+        if not 0.0 < v < 1.0:
+            raise ValueError("partial_take_profit_fraction must be within 0.0..<1.0")
+        return v
+
+    @field_validator(
+        "partial_take_profit_r",
+        "chandelier_atr_mult",
+        "atr_take_profit_mult",
+        "atr_stop_loss_mult",
+        "stale_mfe_r",
+    )
+    @classmethod
+    def _positive_multiplier(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("exit multipliers must be positive")
+        return v
+
+    @field_validator("trail_granularity_seconds")
+    @classmethod
+    def _positive_granularity(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("trail_granularity_seconds must be positive")
+        return v
+
+    @model_validator(mode="after")
+    def _valid_bounds(self) -> ExitProfileConfig:
+        if self.stale_time_stop_hours <= 0:
+            raise ValueError("stale_time_stop_hours must be positive")
+        if self.stale_time_stop_hours > self.time_stop_hours:
+            raise ValueError("stale_time_stop_hours cannot exceed time_stop_hours")
+        if not 0 < self.atr_min_stop_pct <= self.atr_max_stop_pct:
+            raise ValueError("ATR stop bounds must satisfy 0 < min <= max")
+        return self
+
+
+# Maximum allowed hold before a time-stop. The selected swing profile uses 120h.
+MAX_TIME_STOP_HOURS = 120
+_EXIT_FIELDS = tuple(ExitProfileConfig.model_fields)
+
+
+def _nest_exit_fields(data):
+    """Accept legacy flat exit keys while making ``exit`` canonical."""
+    if not isinstance(data, dict):
+        return data
+    values = dict(data)
+    nested = dict(values.get("exit") or {})
+    for field in _EXIT_FIELDS:
+        if field in values:
+            nested[field] = values.pop(field)
+    values["exit"] = nested
+    return values
+
+
+class _ExitAccessMixin:
+    """Temporary flat accessors for call-site compatibility."""
+
+    exit: ExitProfileConfig
+
+    def __getattr__(self, name: str):
+        if name in _EXIT_FIELDS:
+            return getattr(self.exit, name)
+        raise AttributeError(name)
+
+
+class RiskConfig(_ExitAccessMixin, BaseModel):
+    max_position_pct: float = 0.10
+    risk_per_trade_pct: float = 0.005
+    max_open_positions: int = 3
+    max_trades_per_day: int = 8
+    daily_loss_halt_pct: float = -0.05
+    weekly_loss_halt_pct: float = -0.12
+    cooldown_minutes_after_stop: int = 120
+    min_order_notional_usd: float = 25
+    assumed_fee_pct_per_side: float = 0.006
+    exit: ExitProfileConfig = Field(default_factory=ExitProfileConfig)
 
     # Signal entry thresholds
     signal_min_zscore: float = 2.5
@@ -155,12 +235,10 @@ class RiskConfig(BaseModel):
     confirm_lookback_hours: int = 4
     confirm_min_return_pct: float = 0.0
 
-    @field_validator("exit_style")
+    @model_validator(mode="before")
     @classmethod
-    def _valid_exit_style(cls, v: str) -> str:
-        if v not in ("atr", "fixed"):
-            raise ValueError("exit_style must be 'atr' or 'fixed'")
-        return v
+    def _legacy_flat_exit_fields(cls, data):
+        return _nest_exit_fields(data)
 
     @field_validator("risk_per_trade_pct")
     @classmethod
@@ -169,39 +247,8 @@ class RiskConfig(BaseModel):
             raise ValueError("fraction must be within 0.0..1.0")
         return v
 
-    @field_validator("partial_take_profit_fraction")
-    @classmethod
-    def _partial_fraction(cls, v: float) -> float:
-        if not 0.0 < v < 1.0:
-            raise ValueError("partial_take_profit_fraction must be within 0.0..<1.0")
-        return v
-
-    @field_validator("partial_take_profit_r", "chandelier_atr_mult")
-    @classmethod
-    def _positive_multiplier(cls, v: float) -> float:
-        if v <= 0:
-            raise ValueError("exit multipliers must be positive")
-        return v
-
-
-# Maximum allowed hold before a time-stop, across any strategy.
-MAX_TIME_STOP_HOURS = 72
-
 # Fields a strategy inherits from the global RiskConfig when not overridden.
 _INHERITED_FIELDS = (
-    "take_profit_pct",
-    "stop_loss_pct",
-    "time_stop_hours",
-    "exit_style",
-    "atr_take_profit_mult",
-    "atr_stop_loss_mult",
-    "atr_min_stop_pct",
-    "atr_max_stop_pct",
-    "advanced_exit_enabled",
-    "partial_take_profit_fraction",
-    "partial_take_profit_r",
-    "chandelier_atr_mult",
-    "stale_time_stop_hours",
     "signal_min_zscore",
     "signal_min_distinct_sources",
     "signal_min_distinct_authors",
@@ -275,7 +322,7 @@ class EntryRulesConfig(BaseModel):
         return self
 
 
-class StrategyConfig(BaseModel):
+class StrategyConfig(_ExitAccessMixin, BaseModel):
     """One trading methodology with its own capital slice, exits, and limits.
 
     Any field not set in strategies.yaml inherits from the global RiskConfig,
@@ -285,21 +332,9 @@ class StrategyConfig(BaseModel):
     name: str
     enabled: bool = True
     allocation: float = 0.5  # fraction of total equity this strategy manages
-
-    # Exit params
-    take_profit_pct: float
-    stop_loss_pct: float
-    time_stop_hours: int
-    exit_style: str
-    atr_take_profit_mult: float
-    atr_stop_loss_mult: float
-    atr_min_stop_pct: float
-    atr_max_stop_pct: float
-    advanced_exit_enabled: bool
-    partial_take_profit_fraction: float
-    partial_take_profit_r: float
-    chandelier_atr_mult: float
-    stale_time_stop_hours: int
+    regime_mode: Literal["risk_on_only", "risk_off_only", "any"] = "risk_on_only"
+    allowed_tickers: list[str] = Field(default_factory=list)
+    exit: ExitProfileConfig
 
     # Signal thresholds + scorer windowing
     signal_min_zscore: float
@@ -328,26 +363,16 @@ class StrategyConfig(BaseModel):
     assumed_fee_pct_per_side: float
     entry: EntryRulesConfig = Field(default_factory=EntryRulesConfig)
 
-    @field_validator("time_stop_hours")
-    @classmethod
-    def _cap_time_stop(cls, v: int) -> int:
-        if v <= 0 or v > MAX_TIME_STOP_HOURS:
-            raise ValueError(f"time_stop_hours must be in 1..{MAX_TIME_STOP_HOURS}")
-        return v
-
     @model_validator(mode="after")
-    def _valid_exit_times(self) -> StrategyConfig:
-        if self.stale_time_stop_hours <= 0:
-            raise ValueError("stale_time_stop_hours must be positive")
-        if self.stale_time_stop_hours > self.time_stop_hours:
-            raise ValueError("stale_time_stop_hours cannot exceed time_stop_hours")
+    def _valid_strategy(self) -> StrategyConfig:
         if not 0 < self.risk_per_trade_pct <= 1:
             raise ValueError("risk_per_trade_pct must be within 0.0..1.0")
-        if not 0 < self.partial_take_profit_fraction < 1:
-            raise ValueError("partial_take_profit_fraction must be within 0.0..<1.0")
-        if self.partial_take_profit_r <= 0 or self.chandelier_atr_mult <= 0:
-            raise ValueError("advanced exit multipliers must be positive")
         return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def _legacy_flat_exit_fields(cls, data):
+        return _nest_exit_fields(data)
 
     @field_validator("allocation")
     @classmethod
@@ -355,14 +380,6 @@ class StrategyConfig(BaseModel):
         if not (0.0 <= v <= 1.0):
             raise ValueError("allocation must be within 0.0..1.0")
         return v
-
-    @field_validator("exit_style")
-    @classmethod
-    def _valid_strategy_exit_style(cls, v: str) -> str:
-        if v not in ("atr", "fixed"):
-            raise ValueError("exit_style must be 'atr' or 'fixed'")
-        return v
-
 
 class StrategiesConfig(BaseModel):
     strategies: dict[str, StrategyConfig] = Field(default_factory=dict)
@@ -801,6 +818,7 @@ def get_strategies() -> StrategiesConfig:
     """
     risk = get_risk()
     inherited = {f: getattr(risk, f) for f in _INHERITED_FIELDS}
+    inherited["exit"] = risk.exit.model_dump()
 
     raw = _load_yaml("strategies.yaml")
     defs = (raw or {}).get("strategies") or {}
@@ -810,7 +828,13 @@ def get_strategies() -> StrategiesConfig:
     strategies: dict[str, StrategyConfig] = {}
     for name, override in defs.items():
         merged: dict = {**inherited, "name": name, "enabled": True, "allocation": 0.5}
-        merged.update(override or {})
+        override = dict(override or {})
+        exit_override = dict(override.pop("exit", {}) or {})
+        for field in _EXIT_FIELDS:
+            if field in override:
+                exit_override[field] = override.pop(field)
+        merged["exit"] = {**inherited["exit"], **exit_override}
+        merged.update(override)
         merged["name"] = name  # name is authoritative from the mapping key
         if "entry" not in merged:
             merged["entry"] = (
