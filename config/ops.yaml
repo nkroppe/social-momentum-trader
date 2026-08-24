@@ -5,10 +5,10 @@ soak:
   digest_interval_hours: 24
 
 preflight:
-  # Reddit access is intentionally disabled pending API approval; X is the
-  # production social source and mock data must remain disabled.
+  # Reddit is still unapproved. X ingest is paused (price-only paper); set
+  # both this and sources.x.enabled true together if social is turned back on.
   require_reddit: false
-  require_x: true
+  require_x: false
   require_alert_channel: true
   require_postgres: true
 

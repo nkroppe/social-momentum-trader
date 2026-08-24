@@ -280,16 +280,33 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
         )
 
     if ops.preflight.require_x:
-        x_ok = bool(settings.x_bearer_token)
+        if not sources.x.enabled:
+            results.append(
+                CheckResult(
+                    "x_enabled",
+                    False,
+                    "ops.preflight.require_x is true but sources.x.enabled is false",
+                )
+            )
+        else:
+            x_ok = bool(settings.x_bearer_token)
+            results.append(
+                CheckResult(
+                    "x_bearer_token",
+                    x_ok,
+                    "configured" if x_ok else "set X_BEARER_TOKEN",
+                )
+            )
+            if x_ok:
+                results.append(_x_budget_check(settings))
+    elif not sources.x.enabled:
         results.append(
             CheckResult(
-                "x_bearer_token",
-                x_ok,
-                "configured" if x_ok else "set X_BEARER_TOKEN",
+                "x_ingest",
+                True,
+                "paused (price-only; social is not in the live path)",
             )
         )
-        if x_ok:
-            results.append(_x_budget_check(settings))
 
     if ops.preflight.require_alert_channel:
         alerts = _alert_channel_configured(settings)

@@ -68,6 +68,29 @@ def test_trading_policy_fingerprint_is_deterministic_sha256():
     }
 
 
+def test_sources_only_change_keeps_soak_generation(tmp_path):
+    first = _policy()
+    paused = get_sources().model_copy(deep=True)
+    paused.x.enabled = not paused.x.enabled
+    second = _policy(sources=paused)
+    tracker = SoakTracker(tmp_path / "soak.json")
+
+    original = tracker.ensure_started(
+        fingerprint=first.fingerprint,
+        manifest=first.manifest,
+    )
+    updated = tracker.ensure_started(
+        fingerprint=second.fingerprint,
+        manifest=second.manifest,
+    )
+
+    assert updated.generation == original.generation
+    assert updated.started_at == original.started_at
+    assert updated.active_fingerprint == second.fingerprint
+    assert updated.manifest == second.manifest
+    assert (updated.history or []) == (original.history or [])
+
+
 def test_relevant_policy_change_starts_new_soak_generation(tmp_path):
     first = _policy()
     changed_risk = get_risk().model_copy(

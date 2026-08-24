@@ -12,6 +12,9 @@ from ..logging_setup import get_logger
 
 log = get_logger("smt.soak")
 MAX_PRIOR_GENERATIONS = 10
+# Ingest on/off (X/Reddit pause) changes evidence collection, not entry/exit/risk.
+# Keep the soak clock when those are the only section diffs.
+NON_RESETTING_SECTIONS = frozenset({"sources"})
 
 
 def _utc_datetime(value: str) -> datetime:
@@ -144,6 +147,18 @@ class SoakTracker:
         existing = self._load()
         if existing is not None:
             if fingerprint is None or existing.active_fingerprint == fingerprint:
+                return existing
+            next_manifest = dict(manifest or {})
+            changed = self._changed_sections(existing, next_manifest)
+            if set(changed) <= NON_RESETTING_SECTIONS:
+                existing.active_fingerprint = fingerprint
+                existing.manifest = next_manifest
+                self._save(existing)
+                log.info(
+                    "Paper soak generation %d kept (identity updated in place; changed=%s)",
+                    existing.generation,
+                    ",".join(changed),
+                )
                 return existing
             reason = (
                 "legacy state had no trading-policy fingerprint"

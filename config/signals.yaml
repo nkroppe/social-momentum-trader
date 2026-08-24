@@ -2,9 +2,8 @@
 
 default_tier: mid
 
-# P0 observation phase: social rules and L3 are evaluated and audited exactly,
-# but cannot reject, approve, boost, veto, or resize a paper candidate. Price
-# action and hard risk are authoritative. Change to enforce only after review.
+# Social rules stay in shadow (never enforce). X ingest is currently paused, so
+# this path is a no-op until sources.x.enabled is turned back on.
 social_decision_mode: shadow
 
 # Directional posts required before the bullish ratio is trusted as a gate.
