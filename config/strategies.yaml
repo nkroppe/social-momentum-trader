@@ -16,7 +16,7 @@ strategies:
   # Hours-to-intraday horizon. Active in RISK-ON.
   intraday:
     enabled: true
-    allocation: 0.40
+    allocation: 0.20
     regime_mode: risk_on_only
     exit:
       label: intraday_trend_v2
@@ -24,6 +24,7 @@ strategies:
       exit_style: atr
       atr_take_profit_mult: 2.0
       atr_stop_loss_mult: 1.0
+      atr_min_stop_pct: 0.02
       take_profit_pct: 0.06
       stop_loss_pct: 0.03
       partial_take_profit_fraction: 0.25
@@ -41,8 +42,10 @@ strategies:
     scorer_bucket_minutes: 30
     scorer_lookback_buckets: 8
     confirm_lookback_hours: 4
-    # Intraday is a 15m trigger aligned to a 1h EMA bias. Direct breakouts,
-    # retests, and (tier-permitting) VWAP reclaim pullbacks are distinct setups.
+    # Intraday is a 15m trigger aligned to a 1h EMA bias. Direct breakouts and
+    # (tier-permitting) VWAP reclaim pullbacks only; retests are disabled after
+    # the Aug 24–27 chop (0/5, −$47). Mid/micro require retest, so HYPE/ZEC/PUMP
+    # will not open on this sleeve until that policy changes.
     entry:
       setup_family: bull_breakout
       trigger_granularity_seconds: 900
@@ -60,16 +63,18 @@ strategies:
       retest_tolerance_pct: 0.003
       vwap_periods: 32
       allow_vwap_pullback: true
+      allow_breakout_retest: false
       require_trigger_ema_stack: true
       require_bias_ema_stack: true
       stop_atr_buffer: 0.25
-      min_stop_pct: 0.005
+      # 0.6%/side round-trip is 1.2%. A 0.5–1.3% stop printed ~−2R net.
+      min_stop_pct: 0.02
       max_stop_pct: 0.12
 
   # 1-3 day swing: longer hold, wider targets, stricter entry, longer lookback.
   swing:
     enabled: true
-    allocation: 0.40
+    allocation: 0.60
     regime_mode: risk_on_only
     exit:
       label: swing_trend_v2

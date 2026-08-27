@@ -168,6 +168,28 @@ def test_direct_breakout_and_required_retest_are_separate_setups():
     assert retest.metadata["relative_volume"] == pytest.approx(3.0)
 
 
+def test_disabled_retest_skips_retest_but_keeps_close_breakouts():
+    rules = EntryRulesConfig(
+        require_compression=False,
+        allow_vwap_pullback=False,
+        allow_breakout_retest=False,
+        min_stop_pct=0.02,
+    )
+    preferred = TierConfig(
+        social_policy="ignored", min_relative_volume=1.5, retest_policy="preferred"
+    )
+    required = preferred.model_copy(update={"retest_policy": "required"})
+    bias = _candles()
+
+    direct = detect_price_setup(_direct_breakout(), bias, rules, preferred, "intraday")
+    assert direct is not None
+    assert direct.name == "breakout_close"
+    assert direct.stop_pct >= 0.02
+    assert detect_price_setup(_retest(), bias, rules, preferred, "intraday") is None
+    assert detect_price_setup(_retest(), bias, rules, required, "intraday") is None
+    assert detect_price_setup(_direct_breakout(), bias, rules, required, "intraday") is None
+
+
 def test_swing_bias_rejects_bearish_stack_without_requiring_bullish_stack():
     rules = EntryRulesConfig(
         require_compression=False,
@@ -189,6 +211,9 @@ def test_intraday_and_swing_rules_are_structurally_distinct():
     assert strategies["intraday"].entry.trigger_granularity_seconds == 900
     assert strategies["intraday"].entry.bias_granularity_seconds == 3_600
     assert strategies["intraday"].entry.allow_vwap_pullback
+    assert not strategies["intraday"].entry.allow_breakout_retest
+    assert strategies["intraday"].entry.min_stop_pct == 0.02
+    assert strategies["intraday"].atr_min_stop_pct == 0.02
     assert not strategies["intraday"].entry.require_compression
     assert strategies["swing"].entry.trigger_granularity_seconds == 3_600
     assert strategies["swing"].entry.bias_granularity_seconds == 14_400

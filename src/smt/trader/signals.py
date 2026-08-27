@@ -319,7 +319,11 @@ def _detect_bull_breakout_setup(
     stop_reference = low
     rel_vol = relative_volume(trigger, rules.volume_lookback)
 
-    retest = _retest_setup(trigger, rules, tier.min_relative_volume)
+    retest = (
+        _retest_setup(trigger, rules, tier.min_relative_volume)
+        if rules.allow_breakout_retest
+        else None
+    )
     if retest is not None:
         setup_name = "breakout_retest"
         breakout_level, stop_reference, rel_vol, breakout_idx = retest

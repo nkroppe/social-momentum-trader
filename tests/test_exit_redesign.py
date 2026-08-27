@@ -29,7 +29,7 @@ def test_deployed_nested_profiles_and_allocations_are_exact():
     swing = strategies["swing"]
     bear = strategies["bear_rally"]
 
-    assert (intraday.allocation, swing.allocation, bear.allocation) == (0.40, 0.40, 0.20)
+    assert (intraday.allocation, swing.allocation, bear.allocation) == (0.20, 0.60, 0.20)
     assert (
         intraday.label,
         intraday.partial_take_profit_fraction,

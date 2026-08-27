@@ -445,6 +445,8 @@ class EntryRulesConfig(BaseModel):
     retest_tolerance_pct: float = 0.003
     vwap_periods: int = 32
     allow_vwap_pullback: bool = True
+    # When false, skip breakout_retest and only take close-breakouts / VWAP.
+    allow_breakout_retest: bool = True
     require_trigger_ema_stack: bool = True
     require_bias_ema_stack: bool = True
     # When the full 9>21>50 bias stack is off, still refuse a clearly bearish
