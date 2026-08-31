@@ -37,6 +37,9 @@ weekly_report:
   minute: 0
   state_file: ./data/weekly_report.json
   max_trades_listed: 40
+  # Sunday digest + LLM reflection only; not trade-open/close alerts.
+  extra_email_to:
+    - chief4861@agentmail.to
 
 # Advisory evidence thresholds for `smt shadow-report`. These deliberately
 # fail closed on short observation spans, count downtime, small outcome groups,

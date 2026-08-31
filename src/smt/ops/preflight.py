@@ -318,6 +318,21 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
             )
         )
 
+    extra_weekly = [addr.strip() for addr in ops.weekly_report.extra_email_to if addr.strip()]
+    if extra_weekly:
+        smtp_ok = bool(settings.smtp_host)
+        results.append(
+            CheckResult(
+                "weekly_extra_email",
+                smtp_ok,
+                (
+                    f"{len(extra_weekly)} recipient(s) via SMTP"
+                    if smtp_ok
+                    else "extra_email_to set but SMTP_HOST is missing"
+                ),
+            )
+        )
+
     from ..llm import get_llm
 
     llm = get_llm()

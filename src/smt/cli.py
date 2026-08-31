@@ -226,6 +226,9 @@ def _cmd_weekly_report(args: argparse.Namespace) -> int:
 
     if args.send:
         if r.alerter.notify(subject, body, critical=False):
+            extra = r.ops.weekly_report.extra_email_to
+            if extra and not r.alerter.notify_emails(subject, body, extra):
+                print("\nTelegram/alert copy sent; extra weekly email failed.")
             r.weekly.mark_sent(occurrence)
             print("\nReport dispatched to configured alert channels.")
         else:

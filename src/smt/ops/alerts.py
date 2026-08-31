@@ -6,6 +6,7 @@ Best-effort and non-fatal: alert delivery failures never crash the trader.
 from __future__ import annotations
 
 import smtplib
+from collections.abc import Sequence
 from email.mime.text import MIMEText
 
 import httpx
@@ -82,16 +83,27 @@ class Alerter:
 
         return ok if channels > 0 else False
 
+    def notify_emails(self, subject: str, body: str, recipients: Sequence[str]) -> bool:
+        """SMTP-only copies. Empty recipients is a no-op success."""
+        ok = True
+        for addr in recipients:
+            target = addr.strip()
+            if not target:
+                continue
+            ok = self._email(subject, body, to=target) and ok
+        return ok
+
     # ---- channels ----------------------------------------------------------
 
-    def _email(self, subject: str, body: str) -> bool:
-        if not (self.s.smtp_host and self.s.alert_email_to):
-            return True
+    def _email(self, subject: str, body: str, *, to: str | None = None) -> bool:
+        dest = (to or self.s.alert_email_to or "").strip()
+        if not (self.s.smtp_host and dest):
+            return to is None
         try:
             msg = MIMEText(body)
             msg["Subject"] = f"[smt] {subject}"
             msg["From"] = self.s.smtp_user or "smt@localhost"
-            msg["To"] = self.s.alert_email_to
+            msg["To"] = dest
             with smtplib.SMTP(self.s.smtp_host, self.s.smtp_port, timeout=15) as server:
                 server.starttls()
                 if self.s.smtp_user:

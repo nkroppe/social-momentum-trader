@@ -34,6 +34,7 @@ class LLMCoordinator:
         market: MarketConfig,
         *,
         offline: bool = False,
+        extra_email_to: list[str] | None = None,
     ):
         self.cfg = cfg
         self.store = store
@@ -41,6 +42,7 @@ class LLMCoordinator:
         self.strategies = strategies
         self.signals = signals
         self.market = market
+        self.extra_email_to = list(extra_email_to or [])
         self.enabled = bool(cfg.enabled and not offline)
         self.provider = CursorJSONProvider(cfg)
         self.judge = SparseL3Judge(cfg, self.provider)
@@ -244,6 +246,10 @@ class LLMCoordinator:
             )
             log.warning("LLM weekly reflection delivery failed; will retry")
             return
+        if self.extra_email_to and not self.alerter.notify_emails(
+            subject, body, self.extra_email_to
+        ):
+            log.warning("LLM weekly reflection extra email failed; Telegram copy already sent")
         self.unsent_reflection.unlink(missing_ok=True)
         log.info("Persisted LLM weekly reflection for %s", reflection.week_ending)
 

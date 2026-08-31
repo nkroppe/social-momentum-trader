@@ -288,3 +288,47 @@ def test_email_alert_uses_settings_smtp_fields(monkeypatch):
     assert calls["port"] == 2525
     assert calls["login"] == ("bot@example.com", "secret")
     assert calls["to"] == "me@example.com"
+
+
+def test_notify_emails_overrides_alert_email_to(monkeypatch):
+    from smt.config import Settings
+    from smt.ops.alerts import Alerter
+
+    settings = Settings(
+        smtp_host="smtp.example.com",
+        smtp_port=2525,
+        smtp_user="bot@example.com",
+        smtp_password="secret",
+        alert_email_to="alerts@example.com",
+    )
+    sent: list[str] = []
+
+    class FakeSMTP:
+        def __init__(self, host, port, timeout=None):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def starttls(self):
+            return None
+
+        def login(self, user, password):
+            return None
+
+        def send_message(self, msg):
+            sent.append(msg["To"])
+
+    monkeypatch.setattr("smt.ops.alerts.smtplib.SMTP", FakeSMTP)
+    assert Alerter(settings).notify_emails("subj", "body", ["copy@example.com"]) is True
+    assert sent == ["copy@example.com"]
+
+
+def test_notify_emails_empty_is_success():
+    from smt.config import Settings
+    from smt.ops.alerts import Alerter
+
+    assert Alerter(Settings()).notify_emails("subj", "body", []) is True

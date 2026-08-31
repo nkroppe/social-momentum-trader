@@ -772,6 +772,10 @@ class WeeklyReportConfig(BaseModel):
     state_file: str = "./data/weekly_report.json"
     # Cap the per-trade list; the rest are summarized as a count.
     max_trades_listed: int = 40
+    # Extra SMTP recipients for the Sunday report and LLM reflection only.
+    # Trade alerts still follow ALERT_EMAIL_TO. Empty means Telegram/alert
+    # channels only.
+    extra_email_to: list[str] = Field(default_factory=list)
 
     @field_validator("weekday")
     @classmethod

@@ -380,7 +380,9 @@ week's completed trades is sent on a schedule — by default Sunday 8 PM
 The schedule tracks local wall-clock time, so the hour holds across daylight
 saving instead of drifting. The last send is persisted, so a restart neither
 double-sends nor skips a week, and a report missed during downtime is delivered
-late rather than dropped.
+late rather than dropped. `weekly_report.extra_email_to` in `config/ops.yaml`
+adds SMTP copies of that Sunday digest and the LLM reflection (not trade
+alerts) to listed addresses such as the AgentMail inbox.
 
 Email and Telegram receive everything. ntfy stays reserved for critical events
 (kill switch, loss halts) so its urgent-priority push keeps its meaning.

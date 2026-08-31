@@ -187,6 +187,7 @@ class Runner:
             self.signals,
             self.market_cfg,
             offline=offline,
+            extra_email_to=self.ops.weekly_report.extra_email_to,
         )
         self._last_ingest = 0.0
         self._last_digest = 0.0
@@ -601,6 +602,12 @@ class Runner:
                 occurrence.isoformat(),
             )
             return
+        extra = self.ops.weekly_report.extra_email_to
+        if extra and not self.alerter.notify_emails(subject, body, extra):
+            log.warning(
+                "Weekly report extra email failed for %s; Telegram copy already sent",
+                occurrence.isoformat(),
+            )
         self.weekly.mark_sent(occurrence)
         log.info("Sent weekly report for week ending %s", occurrence.isoformat())
 
