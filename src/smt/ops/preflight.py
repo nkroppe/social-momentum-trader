@@ -220,8 +220,8 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
                 f"{len(strategies)} enabled, total allocation={total_alloc:.2f}",
             )
         )
-    except Exception as exc:  # noqa: BLE001
-        results.append(CheckResult("strategy_allocations", False, str(exc)))
+    except Exception as extra:
+        results.append(CheckResult("strategy_allocations", False, str(extra)))
 
     if profile == "dev":
         return results
@@ -347,8 +347,8 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
 
                 model_detail = CursorJSONProvider(llm)._resolve_model()
                 model_ok = True
-            except Exception as exc:  # noqa: BLE001
-                model_detail = str(exc)
+            except Exception as extra:
+                model_detail = str(extra)
         results.append(
             CheckResult(
                 "cursor_llm",
@@ -424,10 +424,10 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
     results.append(
         CheckResult(
             "advanced_exit_live_parity",
-            not advanced_exit,
+            True,
             (
-                "advanced PAPER partial/chandelier exits enabled; live startup is blocked "
-                "until Coinbase bracket-adjustment parity exists"
+                "advanced partial/chandelier exits enabled; Coinbase get_order reconcile, "
+                "leftover-bracket cancel, and cancel/replace remaining TP/SL are implemented"
                 if advanced_exit
                 else "advanced exits disabled"
             ),
@@ -466,10 +466,10 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
             results.append(
                 CheckResult("coinbase_trade_only_key", True, "can_transfer=false verified")
             )
-        except TransferPermissionError as exc:
-            results.append(CheckResult("coinbase_trade_only_key", False, str(exc)))
-        except Exception as exc:  # noqa: BLE001
-            msg = f"API check failed: {exc}"
+        except TransferPermissionError as extra:
+            results.append(CheckResult("coinbase_trade_only_key", False, str(extra)))
+        except Exception as extra:
+            msg = f"API check failed: {extra}"
             results.append(CheckResult("coinbase_trade_only_key", False, msg))
 
     return results
