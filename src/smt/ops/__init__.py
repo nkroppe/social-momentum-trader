@@ -5,6 +5,7 @@ from .killswitch import KillSwitch
 from .performance import EquityPoint, PerformanceTrade, calculate_performance
 from .preflight import CheckResult, all_passed, run_preflight
 from .reports import (
+    build_compare_report,
     build_weekly_report,
     trade_closed_alert,
     trade_opened_alert,
@@ -26,6 +27,7 @@ __all__ = [
     "all_passed",
     "run_preflight",
     "calculate_performance",
+    "build_compare_report",
     "build_weekly_report",
     "trade_closed_alert",
     "trade_opened_alert",
