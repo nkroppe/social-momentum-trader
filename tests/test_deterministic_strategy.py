@@ -993,7 +993,7 @@ def test_schema_migration_fields_and_live_preflight_block(tmp_path):
         "setup",
     } <= columns
     live = {result.name: result for result in run_preflight("live")}
-    assert not live["advanced_exit_live_parity"].passed
+    assert live["advanced_exit_live_parity"].passed
 
 
 def test_sqlite_legacy_two_column_dedup_is_rebuilt(tmp_path):
