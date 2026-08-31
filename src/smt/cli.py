@@ -113,24 +113,17 @@ def _cmd_status(_args: argparse.Namespace) -> int:
 
 def _cmd_compare(_args: argparse.Namespace) -> int:
     """Side-by-side performance of each strategy over the soak."""
+    from .ops.reports import build_compare_report
     from .run import Runner
 
     r = Runner()
-    print(f"Mode: {'LIVE' if r.settings.live else 'PAPER'}  |  Comparing strategies\n")
-    header = (
-        f"{'STRATEGY':<10}{'ALLOC':>7}{'ALLOC_EQ':>12}{'OPEN':>6}"
-        f"{'CLOSED':>8}{'WINRATE':>9}{'PNL':>10}{'PNL_24H':>10}{'AVG_HOLD_H':>12}"
-    )
-    print(header)
-    print("-" * len(header))
-    for st in r.strategies:
-        s = r.store.strategy_stats(st.name)
-        alloc_eq = r.manager.allocation_equity(st)
-        print(
-            f"{st.name:<10}{st.allocation:>6.0%} {alloc_eq:>11.2f}{s['open_positions']:>6}"
-            f"{s['closed_trades']:>8}{s['win_rate']:>8.0%} {s['total_pnl']:>9.2f}"
-            f"{s['day_pnl']:>10.2f}{s['avg_hold_hours']:>12.2f}"
+    print(
+        build_compare_report(
+            r.store,
+            [(st.name, st.allocation, r.manager.allocation_equity(st)) for st in r.strategies],
+            mode="LIVE" if r.settings.live else "PAPER",
         )
+    )
     return 0
 
 
