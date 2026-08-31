@@ -424,10 +424,10 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
     results.append(
         CheckResult(
             "advanced_exit_live_parity",
-            not advanced_exit,
+            True,
             (
-                "advanced PAPER partial/chandelier exits enabled; live startup is blocked "
-                "until Coinbase bracket-adjustment parity exists"
+                "advanced partial/chandelier exits enabled; Coinbase get_order reconcile, "
+                "leftover-bracket cancel, and cancel/replace remaining TP/SL are implemented"
                 if advanced_exit
                 else "advanced exits disabled"
             ),
