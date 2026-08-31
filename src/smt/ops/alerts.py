@@ -92,10 +92,10 @@ class Alerter:
             msg["Subject"] = f"[smt] {subject}"
             msg["From"] = self.s.smtp_user or "smt@localhost"
             msg["To"] = self.s.alert_email_to
-            with smtplib.SMTP(self.s.smtp_host, self.smtp_port, timeout=15) as server:
+            with smtplib.SMTP(self.s.smtp_host, self.s.smtp_port, timeout=15) as server:
                 server.starttls()
                 if self.s.smtp_user:
-                    server.login(self.s.smtp_user, self.smtp_password)
+                    server.login(self.s.smtp_user, self.s.smtp_password)
                 server.send_message(msg)
             return True
         except Exception as exc:  # noqa: BLE001

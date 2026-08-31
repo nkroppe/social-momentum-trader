@@ -18,7 +18,9 @@ reddit:
   limit_per_subreddit: 50
 
 x:
-  enabled: true
+  # Paused: paper book is price-action + risk only. Flip back on to resume
+  # cashtag counts/samples; keep require_x in ops.yaml in sync.
+  enabled: false
   # Accounts to watch (recent tweets from each). No @ prefix required.
   watch_accounts: []
   # Cashtag/keyword recent-search queries. Keep tight to control API spend.
@@ -31,8 +33,6 @@ x:
     - "$HYPE"
     - "$ZEC"
     - "$PUMP"
-    - "$BICO"
-    - "$CAP"
   counts_enabled: true
   count_window_minutes: 30
   count_granularity: minute

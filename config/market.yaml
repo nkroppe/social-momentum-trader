@@ -6,13 +6,35 @@
 candle_granularity_seconds: 3600   # 1h candles
 atr_periods: 14
 cache_ttl_seconds: 300             # re-fetch candles at most every 5 min
-price_cache_ttl_seconds: 20
+price_cache_ttl_seconds: 2
 request_timeout_seconds: 15
 unavailable_retry_seconds: 900     # back off products Coinbase does not list
 
-# Paper fills use real Coinbase quotes so soak results reflect the live market.
-# Set false for fully offline dev on a simulated random walk.
+# Deployed PAPER is executable and fail-closed: a fresh level-1 book and a
+# contiguous, newly closed one-minute feed are required. Random prices exist
+# only behind the explicit offline simulation path.
 paper_use_real_prices: true
+paper_quote_max_age_seconds: 10
+paper_bar_granularity_seconds: 60
+paper_bar_max_age_seconds: 300       # public closed-candle endpoint can lag several minutes
+paper_bar_cache_ttl_seconds: 10
+# Thin Coinbase books omit empty minutes. Fill up to N missing 1m bars with
+# flat zero-volume candles; larger holes still fail closed.
+paper_bar_gap_fill_enabled: true
+paper_bar_gap_fill_max_bars: 5
+paper_max_spread_bps: 40
+# Fallback when the product is not in the universe. Majors/large stay at $100;
+# mid/micro Coinbase books are thinner than that and were failing closed on
+# otherwise valid setups (PUMP ~$50 bid vs a $100 floor).
+paper_min_top_level_notional_usd: 100
+paper_min_top_level_notional_by_tier:
+  major: 100
+  large: 100
+  mid: 40
+  micro: 25
+paper_max_top_level_participation: 0.50
+paper_adverse_slippage_bps: 5
+candle_max_age_multiplier: 1.10
 
 # Hard production latch for the deterministic multi-timeframe setup engine.
 # Offline `smt simulate` disables this in memory; deployed runs fail closed.
@@ -27,16 +49,23 @@ confirmation:
   require_above_sma: true
   sma_periods: 24            # 24 x 1h = 1 day
   require_positive_return: true
-  min_volume_zscore: 0.0     # raise to ~1.0 to demand a real volume expansion
+  # 0.0 disables this extra 1h volume-z gate. Setup already requires
+  # tier-relative volume on the trigger bar; the z-score was rejecting
+  # those same prints (including a CAP breakout that then ran +10% in 4h).
+  min_volume_zscore: 0.0
   volume_periods: 24
 
 # Broad-market trend gate. Long-only alt momentum bleeds in a BTC downtrend.
+# RISK-ON = daily close above SMA50 AND BTC 4h not printing consecutive lower lows.
 regime:
   enabled: true
   benchmark_product_id: BTC-USD
   granularity_seconds: 86400   # daily candles
   sma_periods: 50
   fail_closed: true
+  require_no_lower_lows: true
+  structure_granularity_seconds: 14400  # 4h
+  structure_lower_lows_bars: 3
 
 # Equalize risk across a universe spanning BTC to sub-cent tokens. Scale is
 # capped at 1.0, so this only ever reduces size below max_position_pct.

@@ -74,19 +74,15 @@ class SparseL3Judge:
     def _key(context: dict[str, Any]) -> str:
         setup_id = context.get("setup_id")
         if setup_id:
-            social = json.dumps(
-                context.get("recent_social_posts", []),
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            )
+            # One Sonnet call per ticker/strategy/tier/trigger candle. Post
+            # mutations on the same closed bar must not burn the monthly cap
+            # (gen-5: three HYPE calls in 31 minutes on one 15m retest).
             stable = "|".join(
                 (
                     str(context.get("ticker", "")),
                     str(context.get("strategy", "")),
                     str(context.get("tier", "")),
                     str(setup_id),
-                    hashlib.sha256(social.encode("utf-8")).hexdigest()[:16],
                 )
             )
             return hashlib.sha256(stable.encode("utf-8")).hexdigest()[:24]

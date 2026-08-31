@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from calendar import monthrange
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -427,6 +428,7 @@ class XCollector:
             count_request_cost_usd=settings.x_recent_count_request_cost_usd,
         )
         self.count_observations: list[SocialCount] = []
+        self._setup_sample_at: dict[str, float] = {}
         self._client = httpx.Client(
             headers={"Authorization": f"Bearer {settings.x_bearer_token}"},
             timeout=30.0,
@@ -588,6 +590,45 @@ class XCollector:
             self.budget.budget_usd,
         )
         return self._parse_tweets(payload)
+
+    def sample_for_ticker(self, ticker: str) -> list[SocialEvent]:
+        """Fetch a post sample when a price setup appears and counts did not.
+
+        Count-anomaly sampling is the cheap default. Gen-5 still produced LLM
+        reviews with zero ``social_events`` because quiet windows never
+        crossed z/relative triggers. One sample per ticker per count window
+        keeps the dollar cap intact and gives the shadow ledger posts to label.
+        """
+        ticker = ticker.upper()
+        query = next((q for t, q in self._keyword_queries() if t == ticker), None)
+        if query is None:
+            return []
+        try:
+            if self.budget.remaining_usd <= 0 or self.budget.day_remaining_usd() <= 0:
+                return []
+        except BudgetStateUnavailable:
+            return []
+        cooldown = max(self.cfg.count_window_minutes, 1) * 60
+        now = time.monotonic()
+        last = self._setup_sample_at.get(ticker, 0.0)
+        if now - last < cooldown:
+            return []
+        try:
+            events = self._search(query, self.cfg.sample_size)
+        except ReadBudgetExhausted:
+            log.info("X dollar pace hit during setup sample for %s", ticker)
+            return []
+        except Exception as exc:  # noqa: BLE001
+            log.warning("x setup sample failed for %s: %s", ticker, exc)
+            return []
+        self._setup_sample_at[ticker] = now
+        log.info(
+            "x setup sample %s: %d events (cooldown %ds)",
+            ticker,
+            len(events),
+            cooldown,
+        )
+        return events
 
     def _count_window(self, now: datetime | None = None) -> tuple[datetime, datetime]:
         now = now or datetime.now(UTC)

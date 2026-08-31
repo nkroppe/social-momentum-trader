@@ -5,7 +5,17 @@ from __future__ import annotations
 import enum
 from datetime import UTC, datetime
 
-from sqlalchemy import DateTime, Enum, Float, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    DateTime,
+    Enum,
+    Float,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -27,6 +37,7 @@ class ExitReason(enum.StrEnum):
     TRAILING_STOP = "TRAILING_STOP"
     STOP_LOSS = "STOP_LOSS"
     ENTRY_RISK = "ENTRY_RISK"
+    STALE_TIME_STOP = "STALE_TIME_STOP"
     TIME_STOP = "TIME_STOP"
     KILL_SWITCH = "KILL_SWITCH"
     NONE = "NONE"
@@ -101,9 +112,8 @@ class ShadowDecision(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     decision_key: Mapped[str] = mapped_column(String(64), unique=True, index=True)
-    trade_id: Mapped[int | None] = mapped_column(
-        Integer, default=0, nullable=True, index=True
-    )
+    opportunity_key: Mapped[str] = mapped_column(String(64), default="", index=True)
+    trade_id: Mapped[int | None] = mapped_column(Integer, default=0, nullable=True, index=True)
     ticker: Mapped[str] = mapped_column(String(16), index=True)
     strategy: Mapped[str] = mapped_column(String(16), index=True)
     tier: Mapped[str] = mapped_column(String(16), default="")
@@ -122,8 +132,96 @@ class ShadowDecision(Base):
     )
     risk_status: Mapped[str] = mapped_column(String(32), default="")
     risk_reason: Mapped[str] = mapped_column(Text, default="")
-    first_evaluated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow
+    first_evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, index=True
+    )
+
+
+class OpportunityDecision(Base):
+    """Prospective, candle-keyed audit of every symbol evaluation."""
+
+    __tablename__ = "opportunity_decisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "ledger_version",
+            "config_fingerprint",
+            "run_id",
+            "strategy",
+            "ticker",
+            "trigger_candle_ts",
+            name="uq_opportunity_evaluation",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    opportunity_key: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    ledger_version: Mapped[int] = mapped_column(Integer, default=1)
+    config_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    run_id: Mapped[str] = mapped_column(String(64), index=True)
+    strategy: Mapped[str] = mapped_column(String(16), index=True)
+    ticker: Mapped[str] = mapped_column(String(16), index=True)
+    product_id: Mapped[str] = mapped_column(String(32))
+    tier: Mapped[str] = mapped_column(String(16), default="")
+    trigger_granularity_seconds: Mapped[int] = mapped_column(Integer)
+    trigger_candle_ts: Mapped[int] = mapped_column(BigInteger, index=True)
+    trigger_closed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+    outcome_status: Mapped[str] = mapped_column(String(32), index=True)
+    outcome_reason: Mapped[str] = mapped_column(Text, default="")
+    regime_status: Mapped[str] = mapped_column(String(32), default="")
+    regime_reason: Mapped[str] = mapped_column(Text, default="")
+    price_status: Mapped[str] = mapped_column(String(32), default="")
+    price_reason: Mapped[str] = mapped_column(Text, default="")
+    setup_status: Mapped[str] = mapped_column(String(32), default="")
+    setup_name: Mapped[str] = mapped_column(String(64), default="")
+    setup_reason: Mapped[str] = mapped_column(Text, default="")
+    confirmation_status: Mapped[str] = mapped_column(String(32), default="")
+    confirmation_reason: Mapped[str] = mapped_column(Text, default="")
+    social_status: Mapped[str] = mapped_column(String(32), default="")
+    social_reason: Mapped[str] = mapped_column(Text, default="")
+    llm_status: Mapped[str] = mapped_column(String(32), default="")
+    llm_score: Mapped[float] = mapped_column(Float, default=0.0)
+    llm_veto: Mapped[bool] = mapped_column(default=False)
+    llm_reason: Mapped[str] = mapped_column(Text, default="")
+    risk_status: Mapped[str] = mapped_column(String(32), default="")
+    risk_reason: Mapped[str] = mapped_column(Text, default="")
+    execution_status: Mapped[str] = mapped_column(String(32), default="")
+    execution_reason: Mapped[str] = mapped_column(Text, default="")
+
+    feature_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    proposed_entry_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    proposed_stop_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    proposed_notional_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    proposed_risk_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    portfolio_equity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    portfolio_existing_heat: Mapped[float | None] = mapped_column(Float, nullable=True)
+    portfolio_proposed_heat: Mapped[float | None] = mapped_column(Float, nullable=True)
+    portfolio_gross_exposure: Mapped[float | None] = mapped_column(Float, nullable=True)
+    portfolio_symbol_exposure: Mapped[float | None] = mapped_column(Float, nullable=True)
+    portfolio_micro_exposure: Mapped[float | None] = mapped_column(Float, nullable=True)
+    shadow_decision_key: Mapped[str] = mapped_column(String(64), default="", index=True)
+    trade_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+
+    return_1h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mae_1h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mfe_1h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    outcome_1h_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    return_4h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mae_4h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mfe_4h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    outcome_4h_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    return_24h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mae_24h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mfe_24h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    outcome_24h_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    return_72h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mae_72h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mfe_72h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    outcome_72h_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    evaluated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow, index=True
@@ -176,6 +274,10 @@ class Trade(Base):
     trailing_stop: Mapped[float] = mapped_column(Float, default=0.0)
     entry_fee_paid: Mapped[float] = mapped_column(Float, default=0.0)
     setup: Mapped[str] = mapped_column(String(64), default="")
+    last_processed_paper_bar_ts: Mapped[int] = mapped_column(BigInteger, default=0)
+    config_fingerprint: Mapped[str] = mapped_column(String(64), default="", index=True)
+    exit_profile_label: Mapped[str] = mapped_column(String(64), default="")
+    exit_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     time_stop_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
     exit_price: Mapped[float] = mapped_column(Float, default=0.0)

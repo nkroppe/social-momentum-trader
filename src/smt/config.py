@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -44,9 +44,14 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data/smt.sqlite"
 
     # Starting equity used for paper sizing / loss-halt math.
-    paper_start_equity: float = 5000.0
+    paper_start_equity: float = 10_000.0
     # Poll cadence for the main trade loop (exit checks).
     loop_interval_seconds: int = 60
+
+    # Read-only web dashboard (`smt dashboard`). Token is required when binding
+    # a non-loopback address or when DASHBOARD_REQUIRE_AUTH=true (Docker default).
+    dashboard_token: str = ""
+    dashboard_require_auth: bool = False
 
     # Coinbase (trade-only key)
     coinbase_api_key: str = ""
@@ -110,23 +115,38 @@ class Settings(BaseSettings):
 # ----------------------------------------------------------------------------
 
 
-class RiskConfig(BaseModel):
-    max_position_pct: float = 0.10
-    risk_per_trade_pct: float = 0.005
-    max_open_positions: int = 3
-    max_trades_per_day: int = 8
-    daily_loss_halt_pct: float = -0.05
-    weekly_loss_halt_pct: float = -0.12
-    cooldown_minutes_after_stop: int = 120
+MAX_TIME_STOP_HOURS = 120
+
+EXIT_PROFILE_FIELDS = (
+    "label",
+    "mode",
+    "take_profit_pct",
+    "stop_loss_pct",
+    "time_stop_hours",
+    "exit_style",
+    "atr_take_profit_mult",
+    "atr_stop_loss_mult",
+    "atr_min_stop_pct",
+    "atr_max_stop_pct",
+    "advanced_exit_enabled",
+    "partial_take_profit_fraction",
+    "partial_take_profit_r",
+    "chandelier_atr_mult",
+    "trail_granularity_seconds",
+    "stale_time_stop_hours",
+    "stale_mfe_r",
+)
+
+
+class ExitProfileConfig(BaseModel):
+    """Canonical, fully-resolved exit policy persisted with each new trade."""
+
+    label: str = "legacy_default"
+    mode: Literal["partial_trail", "bounded_target"] = "partial_trail"
     take_profit_pct: float = 0.06
     stop_loss_pct: float = 0.03
     time_stop_hours: int = 6
-    min_order_notional_usd: float = 25
-    assumed_fee_pct_per_side: float = 0.006
-
-    # Exit sizing. "atr" scales targets to each asset's own volatility so one
-    # rule fits both BTC and a sub-cent token; "fixed" uses the flat pcts above.
-    exit_style: str = "atr"
+    exit_style: Literal["atr", "fixed"] = "atr"
     atr_take_profit_mult: float = 2.0
     atr_stop_loss_mult: float = 1.0
     atr_min_stop_pct: float = 0.008
@@ -135,7 +155,173 @@ class RiskConfig(BaseModel):
     partial_take_profit_fraction: float = 0.50
     partial_take_profit_r: float = 1.5
     chandelier_atr_mult: float = 3.0
+    trail_granularity_seconds: int = 900
     stale_time_stop_hours: int = 4
+    stale_mfe_r: float = 1.0
+
+    @field_validator("label")
+    @classmethod
+    def _nonempty_label(cls, value: str) -> str:
+        label = value.strip()
+        if not label:
+            raise ValueError("exit profile label cannot be empty")
+        return label
+
+    @field_validator("time_stop_hours")
+    @classmethod
+    def _cap_time_stop(cls, value: int) -> int:
+        if value <= 0 or value > MAX_TIME_STOP_HOURS:
+            raise ValueError(f"time_stop_hours must be in 1..{MAX_TIME_STOP_HOURS}")
+        return value
+
+    @field_validator("trail_granularity_seconds", "stale_time_stop_hours")
+    @classmethod
+    def _positive_period(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("exit time settings must be positive")
+        return value
+
+    @field_validator("partial_take_profit_fraction")
+    @classmethod
+    def _partial_fraction(cls, value: float) -> float:
+        if not 0.0 < value < 1.0:
+            raise ValueError("partial_take_profit_fraction must be within 0.0..<1.0")
+        return value
+
+    @field_validator(
+        "partial_take_profit_r",
+        "chandelier_atr_mult",
+        "atr_take_profit_mult",
+        "atr_stop_loss_mult",
+    )
+    @classmethod
+    def _positive_multiplier(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("exit multipliers must be positive")
+        return value
+
+    @field_validator("stale_mfe_r")
+    @classmethod
+    def _nonnegative_mfe(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("stale_mfe_r must be non-negative")
+        return value
+
+    @model_validator(mode="after")
+    def _valid_profile(self) -> ExitProfileConfig:
+        if self.stale_time_stop_hours > self.time_stop_hours:
+            raise ValueError("stale_time_stop_hours cannot exceed time_stop_hours")
+        if not 0 < self.atr_min_stop_pct <= self.atr_max_stop_pct:
+            raise ValueError("ATR stop bounds must satisfy 0 < min <= max")
+        return self
+
+
+def _nested_exit_values(value: Any) -> Any:
+    """Translate legacy flat model input to the canonical nested profile."""
+    if not isinstance(value, dict):
+        return value
+    values = dict(value)
+    interim_nested = dict(values.pop("exit_profile", {}) or {})
+    canonical_nested = dict(values.pop("exit", {}) or {})
+    nested: dict[str, Any] = {}
+    for field in EXIT_PROFILE_FIELDS:
+        if field in values:
+            nested[field] = values.pop(field)
+    nested.update(interim_nested)
+    nested.update(canonical_nested)
+    if nested:
+        values["exit_profile"] = nested
+    return values
+
+
+class _ExitProfileAccess:
+    """Backward-compatible Python access for the former flat fields."""
+
+    @property
+    def label(self) -> str:
+        return self.exit_profile.label
+
+    @property
+    def mode(self) -> str:
+        return self.exit_profile.mode
+
+    @property
+    def take_profit_pct(self) -> float:
+        return self.exit_profile.take_profit_pct
+
+    @property
+    def stop_loss_pct(self) -> float:
+        return self.exit_profile.stop_loss_pct
+
+    @property
+    def time_stop_hours(self) -> int:
+        return self.exit_profile.time_stop_hours
+
+    @property
+    def exit_style(self) -> str:
+        return self.exit_profile.exit_style
+
+    @property
+    def atr_take_profit_mult(self) -> float:
+        return self.exit_profile.atr_take_profit_mult
+
+    @property
+    def atr_stop_loss_mult(self) -> float:
+        return self.exit_profile.atr_stop_loss_mult
+
+    @property
+    def atr_min_stop_pct(self) -> float:
+        return self.exit_profile.atr_min_stop_pct
+
+    @property
+    def atr_max_stop_pct(self) -> float:
+        return self.exit_profile.atr_max_stop_pct
+
+    @property
+    def advanced_exit_enabled(self) -> bool:
+        return self.exit_profile.advanced_exit_enabled
+
+    @property
+    def partial_take_profit_fraction(self) -> float:
+        return self.exit_profile.partial_take_profit_fraction
+
+    @property
+    def partial_take_profit_r(self) -> float:
+        return self.exit_profile.partial_take_profit_r
+
+    @property
+    def chandelier_atr_mult(self) -> float:
+        return self.exit_profile.chandelier_atr_mult
+
+    @property
+    def trail_granularity_seconds(self) -> int:
+        return self.exit_profile.trail_granularity_seconds
+
+    @property
+    def stale_time_stop_hours(self) -> int:
+        return self.exit_profile.stale_time_stop_hours
+
+    @property
+    def stale_mfe_r(self) -> float:
+        return self.exit_profile.stale_mfe_r
+
+
+class RiskConfig(_ExitProfileAccess, BaseModel):
+    max_position_pct: float = 0.10
+    risk_per_trade_pct: float = 0.005
+    max_aggregate_open_heat_pct: float = 0.02
+    max_gross_exposure_pct: float = 0.50
+    max_combined_symbol_exposure_pct: float = 0.10
+    max_micro_exposure_pct: float = 0.15
+    max_open_positions: int = 3
+    max_trades_per_day: int = 8
+    daily_loss_halt_pct: float = -0.05
+    weekly_loss_halt_pct: float = -0.12
+    cooldown_minutes_after_stop: int = 120
+    min_order_notional_usd: float = 25
+    assumed_fee_pct_per_side: float = 0.006
+
+    exit_profile: ExitProfileConfig = Field(default_factory=ExitProfileConfig)
 
     # Signal entry thresholds
     signal_min_zscore: float = 2.5
@@ -155,12 +341,10 @@ class RiskConfig(BaseModel):
     confirm_lookback_hours: int = 4
     confirm_min_return_pct: float = 0.0
 
-    @field_validator("exit_style")
+    @model_validator(mode="before")
     @classmethod
-    def _valid_exit_style(cls, v: str) -> str:
-        if v not in ("atr", "fixed"):
-            raise ValueError("exit_style must be 'atr' or 'fixed'")
-        return v
+    def _flat_exit_compatibility(cls, value: Any) -> Any:
+        return _nested_exit_values(value)
 
     @field_validator("risk_per_trade_pct")
     @classmethod
@@ -169,23 +353,35 @@ class RiskConfig(BaseModel):
             raise ValueError("fraction must be within 0.0..1.0")
         return v
 
-    @field_validator("partial_take_profit_fraction")
+    @field_validator(
+        "max_aggregate_open_heat_pct",
+        "max_gross_exposure_pct",
+        "max_combined_symbol_exposure_pct",
+        "max_micro_exposure_pct",
+    )
     @classmethod
-    def _partial_fraction(cls, v: float) -> float:
-        if not 0.0 < v < 1.0:
-            raise ValueError("partial_take_profit_fraction must be within 0.0..<1.0")
+    def _global_risk_fraction(cls, v: float) -> float:
+        if not 0.0 < v <= 1.0:
+            raise ValueError("global risk fractions must be within 0.0..1.0")
         return v
 
-    @field_validator("partial_take_profit_r", "chandelier_atr_mult")
+    @field_validator("assumed_fee_pct_per_side")
     @classmethod
-    def _positive_multiplier(cls, v: float) -> float:
-        if v <= 0:
-            raise ValueError("exit multipliers must be positive")
+    def _valid_fee(cls, v: float) -> float:
+        if not 0.0 <= v < 1.0:
+            raise ValueError("assumed_fee_pct_per_side must be within 0.0..<1.0")
         return v
 
+    @model_validator(mode="after")
+    def _valid_global_exposure_caps(self) -> RiskConfig:
+        if self.max_aggregate_open_heat_pct > self.max_gross_exposure_pct:
+            raise ValueError("aggregate open heat cannot exceed gross exposure cap")
+        if self.max_combined_symbol_exposure_pct > self.max_gross_exposure_pct:
+            raise ValueError("combined symbol exposure cannot exceed gross exposure cap")
+        if self.max_micro_exposure_pct > self.max_gross_exposure_pct:
+            raise ValueError("micro exposure cannot exceed gross exposure cap")
+        return self
 
-# Maximum allowed hold before a time-stop, across any strategy.
-MAX_TIME_STOP_HOURS = 72
 
 # Fields a strategy inherits from the global RiskConfig when not overridden.
 _INHERITED_FIELDS = (
@@ -228,12 +424,18 @@ _INHERITED_FIELDS = (
 class EntryRulesConfig(BaseModel):
     """Deterministic price-action rules for one holding methodology."""
 
+    # bull_breakout: EMA stack + RSI floor + breakout/retest/VWAP.
+    # bear_rally: RISK-OFF relief setups (RSI reclaim, failed breakdown, RS bounce).
+    setup_family: Literal["bull_breakout", "bear_rally"] = "bull_breakout"
     trigger_granularity_seconds: int = 900
     bias_granularity_seconds: int = 3_600
     breakout_lookback: int = 20
     structure_lookback: int = 20
     rsi_periods: int = 14
     rsi_min: float = 55.0
+    rsi_oversold_max: float = 35.0
+    rsi_reclaim_min: float = 45.0
+    rsi_lookback_bars: int = 8
     volume_lookback: int = 20
     compression_lookback: int = 20
     compression_recent: int = 5
@@ -243,8 +445,21 @@ class EntryRulesConfig(BaseModel):
     retest_tolerance_pct: float = 0.003
     vwap_periods: int = 32
     allow_vwap_pullback: bool = True
+    # When false, skip breakout_retest and only take close-breakouts / VWAP.
+    allow_breakout_retest: bool = True
     require_trigger_ema_stack: bool = True
     require_bias_ema_stack: bool = True
+    # When the full 9>21>50 bias stack is off, still refuse a clearly bearish
+    # 9<21<50 stack so swing can fire in a grind without longing into 4h dump.
+    reject_bearish_bias_stack: bool = False
+    allow_rsi_reclaim: bool = True
+    allow_failed_breakdown: bool = True
+    allow_rs_bounce: bool = True
+    failed_breakdown_lookback: int = 20
+    rs_lookback_bars: int = 16
+    rs_min_outperformance_pct: float = 0.01
+    max_chase_return_pct: float = 0.05
+    chase_lookback_bars: int = 4
     stop_atr_buffer: float = 0.25
     min_stop_pct: float = 0.005
     max_stop_pct: float = 0.15
@@ -254,11 +469,15 @@ class EntryRulesConfig(BaseModel):
         "breakout_lookback",
         "structure_lookback",
         "rsi_periods",
+        "rsi_lookback_bars",
         "volume_lookback",
         "compression_lookback",
         "compression_recent",
         "retest_window",
         "vwap_periods",
+        "failed_breakdown_lookback",
+        "rs_lookback_bars",
+        "chase_lookback_bars",
     )
     @classmethod
     def _positive_period(cls, v: int) -> int:
@@ -272,10 +491,22 @@ class EntryRulesConfig(BaseModel):
             raise ValueError("entry stop bounds must satisfy 0 < min <= max")
         if not 0 < self.max_entry_slippage_pct <= 0.05:
             raise ValueError("max_entry_slippage_pct must be within 0..5%")
+        if not 0 <= self.rsi_oversold_max <= self.rsi_reclaim_min <= 100:
+            raise ValueError("rsi_oversold_max must be <= rsi_reclaim_min within 0..100")
+        if self.max_chase_return_pct < 0 or self.rs_min_outperformance_pct < 0:
+            raise ValueError("chase/RS thresholds must be non-negative")
         return self
 
 
-class StrategyConfig(BaseModel):
+class StrategyConfirmationConfig(BaseModel):
+    """Optional per-strategy overrides of market.yaml confirmation gates."""
+
+    require_above_sma: bool | None = None
+    require_positive_return: bool | None = None
+    min_volume_zscore: float | None = None
+
+
+class StrategyConfig(_ExitProfileAccess, BaseModel):
     """One trading methodology with its own capital slice, exits, and limits.
 
     Any field not set in strategies.yaml inherits from the global RiskConfig,
@@ -285,21 +516,16 @@ class StrategyConfig(BaseModel):
     name: str
     enabled: bool = True
     allocation: float = 0.5  # fraction of total equity this strategy manages
+    # risk_on_only: enter only when BTC > SMA50 (default bull strategies).
+    # risk_off_only: enter only when BTC <= SMA50 (bear_rally).
+    # always: ignore the benchmark gate.
+    regime_mode: Literal["risk_on_only", "risk_off_only", "always"] = "risk_on_only"
+    # Empty lists mean no extra filter (full tradeable universe).
+    allowed_tickers: list[str] = Field(default_factory=list)
+    allowed_tiers: list[str] = Field(default_factory=list)
+    confirmation: StrategyConfirmationConfig = Field(default_factory=StrategyConfirmationConfig)
 
-    # Exit params
-    take_profit_pct: float
-    stop_loss_pct: float
-    time_stop_hours: int
-    exit_style: str
-    atr_take_profit_mult: float
-    atr_stop_loss_mult: float
-    atr_min_stop_pct: float
-    atr_max_stop_pct: float
-    advanced_exit_enabled: bool
-    partial_take_profit_fraction: float
-    partial_take_profit_r: float
-    chandelier_atr_mult: float
-    stale_time_stop_hours: int
+    exit_profile: ExitProfileConfig
 
     # Signal thresholds + scorer windowing
     signal_min_zscore: float
@@ -328,25 +554,25 @@ class StrategyConfig(BaseModel):
     assumed_fee_pct_per_side: float
     entry: EntryRulesConfig = Field(default_factory=EntryRulesConfig)
 
-    @field_validator("time_stop_hours")
+    @model_validator(mode="before")
     @classmethod
-    def _cap_time_stop(cls, v: int) -> int:
-        if v <= 0 or v > MAX_TIME_STOP_HOURS:
-            raise ValueError(f"time_stop_hours must be in 1..{MAX_TIME_STOP_HOURS}")
-        return v
+    def _flat_exit_compatibility(cls, value: Any) -> Any:
+        return _nested_exit_values(value)
+
+    @field_validator("allowed_tickers")
+    @classmethod
+    def _normalize_tickers(cls, values: list[str]) -> list[str]:
+        return [str(value).strip().upper() for value in values if str(value).strip()]
+
+    @field_validator("allowed_tiers")
+    @classmethod
+    def _normalize_tiers(cls, values: list[str]) -> list[str]:
+        return [str(value).strip().lower() for value in values if str(value).strip()]
 
     @model_validator(mode="after")
     def _valid_exit_times(self) -> StrategyConfig:
-        if self.stale_time_stop_hours <= 0:
-            raise ValueError("stale_time_stop_hours must be positive")
-        if self.stale_time_stop_hours > self.time_stop_hours:
-            raise ValueError("stale_time_stop_hours cannot exceed time_stop_hours")
         if not 0 < self.risk_per_trade_pct <= 1:
             raise ValueError("risk_per_trade_pct must be within 0.0..1.0")
-        if not 0 < self.partial_take_profit_fraction < 1:
-            raise ValueError("partial_take_profit_fraction must be within 0.0..<1.0")
-        if self.partial_take_profit_r <= 0 or self.chandelier_atr_mult <= 0:
-            raise ValueError("advanced exit multipliers must be positive")
         return self
 
     @field_validator("allocation")
@@ -356,12 +582,18 @@ class StrategyConfig(BaseModel):
             raise ValueError("allocation must be within 0.0..1.0")
         return v
 
-    @field_validator("exit_style")
-    @classmethod
-    def _valid_strategy_exit_style(cls, v: str) -> str:
-        if v not in ("atr", "fixed"):
-            raise ValueError("exit_style must be 'atr' or 'fixed'")
-        return v
+    def regime_allows_entries(self, risk_on: bool, *, risk_off: bool = False) -> bool:
+        """Whether the BTC SMA regime state permits new entries for this strategy.
+
+        ``risk_on`` is the full bull gate (above SMA + structure). ``risk_off`` is
+        specifically daily close at/below SMA — not merely ``not risk_on``, which
+        also covers structure blocks and missing history.
+        """
+        if self.regime_mode == "always":
+            return True
+        if self.regime_mode == "risk_off_only":
+            return risk_off
+        return risk_on
 
 
 class StrategiesConfig(BaseModel):
@@ -404,6 +636,13 @@ class UniverseConfig(BaseModel):
     def tier_of(self, ticker: str, default: str = "mid") -> str:
         spec = self.symbols.get(ticker)
         return spec.tier if spec else default
+
+    def tier_of_product(self, product_id: str) -> str | None:
+        """Liquidity tier for a Coinbase product id, or None if unknown."""
+        for spec in self.symbols.values():
+            if spec.product_id == product_id:
+                return spec.tier
+        return None
 
 
 class RedditSource(BaseModel):
@@ -503,6 +742,21 @@ class TradeAlertsConfig(BaseModel):
     on_close: bool = True
 
 
+class TelegramControlConfig(BaseModel):
+    """Inbound Telegram commands that trip or clear the kill switch."""
+
+    enabled: bool = True
+    state_file: str = "./data/telegram_control.json"
+    request_timeout_seconds: float = 5.0
+
+    @field_validator("request_timeout_seconds")
+    @classmethod
+    def _positive_timeout(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("request_timeout_seconds must be positive")
+        return value
+
+
 WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
 
@@ -571,9 +825,7 @@ class ShadowReportConfig(BaseModel):
             raise ValueError("shadow report readiness counts must be positive")
         return value
 
-    @field_validator(
-        "min_count_coverage", "min_llm_completion_rate", "max_llm_error_rate"
-    )
+    @field_validator("min_count_coverage", "min_llm_completion_rate", "max_llm_error_rate")
     @classmethod
     def _readiness_fraction(cls, value: float) -> float:
         if not 0.0 <= value <= 1.0:
@@ -592,6 +844,7 @@ class OpsConfig(BaseModel):
     soak: SoakOpsConfig = Field(default_factory=SoakOpsConfig)
     preflight: PreflightConfig = Field(default_factory=PreflightConfig)
     trade_alerts: TradeAlertsConfig = Field(default_factory=TradeAlertsConfig)
+    telegram_control: TelegramControlConfig = Field(default_factory=TelegramControlConfig)
     weekly_report: WeeklyReportConfig = Field(default_factory=WeeklyReportConfig)
     shadow_report: ShadowReportConfig = Field(default_factory=ShadowReportConfig)
 
@@ -615,13 +868,35 @@ class ConfirmationConfig(BaseModel):
 
 
 class RegimeConfig(BaseModel):
-    """Benchmark trend filter: block new longs in a broad downtrend."""
+    """Benchmark trend filter: block new longs in a broad downtrend.
+
+    RISK-ON requires the daily close above SMA(sma_periods). When
+    ``require_no_lower_lows`` is set, consecutive lower lows on the structure
+    timeframe (default 4h) also block RISK-ON — so alts are not bought into a
+    BTC breakdown that the daily SMA has not yet flipped.
+    """
 
     enabled: bool = True
     benchmark_product_id: str = "BTC-USD"
     granularity_seconds: int = 86_400
     sma_periods: int = 50
     fail_closed: bool = True
+    require_no_lower_lows: bool = True
+    structure_granularity_seconds: int = 14_400  # 4h
+    structure_lower_lows_bars: int = 3
+
+    @field_validator("structure_granularity_seconds", "structure_lower_lows_bars", "sma_periods")
+    @classmethod
+    def _positive_regime_periods(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("regime period settings must be positive")
+        return value
+
+    @model_validator(mode="after")
+    def _valid_lower_lows(self) -> RegimeConfig:
+        if self.require_no_lower_lows and self.structure_lower_lows_bars < 2:
+            raise ValueError("structure_lower_lows_bars must be >= 2 when enabled")
+        return self
 
 
 class VolSizingConfig(BaseModel):
@@ -641,17 +916,81 @@ class MarketConfig(BaseModel):
     candle_granularity_seconds: int = 3_600
     atr_periods: int = 14
     cache_ttl_seconds: int = 300
-    price_cache_ttl_seconds: int = 20
+    price_cache_ttl_seconds: int = 2
     request_timeout_seconds: float = 15.0
     unavailable_retry_seconds: int = 900
     # Paper fills price off real Coinbase quotes so soak results reflect the
     # same market the live path would trade.
     paper_use_real_prices: bool = True
+    paper_quote_max_age_seconds: float = 10.0
+    paper_bar_granularity_seconds: int = 60
+    paper_bar_max_age_seconds: float = 300.0
+    paper_bar_cache_ttl_seconds: float = 10.0
+    # Coinbase omits empty 1m slots on thin books. Fill short holes with flat
+    # zero-volume bars so PAPER can walk time; longer holes still fail closed.
+    paper_bar_gap_fill_enabled: bool = True
+    paper_bar_gap_fill_max_bars: int = 5
+    paper_max_spread_bps: float = 40.0
+    paper_min_top_level_notional_usd: float = 100.0
+    paper_min_top_level_notional_by_tier: dict[str, float] = Field(
+        default_factory=lambda: {
+            "major": 100.0,
+            "large": 100.0,
+            "mid": 40.0,
+            "micro": 25.0,
+        }
+    )
+    paper_max_top_level_participation: float = 0.50
+    paper_adverse_slippage_bps: float = 5.0
+    candle_max_age_multiplier: float = 1.10
     confirmation: ConfirmationConfig = Field(default_factory=ConfirmationConfig)
     regime: RegimeConfig = Field(default_factory=RegimeConfig)
     sizing: VolSizingConfig = Field(default_factory=VolSizingConfig)
     price_action_enabled: bool = True
     price_action_fail_closed: bool = True
+
+    def min_top_level_notional_usd(self, tier: str | None = None) -> float:
+        """Visible top-of-book notional required to model a PAPER fill."""
+        if tier:
+            floor = self.paper_min_top_level_notional_by_tier.get(tier.lower())
+            if floor is not None:
+                return floor
+        return self.paper_min_top_level_notional_usd
+
+    @model_validator(mode="after")
+    def _valid_market_freshness(self) -> MarketConfig:
+        if self.paper_bar_granularity_seconds != 60:
+            raise ValueError("paper_bar_granularity_seconds must be 60")
+        positive = {
+            "price_cache_ttl_seconds": self.price_cache_ttl_seconds,
+            "paper_quote_max_age_seconds": self.paper_quote_max_age_seconds,
+            "paper_bar_max_age_seconds": self.paper_bar_max_age_seconds,
+            "paper_bar_cache_ttl_seconds": self.paper_bar_cache_ttl_seconds,
+            "paper_max_spread_bps": self.paper_max_spread_bps,
+            "paper_min_top_level_notional_usd": self.paper_min_top_level_notional_usd,
+            "paper_adverse_slippage_bps": self.paper_adverse_slippage_bps,
+        }
+        if any(value <= 0 for value in positive.values()):
+            raise ValueError("paper freshness, liquidity, and slippage settings must be positive")
+        allowed_tiers = {"major", "large", "mid", "micro"}
+        for tier, floor in self.paper_min_top_level_notional_by_tier.items():
+            if tier.lower() not in allowed_tiers:
+                raise ValueError(f"unknown paper depth tier {tier!r}")
+            if floor <= 0:
+                raise ValueError("tiered paper min top-level notional must be positive")
+        if self.price_cache_ttl_seconds > self.paper_quote_max_age_seconds:
+            raise ValueError("price_cache_ttl_seconds cannot exceed paper_quote_max_age_seconds")
+        if self.paper_bar_cache_ttl_seconds > self.paper_bar_max_age_seconds:
+            raise ValueError("paper_bar_cache_ttl_seconds cannot exceed paper_bar_max_age_seconds")
+        if self.paper_bar_gap_fill_max_bars < 0:
+            raise ValueError("paper_bar_gap_fill_max_bars cannot be negative")
+        if not 0 < self.paper_max_top_level_participation <= 0.50:
+            raise ValueError("paper_max_top_level_participation must be within 0..0.50")
+        if self.paper_max_spread_bps > 1_000 or self.paper_adverse_slippage_bps > 1_000:
+            raise ValueError("paper spread and slippage limits cannot exceed 1000 bps")
+        if self.candle_max_age_multiplier < 1.0:
+            raise ValueError("candle_max_age_multiplier must be at least 1.0")
+        return self
 
 
 # ----------------------------------------------------------------------------
@@ -800,7 +1139,11 @@ def get_strategies() -> StrategiesConfig:
     strategy at full allocation reproduces the pre-dual-strategy behavior.
     """
     risk = get_risk()
-    inherited = {f: getattr(risk, f) for f in _INHERITED_FIELDS}
+    inherited = {
+        field: getattr(risk, field)
+        for field in _INHERITED_FIELDS
+        if field not in EXIT_PROFILE_FIELDS
+    }
 
     raw = _load_yaml("strategies.yaml")
     defs = (raw or {}).get("strategies") or {}
@@ -809,15 +1152,31 @@ def get_strategies() -> StrategiesConfig:
 
     strategies: dict[str, StrategyConfig] = {}
     for name, override in defs.items():
-        merged: dict = {**inherited, "name": name, "enabled": True, "allocation": 0.5}
-        merged.update(override or {})
+        override_values = dict(override or {})
+        profile_override = dict(override_values.pop("exit_profile", {}) or {})
+        profile_override.update(dict(override_values.pop("exit", {}) or {}))
+        for field in EXIT_PROFILE_FIELDS:
+            if field in override_values:
+                profile_override[field] = override_values.pop(field)
+        profile = {
+            **risk.exit_profile.model_dump(mode="python"),
+            **profile_override,
+        }
+        merged: dict = {
+            **inherited,
+            "exit_profile": profile,
+            "name": name,
+            "enabled": True,
+            "allocation": 0.5,
+        }
+        merged.update(override_values)
         merged["name"] = name  # name is authoritative from the mapping key
         if "entry" not in merged:
             merged["entry"] = (
                 EntryRulesConfig(
                     trigger_granularity_seconds=3_600,
                     bias_granularity_seconds=14_400,
-                    require_compression=True,
+                    require_compression=False,
                     allow_vwap_pullback=False,
                 )
                 if name == "swing"

@@ -107,7 +107,11 @@ def build_collectors(
     universe: UniverseConfig,
     store: Store | None = None,
 ) -> list[Collector]:
-    """Instantiate enabled collectors; fall back to mock so the loop always runs."""
+    """Instantiate enabled collectors.
+
+    An empty list is valid: price-only paper with social ingest paused. Mock is
+    added only when `sources.mock.enabled` is true, never as a silent fallback.
+    """
     collectors: list[Collector] = []
 
     if sources.reddit.enabled and settings.reddit_client_id:
@@ -133,10 +137,12 @@ def build_collectors(
         except Exception as exc:  # noqa: BLE001
             log.warning("X collector unavailable: %s", exc)
 
-    if not collectors or sources.mock.enabled:
+    if sources.mock.enabled:
         from .mock import MockCollector
 
         collectors.append(MockCollector(sources.mock, universe))
         if not any(c.source_name != "mock" for c in collectors):
-            log.info("No live sources configured -> running with MOCK data only")
+            log.info("Mock source enabled -> injecting synthetic social events")
+    elif not collectors:
+        log.info("No social collectors enabled -> price-only (X/Reddit ingest paused)")
     return collectors

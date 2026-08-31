@@ -115,8 +115,15 @@ class CoinbaseBroker:
         # NOTE (live TODO): reconcile actual fill price/qty/fee from get_order(order_id).
         return Fill(order_id=order_id or client_order_id, price=price, qty=qty, fee=0.0)
 
-    def close_long(self, product_id: str, qty: float) -> Fill:
-        """Market sell (used for time-stop / kill; TP/SL are server-side)."""
+    def close_long(
+        self,
+        product_id: str,
+        qty: float,
+        reference_price: float | None = None,
+        *,
+        emergency: bool = False,
+    ) -> Fill:
+        """Market sell; `reference_price` / `emergency` are PAPER-only and ignored."""
         self._guard_path("/orders")
         import uuid
 

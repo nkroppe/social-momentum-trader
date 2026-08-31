@@ -12,6 +12,7 @@ from sqlalchemy import inspect
 from smt.config import (
     EntryRulesConfig,
     MarketConfig,
+    RiskConfig,
     Settings,
     SignalsConfig,
     TierConfig,
@@ -20,6 +21,8 @@ from smt.config import (
 )
 from smt.market import (
     Candle,
+    TechnicalSnapshot,
+    TopOfBookQuote,
     aggregate_candles,
     ema,
     relative_volume,
@@ -33,6 +36,7 @@ from smt.ops.preflight import run_preflight
 from smt.scorer import ScoreResult
 from smt.store import Store
 from smt.trader.broker import Fill
+from smt.trader.execution import ExecutionCostEstimator
 from smt.trader.manager import TradeManager
 from smt.trader.paper import PaperBroker
 from smt.trader.risk import RiskGate
@@ -47,6 +51,23 @@ def _candles(count: int = 70, *, step: float = 0.2, volume: float = 100.0) -> li
             Candle(
                 ts=i * 900,
                 open=close - 0.05,
+                high=close + 0.10,
+                low=close - 0.10,
+                close=close,
+                volume=volume,
+            )
+        )
+    return rows
+
+
+def _down_candles(count: int = 70, *, step: float = 0.2, volume: float = 100.0) -> list[Candle]:
+    rows: list[Candle] = []
+    for i in range(count):
+        close = 100.0 + (count - 1 - i) * step
+        rows.append(
+            Candle(
+                ts=i * 900,
+                open=close + 0.05,
                 high=close + 0.10,
                 low=close - 0.10,
                 close=close,
@@ -147,21 +168,91 @@ def test_direct_breakout_and_required_retest_are_separate_setups():
     assert retest.metadata["relative_volume"] == pytest.approx(3.0)
 
 
+def test_disabled_retest_skips_retest_but_keeps_close_breakouts():
+    rules = EntryRulesConfig(
+        require_compression=False,
+        allow_vwap_pullback=False,
+        allow_breakout_retest=False,
+        min_stop_pct=0.02,
+    )
+    preferred = TierConfig(
+        social_policy="ignored", min_relative_volume=1.5, retest_policy="preferred"
+    )
+    required = preferred.model_copy(update={"retest_policy": "required"})
+    bias = _candles()
+
+    direct = detect_price_setup(_direct_breakout(), bias, rules, preferred, "intraday")
+    assert direct is not None
+    assert direct.name == "breakout_close"
+    assert direct.stop_pct >= 0.02
+    assert detect_price_setup(_retest(), bias, rules, preferred, "intraday") is None
+    assert detect_price_setup(_retest(), bias, rules, required, "intraday") is None
+    assert detect_price_setup(_direct_breakout(), bias, rules, required, "intraday") is None
+
+
+def test_swing_bias_rejects_bearish_stack_without_requiring_bullish_stack():
+    rules = EntryRulesConfig(
+        require_compression=False,
+        allow_vwap_pullback=False,
+        require_bias_ema_stack=False,
+        reject_bearish_bias_stack=True,
+        rsi_min=50,
+    )
+    preferred = TierConfig(
+        social_policy="ignored", min_relative_volume=1.5, retest_policy="preferred"
+    )
+    trigger = _direct_breakout()
+    assert detect_price_setup(trigger, _candles(), rules, preferred, "swing") is not None
+    assert detect_price_setup(trigger, _down_candles(), rules, preferred, "swing") is None
+
+
 def test_intraday_and_swing_rules_are_structurally_distinct():
     strategies = {strategy.name: strategy for strategy in get_strategies().enabled()}
     assert strategies["intraday"].entry.trigger_granularity_seconds == 900
     assert strategies["intraday"].entry.bias_granularity_seconds == 3_600
     assert strategies["intraday"].entry.allow_vwap_pullback
+    assert not strategies["intraday"].entry.allow_breakout_retest
+    assert strategies["intraday"].entry.min_stop_pct == 0.02
+    assert strategies["intraday"].atr_min_stop_pct == 0.02
     assert not strategies["intraday"].entry.require_compression
     assert strategies["swing"].entry.trigger_granularity_seconds == 3_600
     assert strategies["swing"].entry.bias_granularity_seconds == 14_400
-    assert strategies["swing"].entry.require_compression
+    # Ledger-backed: compression is no longer a hard gate. Gen-5 grind: RSI 50
+    # and refuse a bearish 4h stack instead of requiring a full bullish stack.
+    assert not strategies["swing"].entry.require_compression
     assert not strategies["swing"].entry.allow_vwap_pullback
+    assert strategies["swing"].entry.rsi_min == 50
+    assert not strategies["swing"].entry.require_bias_ema_stack
+    assert strategies["swing"].entry.reject_bearish_bias_stack
+    assert strategies["bear_rally"].regime_mode == "risk_off_only"
+    assert strategies["bear_rally"].entry.setup_family == "bear_rally"
 
 
 class _SetupMarket:
+    def __init__(
+        self,
+        snapshot: TechnicalSnapshot | None = None,
+        *,
+        setup_data_available: bool = True,
+    ):
+        self._snapshot = snapshot
+        self.setup_data_available = setup_data_available
+
     def candles(self, _product: str, granularity: int | None = None) -> list[Candle]:
+        if not self.setup_data_available:
+            return []
         return _direct_breakout() if granularity == 900 else _candles()
+
+    def snapshot(self, product: str, sma_periods: int, lookback_periods: int) -> TechnicalSnapshot:
+        del sma_periods, lookback_periods
+        return self._snapshot or TechnicalSnapshot(
+            product_id=product,
+            ok=True,
+            price=120,
+            sma=100,
+            trailing_return=0.03,
+            volume_z=2.0,
+        )
 
     def regime_ok(self) -> tuple[bool, str]:
         return True, "test"
@@ -204,7 +295,7 @@ def test_tier_playbooks_keep_price_hard_and_apply_social_afterward():
                 retest_policy="preferred",
                 optional_social_boost=1.1,
             ),
-        }
+        },
     )
     engine = SignalEngine(
         make_strategy(),
@@ -219,6 +310,151 @@ def test_tier_playbooks_keep_price_hard_and_apply_social_afterward():
     large = engine.candidates([_score("SOL")])
     assert large[0].conviction == pytest.approx(0.85 * 1.1)
     assert engine.candidates([_score("SOL", bullish=0.0)]) == []  # optional-social veto
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        TechnicalSnapshot("BTC-USD", True, price=90, sma=100, trailing_return=0.03, volume_z=2),
+        TechnicalSnapshot("BTC-USD", True, price=120, sma=100, trailing_return=-0.01, volume_z=2),
+        TechnicalSnapshot("BTC-USD", True, price=120, sma=100, trailing_return=0.03, volume_z=0),
+        TechnicalSnapshot("BTC-USD", False, detail="upstream unavailable"),
+    ],
+)
+def test_production_price_setup_also_requires_confirmation_snapshot(snapshot):
+    universe = UniverseConfig(symbols={"BTC": {"product_id": "BTC-USD", "tier": "major"}})
+    signals = SignalsConfig(
+        tiers={
+            "major": TierConfig(
+                social_policy="ignored",
+                min_relative_volume=1.5,
+                retest_policy="preferred",
+            )
+        }
+    )
+    market_cfg = MarketConfig()
+    market_cfg.confirmation.min_volume_zscore = 1.0
+    engine = SignalEngine(
+        make_strategy(),
+        universe,
+        signals,
+        _SetupMarket(snapshot),  # type: ignore[arg-type]
+        market_cfg,
+    )
+
+    assert engine.candidates([_score("BTC")]) == []
+
+
+def test_zero_volume_z_floor_does_not_block_below_average_volume():
+    universe = UniverseConfig(symbols={"BTC": {"product_id": "BTC-USD", "tier": "major"}})
+    signals = SignalsConfig(
+        tiers={
+            "major": TierConfig(
+                social_policy="ignored",
+                min_relative_volume=1.5,
+                retest_policy="preferred",
+            )
+        }
+    )
+    market_cfg = MarketConfig()
+    assert market_cfg.confirmation.min_volume_zscore == 0.0
+    snap = TechnicalSnapshot(
+        "BTC-USD",
+        True,
+        price=120,
+        sma=100,
+        trailing_return=0.03,
+        volume_z=-0.21,
+    )
+    engine = SignalEngine(
+        make_strategy(),
+        universe,
+        signals,
+        _SetupMarket(snap),  # type: ignore[arg-type]
+        market_cfg,
+    )
+    assert engine._trend_ok(snap).passed  # noqa: SLF001 - gate unit test
+
+
+def test_price_action_fail_closed_controls_missing_setup_data():
+    universe = UniverseConfig(symbols={"BTC": {"product_id": "BTC-USD", "tier": "major"}})
+    signals = SignalsConfig(tiers={"major": TierConfig(social_policy="ignored")})
+    market = _SetupMarket(setup_data_available=False)
+    fail_closed = MarketConfig()
+    fail_closed.confirmation.enabled = False
+    engine = SignalEngine(
+        make_strategy(),
+        universe,
+        signals,
+        market,  # type: ignore[arg-type]
+        fail_closed,
+    )
+    assert engine.candidates([_score("BTC")]) == []
+
+    fail_open = fail_closed.model_copy(deep=True)
+    fail_open.price_action_fail_closed = False
+    engine = SignalEngine(
+        make_strategy(),
+        universe,
+        signals,
+        market,  # type: ignore[arg-type]
+        fail_open,
+    )
+    assert len(engine.candidates([_score("BTC")])) == 1
+
+
+def test_candidate_ranking_is_price_based_and_social_z_invariant(monkeypatch):
+    tickers = ["AAA", "BBB", "CCC", "DDD", "EEE"]
+    universe = UniverseConfig(
+        symbols={ticker: {"product_id": f"{ticker}-USD", "tier": "major"} for ticker in tickers}
+    )
+    engine = SignalEngine(
+        make_strategy(),
+        universe,
+        market=_SetupMarket(),  # type: ignore[arg-type]
+        market_cfg=MarketConfig(),
+    )
+    price_quality = {
+        "AAA": ("breakout_close", 1.0, 10.0),
+        "BBB": ("breakout_retest", 0.9, 2.0),
+        "CCC": ("breakout_retest", 0.9, 3.0),
+        "DDD": ("breakout_retest", 1.0, 1.0),
+        "EEE": ("breakout_retest", 0.9, 2.0),
+    }
+
+    def evaluate(score):
+        setup, conviction, rel_vol = price_quality[score.ticker]
+        return TradeCandidate(
+            ticker=score.ticker,
+            product_id=f"{score.ticker}-USD",
+            zscore=score.zscore,
+            mentions=score.mentions_window,
+            sources=score.distinct_sources,
+            reason="test",
+            setup=setup,
+            conviction=conviction,
+            setup_metadata={
+                "price_conviction": conviction,
+                "relative_volume": rel_vol,
+            },
+        )
+
+    monkeypatch.setattr(engine, "_evaluate", evaluate)
+    high_first = [_score(ticker) for ticker in tickers]
+    for index, score in enumerate(high_first):
+        score.zscore = 100 - index
+    low_first = list(reversed([_score(ticker) for ticker in tickers]))
+    for index, score in enumerate(low_first):
+        score.zscore = -100 + index
+
+    expected = ["DDD", "CCC", "BBB", "EEE", "AAA"]
+    first = engine.candidates(high_first)
+    second = engine.candidates(low_first)
+    assert [candidate.ticker for candidate in first] == expected
+    assert [candidate.ticker for candidate in second] == expected
+    assert {candidate.ticker: candidate.zscore for candidate in first} == {
+        score.ticker: score.zscore for score in high_first
+    }
 
 
 def _candidate(**overrides) -> TradeCandidate:
@@ -236,6 +472,18 @@ def _candidate(**overrides) -> TradeCandidate:
     }
     values.update(overrides)
     return TradeCandidate(**values)
+
+
+def _quote(product_id: str, midpoint: float = 100.0, size: float = 100.0) -> TopOfBookQuote:
+    return TopOfBookQuote(
+        product_id,
+        midpoint - 0.05,
+        midpoint + 0.05,
+        size,
+        size,
+        1,
+        utcnow().timestamp(),
+    )
 
 
 def test_risk_budget_sizing_uses_stop_and_never_exceeds_hard_cap(tmp_path):
@@ -274,6 +522,287 @@ def _open_trade(store, strategy: str = "intraday") -> Trade:
             time_stop_at=utcnow() + timedelta(hours=6),
         )
     )
+
+
+def _add_portfolio_trade(
+    store,
+    *,
+    ticker: str,
+    strategy: str,
+    qty: float,
+    stop: float,
+    tier_entry_fee: float = 0.0,
+) -> Trade:
+    return store.add_trade(
+        Trade(
+            ticker=ticker,
+            strategy=strategy,
+            product_id=f"{ticker}-USD",
+            status=TradeStatus.OPEN,
+            qty=qty,
+            original_qty=qty,
+            entry_price=100.0,
+            entry_notional=qty * 100.0,
+            take_profit=115.0,
+            stop_loss=stop,
+            highest_price=100.0,
+            initial_risk_per_unit=100.0 - stop,
+            entry_fee_paid=tier_entry_fee,
+            fees_paid=tier_entry_fee,
+            time_stop_at=utcnow() + timedelta(hours=6),
+        )
+    )
+
+
+def test_structure_target_rejected_when_first_partial_is_net_negative(tmp_path):
+    store = make_store(tmp_path)
+    strategy = make_strategy(partial_take_profit_r=0.1)
+    quote = _quote("BTC-USD")
+    gate = RiskGate(
+        store,
+        mark_price=lambda _product: 100.0,
+        quote=lambda _product: quote,
+        portfolio_equity=lambda: 5_000.0,
+        universe=make_universe(),
+    )
+    candidate = _candidate(
+        setup="breakout_close",
+        entry_price=100.0,
+        structure_stop=99.9,
+        stop_pct=0.001,
+    )
+    manager = TradeManager(
+        Settings(paper_start_equity=5_000),
+        make_universe(),
+        store,
+        PaperBroker(seed=1),
+        strategies=[strategy],
+    )
+    target, stop, _ = manager.exit_levels(100.0, candidate, strategy)
+    assert stop == 99.9
+    assert target == 100.01  # preserve the structure/R target; never raise it to a fee floor
+
+    decision = gate.evaluate(candidate, strategy, 2_500.0, 2_500.0)
+
+    assert not decision.approved
+    assert "first partial not positively economic" in decision.reason
+    assert "gross=$" in decision.reason
+    assert "modeled_cost=$" in decision.reason
+    assert "net=$-" in decision.reason
+    assert "spread=" in decision.reason
+
+
+def test_global_symbol_cap_allows_both_strategies_up_to_combined_limit(tmp_path):
+    store = make_store(tmp_path)
+    _add_portfolio_trade(
+        store,
+        ticker="BTC",
+        strategy="intraday",
+        qty=2.5,
+        stop=90.0,
+        tier_entry_fee=1.5,
+    )
+    strategy = make_strategy("swing")
+    gate = RiskGate(
+        store,
+        mark_price=lambda _product: 100.0,
+        quote=lambda product: _quote(product),
+        portfolio_equity=lambda: 5_000.0,
+        universe=make_universe(),
+    )
+    candidate = _candidate(
+        strategy="swing",
+        setup="breakout_retest",
+        entry_price=100.0,
+        structure_stop=95.0,
+        stop_pct=0.05,
+    )
+
+    decision = gate.evaluate(candidate, strategy, 2_500.0, 2_500.0)
+
+    assert decision.approved
+    assert decision.notional_usd == 250.0
+
+
+def test_global_symbol_cap_explains_projected_rejection(tmp_path):
+    store = make_store(tmp_path)
+    _add_portfolio_trade(
+        store,
+        ticker="BTC",
+        strategy="intraday",
+        qty=2.6,
+        stop=90.0,
+        tier_entry_fee=1.56,
+    )
+    strategy = make_strategy("swing")
+    gate = RiskGate(
+        store,
+        mark_price=lambda _product: 100.0,
+        quote=lambda product: _quote(product),
+        portfolio_equity=lambda: 5_000.0,
+        universe=make_universe(),
+    )
+
+    decision = gate.evaluate(
+        _candidate(
+            strategy="swing",
+            setup="breakout_retest",
+            entry_price=100.0,
+            structure_stop=95.0,
+            stop_pct=0.05,
+        ),
+        strategy,
+        2_500.0,
+        2_500.0,
+    )
+
+    assert not decision.approved
+    assert "global combined symbol exposure" in decision.reason
+    assert "projected=$510.00" in decision.reason
+    assert "limit=$500.00" in decision.reason
+
+
+def test_global_heat_includes_remaining_risk_and_exit_cost(tmp_path):
+    store = make_store(tmp_path)
+    _add_portfolio_trade(
+        store,
+        ticker="SOL",
+        strategy="swing",
+        qty=5.0,
+        stop=83.0,
+        tier_entry_fee=3.0,
+    )
+    strategy = make_strategy("intraday")
+    gate = RiskGate(
+        store,
+        mark_price=lambda _product: 100.0,
+        quote=lambda product: _quote(product),
+        portfolio_equity=lambda: 5_000.0,
+        universe=make_universe(),
+    )
+
+    decision = gate.evaluate(
+        _candidate(
+            setup="breakout_close",
+            entry_price=100.0,
+            structure_stop=90.0,
+            stop_pct=0.10,
+        ),
+        strategy,
+        2_500.0,
+        2_500.0,
+    )
+
+    assert not decision.approved
+    assert "global aggregate open heat" in decision.reason
+    assert "existing=$" in decision.reason
+    assert "proposed=$" in decision.reason
+    assert "limit=$100.00" in decision.reason
+
+
+@pytest.mark.parametrize(
+    ("existing_ticker", "existing_qty", "candidate_ticker", "candidate_tier", "reason"),
+    [
+        ("SOL", 24.0, "BTC", "major", "global gross exposure"),
+        ("PUMP", 6.5, "BICO", "micro", "global aggregate micro exposure"),
+    ],
+)
+def test_global_exposure_caps_span_strategies(
+    tmp_path,
+    existing_ticker,
+    existing_qty,
+    candidate_ticker,
+    candidate_tier,
+    reason,
+):
+    store = make_store(tmp_path)
+    _add_portfolio_trade(
+        store,
+        ticker=existing_ticker,
+        strategy="swing",
+        qty=existing_qty,
+        stop=99.0,
+    )
+    universe = UniverseConfig(
+        symbols={
+            "BTC": {"product_id": "BTC-USD", "tier": "major"},
+            "SOL": {"product_id": "SOL-USD", "tier": "large"},
+            "PUMP": {"product_id": "PUMP-USD", "tier": "micro"},
+            "BICO": {"product_id": "BICO-USD", "tier": "micro"},
+        }
+    )
+    risk = RiskConfig(
+        max_aggregate_open_heat_pct=0.50,
+        max_combined_symbol_exposure_pct=0.50,
+    )
+    strategy = make_strategy("intraday")
+    gate = RiskGate(
+        store,
+        mark_price=lambda _product: 100.0,
+        quote=lambda product: _quote(product),
+        portfolio_equity=lambda: 5_000.0,
+        risk=risk,
+        universe=universe,
+    )
+    decision = gate.evaluate(
+        _candidate(
+            ticker=candidate_ticker,
+            product_id=f"{candidate_ticker}-USD",
+            tier=candidate_tier,
+            setup="breakout_close",
+            entry_price=100.0,
+            structure_stop=90.0,
+            stop_pct=0.10,
+        ),
+        strategy,
+        2_500.0,
+        2_500.0,
+    )
+
+    assert not decision.approved
+    assert reason in decision.reason
+
+
+def test_global_projection_fails_closed_when_other_strategy_mark_is_missing(tmp_path):
+    store = make_store(tmp_path)
+    _add_portfolio_trade(
+        store,
+        ticker="SOL",
+        strategy="swing",
+        qty=1.0,
+        stop=90.0,
+    )
+    strategy = make_strategy("intraday")
+    gate = RiskGate(
+        store,
+        mark_price=lambda product: 100.0 if product == "BTC-USD" else None,
+        quote=lambda product: _quote(product),
+        portfolio_equity=lambda: 5_000.0,
+        universe=make_universe(),
+    )
+    decision = gate.evaluate(
+        _candidate(
+            setup="breakout_close",
+            entry_price=100.0,
+            structure_stop=90.0,
+            stop_pct=0.10,
+        ),
+        strategy,
+        2_500.0,
+        2_500.0,
+    )
+
+    assert not decision.approved
+    assert "projected controls unavailable" in decision.reason
+    assert "fresh mark unavailable for SOL-USD" in decision.reason
+
+
+def test_global_risk_cap_validation():
+    with pytest.raises(ValueError, match="combined symbol"):
+        RiskConfig(
+            max_gross_exposure_pct=0.20,
+            max_combined_symbol_exposure_pct=0.21,
+        )
 
 
 def test_loss_halt_includes_unrealized_and_fails_closed_on_quote_errors(tmp_path):
@@ -331,7 +860,7 @@ def test_paper_fill_risk_breach_is_immediately_unwound_and_recorded(tmp_path):
         def open_long(self, _product, notional, _tp, _sl):
             return Fill("buy", 110.0, notional / 110.0, 1.0)
 
-        def close_long(self, _product, qty):
+        def close_long(self, _product, qty, reference_price=None, *, emergency=False):
             return Fill("sell", 109.0, qty, 1.0)
 
     store = make_store(tmp_path)
@@ -400,13 +929,25 @@ def test_partial_then_chandelier_exit_ratchets_and_accounts_for_all_fees(tmp_pat
     assert trade.qty == pytest.approx(5.0)
     assert trade.partial_realized_pnl == pytest.approx(68.55)
     assert manager.equity() == pytest.approx(5_143.55)
+    assert trade.trailing_stop > trade.entry_price
+    costs = ExecutionCostEstimator(strategy.assumed_fee_pct_per_side, manager.market_cfg)
+    quote = broker.execution_quote(trade.product_id, 115.0)
+    modeled_exit = costs.estimate_sell(
+        quote,
+        trade.qty,
+        reference_price=trade.trailing_stop,
+        projected_reference=True,
+    )
+    remaining_entry_fee = trade.entry_fee_paid * (trade.qty / trade.original_qty)
+    remaining_cost_basis = trade.entry_price * trade.qty + remaining_entry_fee
+    assert modeled_exit.net_proceeds == pytest.approx(remaining_cost_basis)
 
     broker.set_price("BTC-USD", 130.0)
     manager.manage_open_trades()
     trade = store.open_trade_for("BTC", strategy.name)
     assert trade is not None
     first_trail = trade.trailing_stop
-    assert first_trail == pytest.approx(100.0)
+    assert first_trail > 100.0
 
     broker.set_price("BTC-USD", 125.0)
     manager.manage_open_trades()
@@ -435,7 +976,7 @@ def test_stale_trade_closes_early_when_it_never_reaches_one_r(tmp_path):
     broker.set_price("BTC-USD", 102.0)
     manager.manage_open_trades()
     closed = store.closed_trades_for("BTC", strategy.name)[-1]
-    assert closed.exit_reason == ExitReason.TIME_STOP
+    assert closed.exit_reason == ExitReason.STALE_TIME_STOP
     assert closed.setup == "breakout_close"
 
 
