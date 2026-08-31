@@ -239,12 +239,11 @@ class Runner:
         )
 
     def _enforce_live_latches(self) -> None:
-        """Second latch: force paper unless LIVE and the ack phrase are both set."""
-        if self.settings.live and any(st.advanced_exit_enabled for st in self.strategies):
-            raise RuntimeError(
-                "LIVE startup blocked: advanced partial/chandelier exits are PAPER-only "
-                "until Coinbase server-side bracket adjustment parity is implemented."
-            )
+        """Second latch: force paper unless LIVE and the ack phrase are both set.
+
+        Advanced partial/Chandelier exits are no longer a live blocker:
+        CoinbaseBroker reconciles fills and cancel/replaces leftover TP/SL.
+        """
         if self.settings.live and self.settings.live_ack != LIVE_ACK_PHRASE:
             log.critical(
                 "LIVE=true but LIVE_ACK != %s -> forcing PAPER mode for safety.",
