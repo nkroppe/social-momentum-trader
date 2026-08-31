@@ -303,8 +303,15 @@ class TradeManager:
         *,
         emergency: bool = False,
     ) -> None:
-        # For paper we simulate the sell; for live-with-server-brackets TP/SL are
-        # already handled by the exchange, so we only actively close on time-stop/kill.
+        # For paper we simulate the sell. Live still market-sells on time-stop/kill
+        # (and after a client-side partial); leftover TP/SL must be cancelled first.
+        canceller = getattr(self.broker, "cancel_leftover_brackets", None)
+        if callable(canceller):
+            try:
+                known = [trade.broker_entry_order_id] if trade.broker_entry_order_id else None
+                canceller(trade.product_id, order_ids=known)
+            except Exception as exc:  # noqa: BLE001 - still attempt the flatten
+                log.warning("leftover-bracket cancel failed for %s: %s", trade.product_id, exc)
         fill = self.broker.close_long(
             trade.product_id,
             trade.qty,
@@ -378,6 +385,23 @@ class TradeManager:
         if atr_abs <= 0:
             atr_abs = trade.initial_risk_per_unit
         return atr_abs
+
+    def _sync_protecting_bracket(self, trade: Trade) -> None:
+        """Cancel/replace remaining live TP/SL after a partial or Chandelier ratchet."""
+        replacer = getattr(self.broker, "replace_remaining_bracket", None)
+        if not callable(replacer) or trade.qty <= 0:
+            return
+        sl = trade.trailing_stop or trade.stop_loss
+        tp = trade.take_profit
+        if tp <= sl:
+            tp = sl * 1.02 if sl > 0 else tp
+        try:
+            new_id = replacer(trade.product_id, trade.qty, tp, sl)
+        except Exception as exc:  # noqa: BLE001 - position remains; retry next loop
+            log.warning("replace remaining bracket failed for %s: %s", trade.product_id, exc)
+            return
+        if new_id:
+            trade.broker_entry_order_id = str(new_id)
 
     def _chandelier_stop(self, trade: Trade, profile) -> float:
         atr_abs = self._trail_atr(trade, profile)
@@ -461,6 +485,7 @@ class TradeManager:
         )
         trade.trailing_stop = max(trade.stop_loss, round(breakeven_floor, 8))
         trade.trailing_stop = self._chandelier_stop(trade, profile)
+        self._sync_protecting_bracket(trade)
         self.store.update_trade(trade)
         log.info(
             "PARTIAL[%s] %s qty=%.8f exit=%.6f pnl=$%.2f trail=%.6f",
@@ -496,12 +521,14 @@ class TradeManager:
 
         profile = self._profile_for(trade)
         trade.highest_price = max(trade.highest_price or trade.entry_price, price)
+        supports_live_advanced = callable(getattr(self.broker, "replace_remaining_bracket", None))
         partial_trail = (
             profile.advanced_exit_enabled
-            and self.broker.name == "paper"
+            and (self.broker.name == "paper" or supports_live_advanced)
             and (not trade.exit_snapshot or trade.setup not in ("", "offline_social"))
         )
         if partial_trail:
+            prev_trail = trade.trailing_stop
             step = quote_step(
                 profile,
                 price=price,
@@ -523,6 +550,8 @@ class TradeManager:
                 else:
                     self._close(trade, action.price, ExitReason(action.reason))
                 return
+            if supports_live_advanced and trade.trailing_stop > prev_trail:
+                self._sync_protecting_bracket(trade)
         elif not self.broker.server_side_brackets:
             # Bounded targets retain the established simulated bracket behavior.
             step = quote_step(
