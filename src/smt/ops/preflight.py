@@ -84,8 +84,8 @@ def _market_data_checks() -> list[CheckResult]:
                     )
                 elif not bars:
                     paper_unready.append((spec.tier, f"{ticker}:1m bars unavailable"))
-            except Exception as extra:
-                paper_unready.append((spec.tier, f"{ticker}:{extra}"))
+            except Exception as exc:  # noqa: BLE001
+                paper_unready.append((spec.tier, f"{ticker}:{exc}"))
 
         detail = "all universe products resolve on Coinbase"
         if missing:
@@ -158,8 +158,8 @@ def _x_budget_check(settings) -> CheckResult:
             f"count requests={budget.count_requests_used:,} "
             f"(${budget.count_spend_usd:,.2f})"
         )
-    except BudgetStateUnavailable as extra:
-        return CheckResult("x_read_budget", False, str(extra))
+    except BudgetStateUnavailable as exc:
+        return CheckResult("x_read_budget", False, str(exc))
 
     if budget.spend_usd == 0 or started is None:
         return CheckResult(
@@ -220,8 +220,8 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
                 f"{len(strategies)} enabled, total allocation={total_alloc:.2f}",
             )
         )
-    except Exception as extra:
-        results.append(CheckResult("strategy_allocations", False, str(extra)))
+    except Exception as exc:  # noqa: BLE001
+        results.append(CheckResult("strategy_allocations", False, str(exc)))
 
     if profile == "dev":
         return results
@@ -347,8 +347,8 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
 
                 model_detail = CursorJSONProvider(llm)._resolve_model()
                 model_ok = True
-            except Exception as extra:
-                model_detail = str(extra)
+            except Exception as exc:  # noqa: BLE001
+                model_detail = str(exc)
         results.append(
             CheckResult(
                 "cursor_llm",
@@ -466,10 +466,10 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
             results.append(
                 CheckResult("coinbase_trade_only_key", True, "can_transfer=false verified")
             )
-        except TransferPermissionError as extra:
-            results.append(CheckResult("coinbase_trade_only_key", False, str(extra)))
-        except Exception as extra:
-            msg = f"API check failed: {extra}"
+        except TransferPermissionError as exc:
+            results.append(CheckResult("coinbase_trade_only_key", False, str(exc)))
+        except Exception as exc:  # noqa: BLE001
+            msg = f"API check failed: {exc}"
             results.append(CheckResult("coinbase_trade_only_key", False, msg))
 
     return results
