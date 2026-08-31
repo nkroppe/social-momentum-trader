@@ -1253,6 +1253,36 @@ class Store:
 
     # ---- Reporting ---------------------------------------------------------
 
+    def setup_names_for_trade_ids(self, trade_ids: Iterable[int]) -> dict[int, str]:
+        """Map trade_id -> opportunity setup_name for linked ledger rows.
+
+        A key means the trade is linked, even when setup_name is empty. If several
+        rows share a trade_id, a non-empty setup_name wins; remaining ties take
+        the latest row.
+        """
+        ids = {int(value) for value in trade_ids if value is not None and int(value) > 0}
+        if not ids:
+            return {}
+        with self.session() as s:
+            rows = list(
+                s.execute(
+                    select(
+                        OpportunityDecision.trade_id,
+                        OpportunityDecision.setup_name,
+                        OpportunityDecision.id,
+                    ).where(OpportunityDecision.trade_id.in_(ids))
+                )
+            )
+        chosen: dict[int, tuple[int, str, int]] = {}
+        for trade_id, setup_name, row_id in rows:
+            tid = int(trade_id)
+            name = str(setup_name or "")
+            nonempty = 1 if name.strip() else 0
+            prev = chosen.get(tid)
+            if prev is None or (nonempty, int(row_id)) > (prev[0], prev[2]):
+                chosen[tid] = (nonempty, name, int(row_id))
+        return {tid: item[1] for tid, item in chosen.items()}
+
     def strategy_stats(self, strategy: str) -> dict:
         """Aggregate performance metrics for one strategy."""
         closed = self.closed_trades(strategy)
