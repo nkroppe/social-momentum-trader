@@ -28,17 +28,14 @@ This installs Docker, configures `ufw` (SSH only), enables fail2ban, and creates
 sudo su - smt
 cd /opt/social-momentum-trader   # or your clone path
 
-git clone <your-repo-url> .     # if not already present
+git clone <your-repo-url> .
+git checkout main
 cp .env.production.example .env
-nano .env                       # fill REDDIT_*, X_BEARER_TOKEN, POSTGRES_PASSWORD, alerts
+nano .env                       # Postgres, alerts, Cursor key; X/Reddit optional (price-only paper is the live default)
 ```
 
-Edit `config/sources.yaml`:
-
-```yaml
-mock:
-  enabled: false   # production: real Reddit + X only
-```
+Live `config/sources.yaml` on the VPS is price-only (`sources.x.enabled: false`, mock off).
+Do not re-enable X/Reddit unless you intend a sources identity update.
 
 Build and start:
 
@@ -109,7 +106,7 @@ See [go-live-checklist.md](go-live-checklist.md) and [venue.md](venue.md).
 |---|---|
 | View logs | `docker compose logs -f trader` |
 | Restart | `docker compose restart trader` |
-| Update code | `git pull && docker compose up -d --build` |
+| Update code | `git checkout main && git pull && docker compose up -d --build` |
 | Backup DB | `docker compose exec postgres pg_dump -U smt smt > backup.sql` |
 | Stop trading | `touch control/KILL` |
 

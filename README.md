@@ -10,8 +10,7 @@ runs.
 
 ## What is live on the VPS (as of 2026-08-27)
 
-The production paper box runs branch `cursor/exit-horizon-redesign-a3ae`,
-**not** `main`. `main` is weeks behind and is not what gets traded.
+The production paper box tracks **`main`**.
 
 | Piece | Live setting |
 | --- | --- |
@@ -289,7 +288,7 @@ See [docs/deploy-vps.md](docs/deploy-vps.md) for the full guide. Quick path:
 
 ```bash
 sudo bash scripts/vps-setup.sh          # once, as root
-# VPS tracks cursor/exit-horizon-redesign-a3ae (not main)
+# VPS tracks main
 cp .env.production.example .env         # Postgres, alerts, Cursor key; X/Reddit optional
 # mock.enabled: false; sources.x.enabled: false on the live box
 docker compose up -d --build
