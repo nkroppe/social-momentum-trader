@@ -1,28 +1,49 @@
 # social-momentum-trader
 
-A 24/7, **long-only spot** crypto trader driven primarily by multi-timeframe
-**price action**, with tier-specific social catalysts, hard risk limits, and
-layered fund-protection guardrails. Runs on a cloud VPS. Coinbase Advanced Trade
-is the broker. **Paper mode is the default**.
+A 24/7, **long-only spot** crypto trader driven by multi-timeframe **price
+action**, hard risk limits, and fund-protection guardrails. Coinbase Advanced
+Trade is the only broker. **Paper mode is the default** and is what the VPS
+runs.
 
-> Not financial advice. Social momentum is noisy and most retail variants lose
-> after fees/slippage. Trade only capital you can afford to lose.
+> Not financial advice. Most retail variants lose after fees and slippage.
+> Trade only capital you can afford to lose.
+
+## What is live on the VPS (as of 2026-08-27)
+
+The production paper box runs branch `cursor/exit-horizon-redesign-a3ae`,
+**not** `main`. `main` is weeks behind and is not what gets traded.
+
+| Piece | Live setting |
+| --- | --- |
+| Mode | PAPER, Coinbase Advanced marks, Postgres |
+| Paper equity | $10,000 starting |
+| Allocations | **20% intraday / 60% swing / 20% bear_rally** |
+| Social ingest | **Off.** `sources.x.enabled: false`, Reddit unapproved, mock disabled. Price-only loop. |
+| Intraday entries | 15m trigger / 1h bias. **Breakout-close and VWAP only** — `breakout_retest` disabled. Min stop **2%** so 1R is larger than ~1.2% round-trip fees. |
+| Swing entries | 1h trigger / 4h bias. Close or retest. VWAP off. Min stop 1%. |
+| Universe | BTC, ETH, SOL, HYPE, ZEC, PUMP. Mid/micro require retest, so HYPE/ZEC/PUMP do **not** open on the intraday sleeve. |
+| Exits | Intraday `intraday_trend_v2`: 25% at 1.5R, Chandelier 2.5 ATR on 1h bars, 12h time / 4h stale if MFE < 0.5R. Swing `swing_trend_v2`: 25% at 2.0R, Chandelier 3.0 ATR on 4h bars, **120h** time / 24h stale. bear_rally `bear_reversion_v2`: 50% at 1.0R, 6h / 2h, RISK-OFF only. |
+| Fees in paper | `assumed_fee_pct_per_side: 0.006` |
+| Soak | Policy-bound generations in `data/soak.json`. Gen **8** started 2026-08-27 13:34 UTC after the allocation/retest/stop-floor change. Changing strategies/risk/market/signals/universe/llm starts a new generation. A **sources-only** change (X/Reddit on/off) updates the fingerprint in place and **does not** reset the clock. |
+
+Social and Sonnet code is still in the repo and stays in **shadow** (audit only).
+With X paused those paths are a no-op on the live book.
 
 ## What it does
 
 ```
-X recent counts (30m) -> anomaly-triggered 25-post samples -> quality metadata
-   -> count-based attention z-score -> multi-timeframe price setup
-   -> SHADOW tier social policy + SHADOW sparse L3 Sonnet review
-   -> HARD RISK GATE (strategy + global portfolio heat/exposure)
-   -> executable PAPER fill -> partial profit + protected Chandelier runner
+Coinbase candles + L1 book
+   -> multi-timeframe price setup (per strategy)
+   -> HARD RISK GATE (strategy + global heat/exposure)
+   -> executable PAPER fill (ask/bid, spread, depth)
+   -> 25% partial + Chandelier runner (PAPER-only advanced exits)
 ```
 
 - **Direction:** long-only spot (USD pairs on an allowlist).
 - **Execution venue (locked):** [Coinbase Advanced Trade](docs/venue.md) — US spot only. No Robinhood, Phantom, or Bullpen in this repo.
-- **Signals:** deterministic price/volume setups first. During the P0 shadow
-  phase, social and LLM outcomes are audited but cannot approve, reject, boost,
-  veto, or resize a paper candidate.
+- **Signals on VPS:** deterministic price/volume only. Social ingest is paused.
+  If X is turned back on, keep `social_decision_mode: shadow` until a separate
+  review; shadow outcomes still cannot approve, reject, boost, veto, or resize.
 
 ## How entries are gated
 
@@ -33,9 +54,16 @@ tier-relative volume. Intraday also requires RSI(14) >= 55 and a bullish 1h
 EMA stack. Swing uses RSI(14) >= 50 and only rejects a bearish 4h stack (it
 does not require a full 9>21>50 bias in a grind). The completed setup must
 then pass the configured SMA, trailing-return, and volume-z confirmation
-gates. Setups are breakout-and-close or breakout-retest; majors and SOL may
-also use a rolling-VWAP reclaim intraday. Swing disables VWAP pullbacks;
-compression is a ranking preference, not a hard gate.
+gates.
+
+**Intraday (live):** breakout-and-close, plus rolling-VWAP reclaim on
+majors/large. `allow_breakout_retest: false` after the Aug 24–27 chop (retest
+was 0/5, −$47). Structure stops are floored at **2%**. Mid/micro tiers still
+*require* retest in `signals.yaml`, so HYPE/ZEC/PUMP will not receive new
+intraday entries until that policy changes.
+
+**Swing (live):** breakout-and-close or breakout-retest. VWAP pullbacks off.
+Compression is a ranking preference, not a hard gate.
 
 The tier playbook is evaluated only after the price setup. With
 `social_decision_mode: shadow` (the shipped default), these are counterfactual
@@ -48,9 +76,10 @@ outcomes for audit and do not affect orders:
 - **Micro (PUMP):** social catalyst plus a hard price breakout/retest.
 
 Social attention can never open a trade without a qualifying price trigger, and
-in shadow mode it cannot close the gate or change size either.
-Retests are preferred for majors/large and required for mid/micro. Relative
-volume is at least 1.5x for major/large and 2.0x for mid/micro.
+in shadow mode it cannot close the gate or change size either. On the live VPS
+X/Reddit collectors are disabled, so these tier social rules do not run.
+Retests remain preferred for majors/large and required for mid/micro **on
+swing**. Relative volume is at least 1.5x for major/large and 2.0x for mid/micro.
 When position capacity is scarce, candidates are ranked only by deterministic
 price evidence (setup quality, conviction, relative volume, ticker), never by
 social z-score.
@@ -83,18 +112,21 @@ message; they are never applied automatically.
 
 ## Strategies, one capital pool
 
-The bot runs **three methodologies** on a configurable capital split (default
-40/40/20 for intraday / swing / bear_rally). Bull strategies only take new
+The bot runs **three methodologies** on a configurable capital split. **Live
+VPS is 20/60/20** (intraday / swing / bear_rally). Bull strategies only take new
 entries when BTC is above its 50-day SMA; bear_rally only when BTC is below it
-(so idle capital sits in cash in the "wrong" regime).
+(so idle capital sits in cash in the "wrong" regime). RISK-ON also requires BTC
+4h not printing consecutive lower lows.
 
-Intraday targets 50% off at 1.5R with a 6-hour hard time-stop and a tighter
-4-hour stale stop if price never reaches +1R. Swing targets 50% off at 2R with
-48-hour/24-hour equivalents. `bear_rally` trades short-lived RISK-OFF relief
-rallies on BTC/ETH/SOL (RSI reclaim, failed breakdown, relative-strength
-bounce) with faster partials (1.0R) and tighter stops. After the partial, the
-remainder uses a Chandelier ATR stop that only ratchets upward and cannot fall
-below a cost-adjusted breakeven floor.
+Intraday (`intraday_trend_v2`) takes **25%** off at **1.5R**, then a Chandelier
+at 2.5 ATR on 1h bars; hard time-stop **12h**, stale **4h** if MFE never
+reaches 0.5R. Swing (`swing_trend_v2`) takes **25%** off at **2.0R**,
+Chandelier at 3.0 ATR on 4h bars; hard time-stop **120h**, stale **24h**. `bear_rally` (`bear_reversion_v2`) trades
+short-lived RISK-OFF relief rallies on BTC/ETH/SOL (RSI reclaim, failed
+breakdown, relative-strength bounce) with **50%** off at **1.0R**, 6h / 2h
+stops. After the partial, the remainder uses a Chandelier ATR stop that only
+ratchets upward and cannot fall below a cost-adjusted breakeven floor. Advanced
+partial/Chandelier management is **PAPER-only**.
 
 Position size starts from a 0.5% equity risk budget divided by the candidate's
 structure-stop percentage. The result is capped by the hard max-position
@@ -106,7 +138,7 @@ spread, slippage, and visible-depth constraints. Across both strategies, global
 limits cap open heat at 2%, gross exposure at 50%, combined exposure per ticker
 at 10%, and aggregate micro exposure at 15%.
 
-Each strategy sizes off its **own** allocation half and enforces its **own**
+Each strategy sizes off its **own** allocation slice and enforces its **own**
 limits (max position %, max open, max trades/day, daily/weekly loss halts,
 cooldown). One strategy hitting a limit or loss-halt does **not** affect the
 other. A ticker may be held by both strategies independently; every trade is
@@ -186,19 +218,17 @@ the `simulate` demo run with zero external accounts.
 - `.env` (copy from `.env.example`) - secrets + mode flags
 - `.env.production.example` - VPS production template (Postgres, alerts, no mock)
 
-### X (Twitter) production setup
+### X (Twitter) — paused on the live VPS
 
-1. Create an X developer app and generate a **Bearer Token** (pay-per-use API).
-2. Set `X_BEARER_TOKEN`. The default shared ceiling is
-   `X_MONTHLY_BUDGET_USD=100`; both endpoint prices are configurable because X
-   pricing can change.
-3. `config/sources.yaml` requests uncensored recent counts for each cashtag in
-   UTC-aligned 30-minute windows, then samples 25 posts only on adaptive
-   anomalies or scheduled cold-start windows. Watch accounts remain trusted
-   sampled event feeds.
-4. Distinct post reads, count requests, endpoint spend, and daily/monthly dollar
-   pace are tracked atomically in `data/x_budget.json`.
-5. On the VPS, set `mock.enabled: false` once Reddit + X credentials are configured.
+X ingest is **off** (`sources.x.enabled: false` and `ops.preflight.require_x: false`).
+Empty social collectors do **not** fall back to mock. Doctor reports `x_ingest:
+paused (price-only)`. Flipping X back on requires setting **both** `enabled` and
+`require_x` together. That hashes `sources` but does **not** start a new soak
+generation (sources is a keep-in-place fingerprint section).
+
+The collector code still exists: Bearer Token, `$100/month` ceiling, 30-minute
+cashtag counts, anomaly-triggered 25-post samples, `data/x_budget.json`. It is
+not in the live path until those flags change.
 
 ### Cursor LLM setup
 
@@ -223,9 +253,10 @@ stop. No manual migration step is required.
 
 Execution is **Coinbase Advanced Trade only** — see [docs/venue.md](docs/venue.md).
 
-> Deployment warning: the shipped social layer is intentionally `shadow`.
-> Do not change it to `enforce` or treat shadow audit results as live-ready
-> evidence without a separately reviewed paper-validation period.
+> Deployment warning: VPS paper is **price-only**. Social is paused, and the
+> remaining social/LLM layer is `shadow` (audit only). Do not set
+> `social_decision_mode: enforce` or treat shadow rows as live-ready evidence
+> without a separately reviewed paper period with ingest actually on.
 
 Two independent latches must both be set, and the Coinbase key must pass the
 trade-only assertion:
@@ -258,8 +289,9 @@ See [docs/deploy-vps.md](docs/deploy-vps.md) for the full guide. Quick path:
 
 ```bash
 sudo bash scripts/vps-setup.sh          # once, as root
-cp .env.production.example .env         # fill Reddit, X, Postgres, alerts
-# set mock.enabled: false in config/sources.yaml
+# VPS tracks cursor/exit-horizon-redesign-a3ae (not main)
+cp .env.production.example .env         # Postgres, alerts, Cursor key; X/Reddit optional
+# mock.enabled: false; sources.x.enabled: false on the live box
 docker compose up -d --build
 docker compose exec trader smt doctor     # verify VPS paper config
 docker compose logs -f trader
@@ -267,9 +299,11 @@ docker compose logs -f trader
 
 During the paper soak, the bot tracks elapsed days in `data/soak.json`, sends
 daily digest alerts, and blocks live mode until the minimum soak is met. The
-clock is bound to a canonical SHA-256 of the resolved trading policy. A relevant
-strategy, risk, market, signal, universe, source, or LLM policy change starts a
-new generation automatically while retaining bounded prior-generation history.
+clock is bound to a canonical SHA-256 of the resolved trading policy. A
+strategies, risk, market, signals, universe, or LLM change starts a new
+generation automatically (bounded prior-generation history is kept). Turning
+X/Reddit ingest on or off is a sources-only identity update and keeps the
+current generation.
 
 ## Ops commands
 
@@ -327,8 +361,9 @@ expected result until the conservative sample, coverage, and observation floors
 in `config/ops.yaml` are met. Outcome-group floors count only linked, closed
 paper trades—not unresolved audit rows. Sonnet also requires at least 95%
 completion across eligible pending/complete/error reviews and a low error rate.
-Current X/count collection and the Sonnet judge must remain enabled; historical
-rows cannot make a disabled evidence pipeline READY.
+With X ingest paused, `shadow-report` cannot become READY: historical rows
+cannot make a disabled evidence pipeline READY. Turn ingest back on only as a
+deliberate soak-generation change, then collect a new sample.
 
 Activation is staged, never automatic: review the report, activate only an
 individual READY tier in a separately approved paper rollout, re-observe it,
@@ -394,5 +429,6 @@ docs/       venue.md, deploy-vps.md, go-live-checklist.md, compromise-runbook.md
 
 ## Roadmap
 
-1. **Now:** prove social-momentum on Coinbase spot (intraday + swing, paper then live).
+1. **Now:** finish the gen-8 paper soak on Coinbase spot (swing-heavy, price-only,
+   no hashed YAML churn). Social stays parked.
 2. **Later (separate repo):** Solana meme-coin bot on-chain — different venue, wallet, and risk model; not mixed with this stack.
