@@ -5,13 +5,28 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import pytest
 from _helpers import make_store
 
 from smt.config import TradeAlertsConfig, WeeklyReportConfig
 from smt.models import ExitReason, Trade, TradeStatus
 from smt.ops.alerts import split_message
-from smt.ops.reports import build_weekly_report, trade_closed_alert, trade_opened_alert
+from smt.ops.reports import (
+    SETUP_BUCKETS,
+    UNKNOWN_SETUP,
+    aggregate_cost_stats,
+    build_compare_report,
+    build_weekly_report,
+    classify_setup,
+    resolve_setup_name,
+    setup_cost_stats,
+    trade_closed_alert,
+    trade_fee_pct_of_notional,
+    trade_gross_pnl,
+    trade_opened_alert,
+)
 from smt.ops.schedule import WeeklyScheduler
+from smt.store import OPPORTUNITY_LEDGER_VERSION, opportunity_key
 
 EASTERN = ZoneInfo("America/New_York")
 
@@ -98,7 +113,17 @@ def test_unknown_timezone_falls_back_instead_of_crashing(tmp_path):
 # ---- Report content ---------------------------------------------------------
 
 
-def _closed_trade(store, ticker, pnl, *, strategy="intraday", closed_at, notional=250.0):
+def _closed_trade(
+    store,
+    ticker,
+    pnl,
+    *,
+    strategy="intraday",
+    closed_at,
+    notional=250.0,
+    fees=1.0,
+    setup="",
+):
     trade = Trade(
         ticker=ticker,
         strategy=strategy,
@@ -114,11 +139,41 @@ def _closed_trade(store, ticker, pnl, *, strategy="intraday", closed_at, notiona
         exit_price=100.0 + pnl,
         exit_reason=ExitReason.TAKE_PROFIT if pnl >= 0 else ExitReason.STOP_LOSS,
         realized_pnl=pnl,
-        fees_paid=1.0,
+        fees_paid=fees,
+        setup=setup,
         opened_at=closed_at - timedelta(hours=3),
         closed_at=closed_at,
     )
     return store.add_trade(trade)
+
+
+def _link_setup(store, trade, setup_name: str, *, run_id: str = "report-test") -> str:
+    fingerprint = "a" * 64
+    trigger_ts = 1_700_000_000 + int(trade.id)
+    key = opportunity_key(
+        config_fingerprint=fingerprint,
+        run_id=run_id,
+        strategy=trade.strategy,
+        ticker=trade.ticker,
+        trigger_candle_ts=trigger_ts,
+    )
+    store.upsert_opportunity(
+        opportunity_key=key,
+        ledger_version=OPPORTUNITY_LEDGER_VERSION,
+        config_fingerprint=fingerprint,
+        run_id=run_id,
+        strategy=trade.strategy,
+        ticker=trade.ticker,
+        product_id=trade.product_id,
+        trigger_granularity_seconds=900,
+        trigger_candle_ts=trigger_ts,
+        trigger_closed_at=datetime.fromtimestamp(trigger_ts, tz=UTC),
+        outcome_status="opened",
+        outcome_reason="filled",
+        setup_name=setup_name,
+    )
+    store.enrich_opportunity(key, trade_id=trade.id)
+    return key
 
 
 def test_weekly_report_totals_only_the_window(tmp_path):
@@ -137,6 +192,12 @@ def test_weekly_report_totals_only_the_window(tmp_path):
     assert "+7.30" in subject
     assert "Trades closed:  2" in body
     assert "NET P/L:        $+7.30" in body
+    assert "Gross P/L:      $+9.30" in body
+    assert "Fees paid:      $2.00" in body
+    assert "Fee% of notional: 0.40%" in body
+    assert "50% (1W / 1L) net" in body
+    assert "50% (1W / 1L) gross" in body
+    assert "By strategy:" in body
     assert "999" not in body
     assert "SOL" in body and "BTC" in body
 
@@ -161,6 +222,102 @@ def test_weekly_report_caps_the_trade_list(tmp_path):
     assert "... and 6 more" in body
 
 
+def test_weekly_report_reports_gross_fees_net_and_both_win_rates(tmp_path):
+    store = make_store(tmp_path)
+    end = datetime(2026, 8, 16, 20, tzinfo=UTC)
+    start = end - timedelta(days=7)
+    _closed_trade(store, "SOL", 9.0, closed_at=end - timedelta(hours=2), fees=1.0, notional=250.0)
+    _closed_trade(
+        store,
+        "BTC",
+        -0.50,
+        strategy="swing",
+        closed_at=end - timedelta(hours=3),
+        fees=1.0,
+        notional=250.0,
+    )
+
+    _, body = build_weekly_report(store, ["intraday", "swing"], start, end, UTC)
+
+    assert "Gross P/L:      $+10.50" in body
+    assert "Fees paid:      $2.00" in body
+    assert "NET P/L:        $+8.50" in body
+    assert "Fee% of notional: 0.40%" in body
+    assert "50%" in body and "100%" in body
+    assert "net" in body and "gross" in body
+    assert "By strategy:" in body
+
+
+def test_setup_buckets_sum_to_closed_trades_and_use_both_sources(tmp_path):
+    store = make_store(tmp_path)
+    end = datetime(2026, 8, 16, 20, tzinfo=UTC)
+    start = end - timedelta(days=7)
+
+    _closed_trade(store, "SOL", 5.0, closed_at=end - timedelta(hours=1), setup="breakout_retest")
+    _closed_trade(store, "BTC", 3.0, closed_at=end - timedelta(hours=2), setup="breakout_close")
+    _closed_trade(store, "ETH", 1.0, closed_at=end - timedelta(hours=3), setup="vwap_pullback")
+    empty = _closed_trade(store, "ZEC", -1.0, closed_at=end - timedelta(hours=4), setup="")
+    linked = _closed_trade(store, "HYPE", 2.0, closed_at=end - timedelta(hours=5), setup="")
+    _link_setup(store, linked, "breakout_retest")
+    kept = _closed_trade(
+        store, "PUMP", 0.5, closed_at=end - timedelta(hours=6), setup="breakout_close"
+    )
+    _link_setup(store, kept, "")
+
+    _, body = build_weekly_report(store, ["intraday"], start, end, UTC)
+    closed = list(store.closed_trades_between(start, end))
+    linked_setups = store.setup_names_for_trade_ids(t.id for t in closed if t.id)
+    rows = setup_cost_stats(closed, linked_setups)
+    counts = {name: stats.n for name, stats in rows}
+
+    assert [name for name, _ in rows] == list(SETUP_BUCKETS)
+    assert counts["breakout_retest"] == 2
+    # Empty linked setup_name falls back to Trade.setup.
+    assert counts["breakout_close"] == 2
+    assert counts["vwap"] == 1
+    assert counts["unknown"] == 1
+    assert sum(counts.values()) == len(closed) == 6
+    assert "By setup:" in body
+    assert resolve_setup_name(empty, {}) == "unknown"
+    assert classify_setup("", "vwap_pullback") == "vwap"
+    assert classify_setup("failed_breakdown") == UNKNOWN_SETUP
+
+
+def test_compare_report_uses_net_headline_and_setup_split(tmp_path):
+    store = make_store(tmp_path)
+    end = datetime(2026, 8, 16, 20, tzinfo=UTC)
+    _closed_trade(
+        store,
+        "SOL",
+        9.0,
+        strategy="intraday",
+        closed_at=end,
+        fees=1.0,
+        notional=200.0,
+        setup="breakout_close",
+    )
+    _closed_trade(
+        store,
+        "BTC",
+        -2.0,
+        strategy="swing",
+        closed_at=end,
+        fees=1.0,
+        notional=300.0,
+        setup="breakout_retest",
+    )
+
+    body = build_compare_report(store, [("intraday", 0.20, 2_000.0), ("swing", 0.60, 6_000.0)])
+    assert "NET_WR" in body and "GROSS_WR" in body
+    assert "Headline win rate is net" in body
+    assert "By setup (closed trades):" in body
+    overall = aggregate_cost_stats(list(store.closed_trades()))
+    assert overall.net_pnl == 7.0
+    assert overall.gross_pnl == 9.0
+    assert overall.fees == 2.0
+    assert overall.fee_pct_of_notional == pytest.approx(2.0 / 500.0)
+
+
 def test_weekly_report_counts_breakeven_separately(tmp_path):
     store = make_store(tmp_path)
     end = datetime(2026, 8, 16, 20, tzinfo=UTC)
@@ -171,6 +328,212 @@ def test_weekly_report_counts_breakeven_separately(tmp_path):
 
     _, body = build_weekly_report(store, ["intraday"], start, end, UTC)
     assert "1W / 1L / 1BE" in body
+    assert "67% (2W / 1L) gross" in body
+
+
+def test_gross_pnl_is_realized_plus_fees_and_fee_pct_uses_notional():
+    closed_at = datetime(2026, 8, 16, 20, tzinfo=UTC)
+    trade = Trade(
+        ticker="SOL",
+        product_id="SOL-USD",
+        qty=1.0,
+        entry_price=100.0,
+        entry_notional=200.0,
+        take_profit=110.0,
+        stop_loss=95.0,
+        time_stop_at=closed_at,
+        realized_pnl=-0.50,
+        fees_paid=1.00,
+        setup="breakout_close",
+        opened_at=closed_at,
+        closed_at=closed_at,
+    )
+    assert trade_gross_pnl(trade) == 0.50
+    assert trade_fee_pct_of_notional(trade) == 0.005
+    zero = Trade(
+        ticker="BTC",
+        product_id="BTC-USD",
+        qty=1.0,
+        entry_price=100.0,
+        entry_notional=0.0,
+        take_profit=110.0,
+        stop_loss=95.0,
+        time_stop_at=closed_at,
+        realized_pnl=-2.0,
+        fees_paid=2.0,
+        opened_at=closed_at,
+        closed_at=closed_at,
+    )
+    assert trade_fee_pct_of_notional(zero) == 0.0
+
+
+def test_resolve_setup_name_uses_opportunity_then_trade_then_unknown():
+    closed_at = datetime(2026, 8, 16, 20, tzinfo=UTC)
+    trade = Trade(
+        ticker="SOL",
+        product_id="SOL-USD",
+        qty=1.0,
+        entry_price=100.0,
+        entry_notional=250.0,
+        take_profit=110.0,
+        stop_loss=95.0,
+        time_stop_at=closed_at,
+        setup="breakout_close",
+        opened_at=closed_at,
+        closed_at=closed_at,
+    )
+    trade.id = 5
+    assert classify_setup("vwap_pullback") == "vwap"
+    assert classify_setup("") == UNKNOWN_SETUP
+    assert classify_setup("failed_breakdown") == UNKNOWN_SETUP
+    assert resolve_setup_name(trade, {5: "breakout_retest"}) == "breakout_retest"
+    assert resolve_setup_name(trade, {5: ""}) == "breakout_close"
+    assert resolve_setup_name(trade, {5: "   "}) == "breakout_close"
+    assert resolve_setup_name(trade, {5: "vwap_pullback"}) == "vwap"
+    assert resolve_setup_name(trade, {}) == "breakout_close"
+    trade.setup = ""
+    assert resolve_setup_name(trade, {}) == UNKNOWN_SETUP
+    assert resolve_setup_name(trade, {9: "vwap_pullback"}) == UNKNOWN_SETUP
+
+
+def test_weekly_report_splits_costs_and_setups(tmp_path):
+    store = make_store(tmp_path)
+    end = datetime(2026, 8, 16, 20, tzinfo=UTC)
+    start = end - timedelta(days=7)
+
+    retest = _closed_trade(
+        store, "SOL", -0.40, closed_at=end - timedelta(hours=2), fees=1.00, setup="breakout_close"
+    )
+    close = _closed_trade(
+        store,
+        "ETH",
+        12.00,
+        strategy="swing",
+        closed_at=end - timedelta(hours=3),
+        fees=2.00,
+        setup="breakout_close",
+    )
+    vwap = _closed_trade(
+        store, "BTC", 5.00, closed_at=end - timedelta(hours=4), fees=1.00, setup=""
+    )
+    other = _closed_trade(
+        store,
+        "DOGE",
+        -3.00,
+        closed_at=end - timedelta(hours=5),
+        notional=0.0,
+        fees=1.50,
+        setup="failed_breakdown",
+    )
+    _link_setup(store, retest, "breakout_retest")
+    _link_setup(store, close, "breakout_close")
+    _link_setup(store, vwap, "vwap_pullback")
+
+    _, body = build_weekly_report(store, ["intraday", "swing"], start, end, UTC)
+    assert "By setup:" in body
+    assert "breakout_retest" in body
+    assert "breakout_close" in body
+    assert "vwap" in body
+    assert "unknown" in body
+    assert "vwap_pullback" not in body
+    assert "failed_breakdown" not in body
+
+    closed = list(store.closed_trades_between(start, end))
+    linked = store.setup_names_for_trade_ids(t.id for t in closed)
+    buckets = setup_cost_stats(closed, linked)
+    assert [name for name, _ in buckets] == list(SETUP_BUCKETS)
+    assert sum(stats.n for _, stats in buckets) == len(closed) == 4
+    by_name = dict(buckets)
+    assert by_name["breakout_retest"].n == 1
+    assert by_name["breakout_retest"].net_pnl == -0.40
+    assert by_name["breakout_retest"].gross_pnl == 0.60
+    assert by_name["breakout_retest"].net_wins == 0
+    assert by_name["breakout_retest"].gross_wins == 1
+    assert by_name["vwap"].n == 1
+    assert by_name[UNKNOWN_SETUP].n == 1
+    assert by_name[UNKNOWN_SETUP].fee_pct_of_notional == 0.0
+    assert other.setup == "failed_breakdown"
+
+    overall = aggregate_cost_stats(closed)
+    assert overall.gross_pnl == pytest.approx(overall.net_pnl + overall.fees)
+    assert "TOTAL" in body
+
+
+def test_empty_setups_count_as_unknown(tmp_path):
+    store = make_store(tmp_path)
+    end = datetime(2026, 8, 16, 20, tzinfo=UTC)
+    start = end - timedelta(days=7)
+    blank = _closed_trade(store, "SOL", 1.0, closed_at=end - timedelta(hours=1), setup="")
+    spaced = _closed_trade(store, "ETH", -1.0, closed_at=end - timedelta(hours=2), setup="  ")
+    _link_setup(store, blank, "")
+
+    _, body = build_weekly_report(store, ["intraday"], start, end, UTC)
+    closed = list(store.closed_trades_between(start, end))
+    linked = store.setup_names_for_trade_ids(t.id for t in closed)
+    buckets = dict(setup_cost_stats(closed, linked))
+    assert list(buckets) == list(SETUP_BUCKETS)
+    assert sum(stats.n for stats in buckets.values()) == 2
+    assert buckets[UNKNOWN_SETUP].n == 2
+    assert UNKNOWN_SETUP in body
+    assert spaced.setup.strip() == ""
+
+
+def test_compare_report_costs_and_setup_totals(tmp_path):
+    store = make_store(tmp_path)
+    end = datetime(2026, 8, 16, 20, tzinfo=UTC)
+    a = _closed_trade(
+        store, "SOL", -0.40, closed_at=end, fees=1.00, setup="ignored", notional=100.0
+    )
+    b = _closed_trade(
+        store,
+        "ETH",
+        8.00,
+        strategy="swing",
+        closed_at=end,
+        fees=2.00,
+        setup="breakout_close",
+        notional=200.0,
+    )
+    c = _closed_trade(store, "BTC", 0.0, closed_at=end, fees=1.00, setup="", notional=100.0)
+    _link_setup(store, a, "breakout_retest")
+    _link_setup(store, b, "breakout_close")
+
+    body = build_compare_report(
+        store, [("intraday", 0.4, 4_000.0), ("swing", 0.6, 6_000.0)], mode="PAPER"
+    )
+    assert "NET_WR" in body and "GROSS_WR" in body and "FEE%" in body
+    assert "By setup (closed trades):" in body
+    assert "breakout_retest" in body
+    assert "breakout_close" in body
+    assert UNKNOWN_SETUP in body
+    assert "40%" in body and "60%" in body
+    assert "Slippage stays in fill price / gross" in body
+
+    closed = list(store.closed_trades())
+    linked = store.setup_names_for_trade_ids(t.id for t in closed)
+    buckets = setup_cost_stats(closed, linked)
+    assert sum(stats.n for _, stats in buckets) == 3
+    by_name = dict(buckets)
+    assert by_name["breakout_retest"].gross_pnl == pytest.approx(0.60)
+    assert by_name["breakout_retest"].net_pnl == pytest.approx(-0.40)
+    assert by_name["breakout_close"].n == 1
+    assert by_name[UNKNOWN_SETUP].n == 1
+    assert c.setup == ""
+    assert "TOTAL" in body
+    overall = aggregate_cost_stats(closed)
+    assert overall.n == 3
+    assert overall.net_wins == 1
+    assert overall.net_breakeven == 1
+    assert overall.gross_wins == 3
+    assert overall.fee_pct_of_notional == pytest.approx(4.0 / 400.0)
+
+
+def test_compare_report_empty_book_has_zero_rates(tmp_path):
+    store = make_store(tmp_path)
+    body = build_compare_report(store, ["intraday"], mode="PAPER")
+    assert "No closed trades." in body
+    assert "0%" in body
+    assert "By setup" not in body
 
 
 # ---- Trade notifications ----------------------------------------------------
