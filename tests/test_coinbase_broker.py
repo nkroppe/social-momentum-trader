@@ -10,7 +10,12 @@ from _helpers import make_store, make_strategy, make_universe
 from smt.config import SecurityConfig, Settings
 from smt.models import ExitReason, TradeStatus
 from smt.trader.broker import Fill
-from smt.trader.coinbase import CoinbaseBroker, ForbiddenApiPathError, TransferPermissionError
+from smt.trader.coinbase import (
+    CoinbaseBroker,
+    ForbiddenApiPathError,
+    PortfolioScopeError,
+    TransferPermissionError,
+)
 from smt.trader.manager import TradeManager
 from smt.trader.signals import TradeCandidate
 
@@ -121,6 +126,14 @@ class FakeREST:
     def list_orders(self, **kwargs):
         self.calls.append(("list_orders", kwargs))
         return {"orders": [{"order_id": oid} for oid in self.open_ids]}
+
+    def get_accounts(self, **kwargs):
+        self.calls.append(("get_accounts", kwargs))
+        return {
+            "accounts": [
+                {"available_balance": {"value": "100.00", "currency": "USD"}},
+            ]
+        }
 
 
 def _broker(rest: FakeREST | None = None) -> tuple[CoinbaseBroker, FakeREST]:
@@ -289,3 +302,96 @@ def test_manager_chandelier_ratchet_replaces_stop(tmp_path):
     assert open_trade is not None
     if open_trade.trailing_stop > first:
         assert len(broker.replaces) >= 2
+
+
+def test_missing_portfolio_id_raises_before_any_client_call():
+    rest = FakeREST()
+    settings = Settings(
+        coinbase_api_key="test-key",
+        coinbase_api_secret="test-secret",
+        coinbase_portfolio_id="",
+        paper_start_equity=5_000,
+    )
+    with pytest.raises(PortfolioScopeError, match="COINBASE_PORTFOLIO_ID"):
+        CoinbaseBroker(settings, _security(), client=rest)
+    assert rest.calls == []
+    assert rest.perms.can_view is True
+
+    blank = Settings(
+        coinbase_api_key="test-key",
+        coinbase_api_secret="test-secret",
+        coinbase_portfolio_id="   ",
+        paper_start_equity=5_000,
+    )
+    with pytest.raises(PortfolioScopeError, match="COINBASE_PORTFOLIO_ID"):
+        CoinbaseBroker(blank, _security(), client=FakeREST())
+
+
+def test_scoped_kwargs_inject_retail_portfolio_id_on_required_methods():
+    broker, client = _broker()
+    scoped = broker._scoped(product_ids=["BTC-USD"])
+    assert scoped == {
+        "product_ids": ["BTC-USD"],
+        "retail_portfolio_id": "portfolio-1",
+    }
+
+    broker.open_long("BTC-USD", 100.0, 110.0, 90.0)
+    broker.close_long("BTC-USD", 0.50, reference_price=99.0)
+    broker.replace_remaining_bracket("BTC-USD", 0.50, 115.0, 102.0)
+    assert broker.portfolio_equity_usd() == pytest.approx(100.0)
+
+    required = {
+        "bracket_buy",
+        "bracket_sell",
+        "market_sell",
+        "list_orders",
+        "get_accounts",
+    }
+    seen: set[str] = set()
+    for kind, kwargs in client.calls:
+        if kind in required:
+            seen.add(kind)
+            assert kwargs["retail_portfolio_id"] == "portfolio-1"
+    assert seen == required
+
+
+def test_typeerror_fail_closed_never_retries_unscoped():
+    class RejectScope(FakeREST):
+        def trigger_bracket_order_gtc_buy(self, **kwargs):
+            self.calls.append(("bracket_buy", kwargs))
+            if "retail_portfolio_id" in kwargs:
+                raise TypeError("unexpected keyword argument 'retail_portfolio_id'")
+            return {"success_response": {"order_id": "entry-1"}}
+
+        def get_accounts(self, **kwargs):
+            self.calls.append(("get_accounts", kwargs))
+            if "retail_portfolio_id" in kwargs:
+                raise TypeError("unexpected keyword argument 'retail_portfolio_id'")
+            return {"accounts": []}
+
+        def list_orders(self, **kwargs):
+            self.calls.append(("list_orders", kwargs))
+            if "retail_portfolio_id" in kwargs:
+                raise TypeError("unexpected keyword argument 'retail_portfolio_id'")
+            return {"orders": []}
+
+    rest = RejectScope()
+    broker, _ = _broker(rest)
+    with pytest.raises(PortfolioScopeError, match="refusing unscoped"):
+        broker.open_long("BTC-USD", 100.0, 110.0, 90.0)
+    buys = [call for call in rest.calls if call[0] == "bracket_buy"]
+    assert len(buys) == 1
+    assert buys[0][1]["retail_portfolio_id"] == "portfolio-1"
+
+    with pytest.raises(PortfolioScopeError, match="refusing unscoped"):
+        broker.portfolio_equity_usd()
+    accounts = [call for call in rest.calls if call[0] == "get_accounts"]
+    assert len(accounts) == 1
+    assert accounts[0][1]["retail_portfolio_id"] == "portfolio-1"
+
+    with pytest.raises(PortfolioScopeError, match="refusing unscoped"):
+        broker._list_open_order_ids("BTC-USD")
+    listed = [call for call in rest.calls if call[0] == "list_orders"]
+    assert len(listed) == 1
+    assert listed[0][1]["retail_portfolio_id"] == "portfolio-1"
+    assert all("retail_portfolio_id" in call[1] for call in rest.calls if isinstance(call[1], dict))

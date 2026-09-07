@@ -37,6 +37,10 @@ class ForbiddenApiPathError(RuntimeError):
     """Raised when a request path looks like a transfer/withdraw."""
 
 
+class PortfolioScopeError(RuntimeError):
+    """Raised when the isolated Coinbase portfolio cannot be scoped."""
+
+
 def _field(obj: Any, *names: str, default: Any = None) -> Any:
     for name in names:
         if isinstance(obj, dict) and name in obj and obj[name] not in (None, ""):
@@ -115,6 +119,11 @@ class CoinbaseBroker:
             )
         else:
             self.client = client
+        self._portfolio_id = str(settings.coinbase_portfolio_id or "").strip()
+        if not self._portfolio_id:
+            raise PortfolioScopeError(
+                "COINBASE_PORTFOLIO_ID is required; refusing unscoped Coinbase access"
+            )
         self._protect_orders: dict[str, set[str]] = {}
         self._assert_trade_only()
 
@@ -147,6 +156,25 @@ class CoinbaseBroker:
                 raise ForbiddenApiPathError(
                     f"Blocked forbidden API path fragment '{bad}' in {path}"
                 )
+
+    def _scoped(self, **kwargs: Any) -> dict[str, Any]:
+        """Inject retail_portfolio_id. Never return kwargs that omit the portfolio."""
+        if not self._portfolio_id:
+            raise PortfolioScopeError(
+                "COINBASE_PORTFOLIO_ID is required; refusing unscoped Coinbase access"
+            )
+        return {**kwargs, "retail_portfolio_id": self._portfolio_id}
+
+    def _call_scoped(self, method: Any, **kwargs: Any) -> Any:
+        """Call a client method with portfolio scope. TypeError is fail-closed."""
+        scoped = self._scoped(**kwargs)
+        try:
+            return method(**scoped)
+        except TypeError as exc:
+            name = getattr(method, "__name__", "client method")
+            raise PortfolioScopeError(
+                f"{name} rejected retail_portfolio_id; refusing unscoped Coinbase call"
+            ) from exc
 
     def _track(self, product_id: str, order_id: str) -> None:
         if order_id:
@@ -194,10 +222,13 @@ class CoinbaseBroker:
     def _list_open_order_ids(self, product_id: str) -> list[str]:
         self._guard_path("/orders/historical/batch")
         try:
-            resp = self.client.list_orders(
+            resp = self._call_scoped(
+                self.client.list_orders,
                 product_ids=[product_id],
                 order_status=["OPEN", "PENDING"],
             )
+        except PortfolioScopeError:
+            raise
         except Exception as exc:  # noqa: BLE001 - cancel still proceeds with known ids
             log.warning("list_orders failed for %s leftover brackets: %s", product_id, exc)
             return []
@@ -247,7 +278,8 @@ class CoinbaseBroker:
         if tp <= sl_price:
             tp = sl_price * 1.02 if sl_price > 0 else tp_price
         client_order_id = f"smt-{uuid.uuid4().hex}"
-        resp = self.client.trigger_bracket_order_gtc_sell(
+        resp = self._call_scoped(
+            self.client.trigger_bracket_order_gtc_sell,
             client_order_id=client_order_id,
             product_id=product_id,
             base_size=str(qty),
@@ -275,7 +307,8 @@ class CoinbaseBroker:
         self._guard_path("/orders")
         client_order_id = f"smt-{uuid.uuid4().hex}"
         # Attached bracket: server-side TP/SL that reduce/close the position.
-        resp = self.client.trigger_bracket_order_gtc_buy(
+        resp = self._call_scoped(
+            self.client.trigger_bracket_order_gtc_buy,
             client_order_id=client_order_id,
             product_id=product_id,
             quote_size=str(round(notional_usd, 2)),
@@ -311,7 +344,8 @@ class CoinbaseBroker:
             self.cancel_leftover_brackets(product_id)
         self._guard_path("/orders")
         client_order_id = f"smt-{uuid.uuid4().hex}"
-        resp = self.client.market_order_sell(
+        resp = self._call_scoped(
+            self.client.market_order_sell,
             client_order_id=client_order_id,
             product_id=product_id,
             base_size=str(qty),
@@ -337,7 +371,7 @@ class CoinbaseBroker:
     def portfolio_equity_usd(self) -> float:
         self._guard_path("/accounts")
         total = 0.0
-        accounts = self.client.get_accounts()
+        accounts = self._call_scoped(self.client.get_accounts)
         items = accounts.get("accounts", []) if isinstance(accounts, dict) else accounts.accounts
         for acct in items:
             bal = acct["available_balance"] if isinstance(acct, dict) else acct.available_balance
