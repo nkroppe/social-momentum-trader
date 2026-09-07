@@ -12,18 +12,26 @@ from smt.config import TradeAlertsConfig, WeeklyReportConfig
 from smt.models import ExitReason, Trade, TradeStatus
 from smt.ops.alerts import split_message
 from smt.ops.reports import (
+    MFE_R_EPSILON,
+    NOTIONAL_BUCKETS,
     SETUP_BUCKETS,
     UNKNOWN_SETUP,
     aggregate_cost_stats,
+    aggregate_mfe_capture,
     build_compare_report,
     build_weekly_report,
+    classify_notional,
     classify_setup,
+    notional_cost_stats,
     resolve_setup_name,
     setup_cost_stats,
+    ticker_cost_stats,
     trade_closed_alert,
     trade_fee_pct_of_notional,
     trade_gross_pnl,
+    trade_mfe_capture,
     trade_opened_alert,
+    trade_realized_r,
 )
 from smt.ops.schedule import WeeklyScheduler
 from smt.store import OPPORTUNITY_LEDGER_VERSION, opportunity_key
@@ -123,6 +131,10 @@ def _closed_trade(
     notional=250.0,
     fees=1.0,
     setup="",
+    highest_price=0.0,
+    initial_risk_per_unit=0.0,
+    original_qty=1.0,
+    qty=1.0,
 ):
     trade = Trade(
         ticker=ticker,
@@ -130,11 +142,14 @@ def _closed_trade(
         product_id=f"{ticker}-USD",
         is_live=False,
         status=TradeStatus.CLOSED,
-        qty=1.0,
+        qty=qty,
+        original_qty=original_qty,
         entry_price=100.0,
         entry_notional=notional,
         take_profit=110.0,
         stop_loss=95.0,
+        highest_price=highest_price,
+        initial_risk_per_unit=initial_risk_per_unit,
         time_stop_at=closed_at,
         exit_price=100.0 + pnl,
         exit_reason=ExitReason.TAKE_PROFIT if pnl >= 0 else ExitReason.STOP_LOSS,
@@ -534,6 +549,183 @@ def test_compare_report_empty_book_has_zero_rates(tmp_path):
     assert "No closed trades." in body
     assert "0%" in body
     assert "By setup" not in body
+
+
+def test_notional_fee_buckets_boundaries_fee_pct_and_fee_to_gross():
+    assert [classify_notional(n) for n in (0.0, 299.99, 300.0, 499.99, 500.0, 699.99, 700.0)] == [
+        "<$300",
+        "<$300",
+        "$300-500",
+        "$300-500",
+        "$500-700",
+        "$500-700",
+        ">=$700",
+    ]
+
+    closed_at = datetime(2026, 8, 16, 20, tzinfo=UTC)
+
+    def _trade(ticker: str, notional: float, pnl: float, fees: float) -> Trade:
+        return Trade(
+            ticker=ticker,
+            product_id=f"{ticker}-USD",
+            qty=1.0,
+            entry_price=100.0,
+            entry_notional=notional,
+            take_profit=110.0,
+            stop_loss=95.0,
+            time_stop_at=closed_at,
+            realized_pnl=pnl,
+            fees_paid=fees,
+            opened_at=closed_at,
+            closed_at=closed_at,
+        )
+
+    trades = [
+        _trade("SOL", 250.0, 4.0, 1.0),
+        _trade("ETH", 300.0, -2.0, 1.5),
+        _trade("BTC", 500.0, 6.0, 2.0),
+        _trade("HYPE", 700.0, -8.0, 3.5),
+    ]
+    rows = notional_cost_stats(trades)
+    assert [name for name, _ in rows] == list(NOTIONAL_BUCKETS)
+    by_name = dict(rows)
+    assert sum(stats.n for stats in by_name.values()) == 4
+    assert by_name["<$300"].n == 1
+    assert by_name["<$300"].fee_pct_of_notional == pytest.approx(1.0 / 250.0)
+    assert by_name["<$300"].fee_to_gross == pytest.approx(1.0 / 5.0)
+    assert by_name["$300-500"].fee_pct_of_notional == pytest.approx(1.5 / 300.0)
+    assert by_name["$300-500"].fee_to_gross == pytest.approx(1.5 / (-2.0 + 1.5))
+    assert by_name["$500-700"].fee_to_gross == pytest.approx(2.0 / 8.0)
+    assert by_name[">=$700"].fee_pct_of_notional == pytest.approx(3.5 / 700.0)
+    assert by_name[">=$700"].fee_to_gross == pytest.approx(3.5 / (-8.0 + 3.5))
+    zero_gross = aggregate_cost_stats([_trade("ZEC", 100.0, -1.0, 1.0)])
+    assert zero_gross.gross_pnl == 0.0
+    assert zero_gross.fee_to_gross == 0.0
+
+
+def test_closes_by_ticker_groups_closed_trades():
+    closed_at = datetime(2026, 8, 16, 20, tzinfo=UTC)
+
+    def _trade(ticker: str, pnl: float, fees: float, notional: float) -> Trade:
+        return Trade(
+            ticker=ticker,
+            product_id=f"{ticker}-USD",
+            qty=1.0,
+            entry_price=100.0,
+            entry_notional=notional,
+            take_profit=110.0,
+            stop_loss=95.0,
+            time_stop_at=closed_at,
+            realized_pnl=pnl,
+            fees_paid=fees,
+            opened_at=closed_at,
+            closed_at=closed_at,
+        )
+
+    trades = [
+        _trade("SOL", 4.0, 1.0, 250.0),
+        _trade("BTC", -2.0, 1.0, 400.0),
+        _trade("SOL", 1.0, 0.5, 250.0),
+    ]
+    rows = ticker_cost_stats(trades)
+    assert [name for name, _ in rows] == ["BTC", "SOL"]
+    by_name = dict(rows)
+    assert by_name["SOL"].n == 2
+    assert by_name["SOL"].net_pnl == pytest.approx(5.0)
+    assert by_name["SOL"].fees == pytest.approx(1.5)
+    assert by_name["BTC"].n == 1
+    assert by_name["BTC"].fee_pct_of_notional == pytest.approx(1.0 / 400.0)
+
+
+def test_mfe_capture_excludes_nonpositive_and_does_not_cap_above_one():
+    closed_at = datetime(2026, 8, 16, 20, tzinfo=UTC)
+
+    def _trade(*, pnl: float, highest: float, risk: float, qty: float = 1.0) -> Trade:
+        return Trade(
+            ticker="SOL",
+            product_id="SOL-USD",
+            qty=qty,
+            original_qty=qty,
+            entry_price=100.0,
+            entry_notional=250.0,
+            take_profit=110.0,
+            stop_loss=95.0,
+            highest_price=highest,
+            initial_risk_per_unit=risk,
+            time_stop_at=closed_at,
+            realized_pnl=pnl,
+            fees_paid=0.0,
+            opened_at=closed_at,
+            closed_at=closed_at,
+        )
+
+    # MFE_R = (110-100)/10 = 1.0; realized_R = 15/10 = 1.5 → capture 1.5 (no cap).
+    above_one = _trade(pnl=15.0, highest=110.0, risk=10.0)
+    assert trade_realized_r(above_one) == pytest.approx(1.5)
+    assert trade_mfe_capture(above_one) == pytest.approx(1.5)
+
+    # highest == entry → MFE_R = 0, excluded.
+    assert trade_mfe_capture(_trade(pnl=5.0, highest=100.0, risk=10.0)) is None
+    # risk <= 0 → MFE_R = 0, excluded.
+    assert trade_mfe_capture(_trade(pnl=5.0, highest=120.0, risk=0.0)) is None
+    # MFE_R == epsilon is excluded; a hair above is kept.
+    epsilon_high = 100.0 + (10.0 * MFE_R_EPSILON)
+    assert trade_mfe_capture(_trade(pnl=1.0, highest=epsilon_high, risk=10.0)) is None
+    kept = _trade(pnl=-5.0, highest=105.0, risk=10.0)
+    assert trade_mfe_capture(kept) == pytest.approx((-5.0 / 10.0) / 0.5)
+
+    stats = aggregate_mfe_capture(
+        [
+            above_one,
+            _trade(pnl=5.0, highest=100.0, risk=10.0),
+            kept,
+        ]
+    )
+    assert stats.n == 2
+    assert stats.mean == pytest.approx((1.5 + (-1.0)) / 2.0)
+
+
+def test_weekly_and_compare_wire_notional_ticker_and_mfe_capture(tmp_path):
+    store = make_store(tmp_path)
+    end = datetime(2026, 8, 16, 20, tzinfo=UTC)
+    start = end - timedelta(days=7)
+    _closed_trade(
+        store,
+        "SOL",
+        10.0,
+        closed_at=end - timedelta(hours=2),
+        notional=250.0,
+        fees=1.0,
+        highest_price=110.0,
+        initial_risk_per_unit=10.0,
+    )
+    _closed_trade(
+        store,
+        "BTC",
+        -5.0,
+        strategy="swing",
+        closed_at=end - timedelta(hours=3),
+        notional=610.0,
+        fees=2.0,
+        highest_price=105.0,
+        initial_risk_per_unit=10.0,
+    )
+
+    _, weekly = build_weekly_report(store, ["intraday", "swing"], start, end, UTC)
+    assert "By notional:" in weekly
+    assert "<$300" in weekly
+    assert "$500-700" in weekly
+    assert "By ticker:" in weekly
+    assert "SOL" in weekly and "BTC" in weekly
+    assert "fee/gross" in weekly
+    assert "MFE capture (realized_R / MFE_R, exclude MFE_R<=0):" in weekly
+    assert "n=2" in weekly
+
+    compare = build_compare_report(store, ["intraday", "swing"])
+    assert "By notional:" in compare
+    assert "By ticker:" in compare
+    assert "MFE capture (realized_R / MFE_R, exclude MFE_R<=0):" in compare
+    assert "n=2" in compare
 
 
 # ---- Trade notifications ----------------------------------------------------

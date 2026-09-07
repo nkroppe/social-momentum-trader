@@ -18,6 +18,8 @@ from ..trader.exit_policy import mfe_r
 
 UNKNOWN_SETUP = "unknown"
 SETUP_BUCKETS = ("breakout_retest", "breakout_close", "vwap", "unknown")
+NOTIONAL_BUCKETS = ("<$300", "$300-500", "$500-700", ">=$700")
+MFE_R_EPSILON = 1e-12
 _PREFERRED_SETUPS = SETUP_BUCKETS[:-1]
 
 
@@ -88,8 +90,20 @@ class CostStats:
         return (self.fees / self.entry_notional) if self.entry_notional else 0.0
 
     @property
+    def fee_to_gross(self) -> float:
+        return (self.fees / self.gross_pnl) if self.gross_pnl else 0.0
+
+    @property
     def avg_hold_hours(self) -> float:
         return (self.hold_seconds / self.n / 3600.0) if self.n else 0.0
+
+
+@dataclass(frozen=True)
+class MfeCaptureStats:
+    """Mean realized_R / MFE_R over trades with MFE_R > epsilon. Not capped at 1.0."""
+
+    n: int = 0
+    mean: float = 0.0
 
 
 def aggregate_cost_stats(trades: Sequence[Trade]) -> CostStats:
@@ -183,6 +197,66 @@ def setup_cost_stats(
     return [(name, aggregate_cost_stats(buckets[name])) for name in SETUP_BUCKETS]
 
 
+def classify_notional(notional: float) -> str:
+    """Map entry notional onto the four digest fee buckets."""
+    size = float(notional or 0.0)
+    if size < 300.0:
+        return "<$300"
+    if size < 500.0:
+        return "$300-500"
+    if size < 700.0:
+        return "$500-700"
+    return ">=$700"
+
+
+def notional_cost_stats(trades: Sequence[Trade]) -> list[tuple[str, CostStats]]:
+    """Always emit the four notional buckets so counts sum to closed trades."""
+    buckets: dict[str, list[Trade]] = {name: [] for name in NOTIONAL_BUCKETS}
+    for trade in trades:
+        buckets[classify_notional(trade.entry_notional)].append(trade)
+    return [(name, aggregate_cost_stats(buckets[name])) for name in NOTIONAL_BUCKETS]
+
+
+def ticker_cost_stats(trades: Sequence[Trade]) -> list[tuple[str, CostStats]]:
+    """Closed-trade cost rollup keyed by ticker, sorted for stable digest output."""
+    buckets: dict[str, list[Trade]] = {}
+    for trade in trades:
+        buckets.setdefault(trade.ticker, []).append(trade)
+    return [(ticker, aggregate_cost_stats(buckets[ticker])) for ticker in sorted(buckets)]
+
+
+def trade_risk_dollars(trade: Trade) -> float:
+    qty = float(getattr(trade, "original_qty", 0.0) or trade.qty or 0.0)
+    return max(float(trade.initial_risk_per_unit or 0.0) * qty, 0.0)
+
+
+def trade_realized_r(trade: Trade) -> float:
+    risk = trade_risk_dollars(trade)
+    return (float(trade.realized_pnl) / risk) if risk else 0.0
+
+
+def trade_mfe_capture(trade: Trade, *, epsilon: float = MFE_R_EPSILON) -> float | None:
+    """realized_R / MFE_R. None when MFE_R <= epsilon. Not capped at 1.0."""
+    peak = _mfe_r(trade)
+    if peak <= epsilon:
+        return None
+    return trade_realized_r(trade) / peak
+
+
+def aggregate_mfe_capture(
+    trades: Sequence[Trade],
+    *,
+    epsilon: float = MFE_R_EPSILON,
+) -> MfeCaptureStats:
+    captures = [
+        capture
+        for trade in trades
+        if (capture := trade_mfe_capture(trade, epsilon=epsilon)) is not None
+    ]
+    n = len(captures)
+    return MfeCaptureStats(n=n, mean=(sum(captures) / n) if n else 0.0)
+
+
 def _wl(wins: int, losses: int, breakeven: int) -> str:
     extra = f" / {breakeven}BE" if breakeven else ""
     return f"{wins}W / {losses}L{extra}"
@@ -193,7 +267,8 @@ def _cost_row(label: str, stats: CostStats, label_width: int) -> str:
         f"  {label:<{label_width}} {stats.n:>3}  "
         f"{stats.net_win_rate:>4.0%} net  {stats.gross_win_rate:>4.0%} gross  "
         f"gross ${stats.gross_pnl:>9,.2f}  fees ${stats.fees:>8,.2f}  "
-        f"net ${stats.net_pnl:>9,.2f}  fee% {stats.fee_pct_of_notional:>6.2%}"
+        f"net ${stats.net_pnl:>9,.2f}  fee% {stats.fee_pct_of_notional:>6.2%}  "
+        f"fee/gross {stats.fee_to_gross:>6.2%}"
     )
 
 
@@ -222,6 +297,29 @@ def _cost_section(title: str, rows: Sequence[tuple[str, CostStats]]) -> list[str
     lines.extend(_cost_row(label, stats, width) for label, stats in rows)
     if len(rows) > 1:
         lines.append(_cost_row("TOTAL", _merge_cost_stats(rows), width))
+    return lines
+
+
+def _mfe_capture_section(trades: Sequence[Trade]) -> list[str]:
+    stats = aggregate_mfe_capture(trades)
+    return [
+        "",
+        "MFE capture (realized_R / MFE_R, exclude MFE_R<=0): "
+        f"n={stats.n}  mean={stats.mean:.2f}",
+    ]
+
+
+def _closed_trade_digest_sections(
+    trades: Sequence[Trade],
+    linked_setups: dict[int, str],
+    setup_title: str,
+) -> list[str]:
+    if not trades:
+        return []
+    lines = _cost_section(setup_title, setup_cost_stats(trades, linked_setups))
+    lines += _cost_section("By notional:", notional_cost_stats(trades))
+    lines += _cost_section("By ticker:", ticker_cost_stats(trades))
+    lines += _mfe_capture_section(trades)
     return lines
 
 
@@ -383,8 +481,7 @@ def build_weekly_report(
             for name in strategy_names
         ]
         lines += _cost_section("By strategy:", by_strategy)
-    if closed:
-        lines += _cost_section("By setup:", setup_cost_stats(closed, linked_setups))
+    lines += _closed_trade_digest_sections(closed, linked_setups, "By setup:")
 
     open_trades = store.open_trades()
     if open_trades:
@@ -488,7 +585,9 @@ def build_compare_report(
             f"{total.fee_pct_of_notional:>8.2%}"
         )
     if closed:
-        lines += _cost_section("By setup (closed trades):", setup_cost_stats(closed, linked_setups))
+        lines += _closed_trade_digest_sections(
+            closed, linked_setups, "By setup (closed trades):"
+        )
     else:
         lines += ["", "No closed trades."]
     return "\n".join(lines)
