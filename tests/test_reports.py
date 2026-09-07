@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -668,8 +669,9 @@ def test_mfe_capture_excludes_nonpositive_and_does_not_cap_above_one():
     assert trade_mfe_capture(_trade(pnl=5.0, highest=100.0, risk=10.0)) is None
     # risk <= 0 → MFE_R = 0, excluded.
     assert trade_mfe_capture(_trade(pnl=5.0, highest=120.0, risk=0.0)) is None
-    # MFE_R == epsilon is excluded; a hair above is kept.
-    epsilon_high = 100.0 + (10.0 * MFE_R_EPSILON)
+    # A representable positive MFE still at/under epsilon is excluded.
+    epsilon_high = 100.0 + math.ulp(100.0)
+    assert ((epsilon_high - 100.0) / 10.0) <= MFE_R_EPSILON
     assert trade_mfe_capture(_trade(pnl=1.0, highest=epsilon_high, risk=10.0)) is None
     kept = _trade(pnl=-5.0, highest=105.0, risk=10.0)
     assert trade_mfe_capture(kept) == pytest.approx((-5.0 / 10.0) / 0.5)
