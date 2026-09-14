@@ -434,12 +434,22 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
         )
     )
 
-    coinbase_ok = settings.coinbase_configured and bool(settings.coinbase_portfolio_id)
+    portfolio_id = str(settings.coinbase_portfolio_id or "").strip()
+    coinbase_ok = settings.coinbase_configured and bool(portfolio_id)
+    if not settings.coinbase_configured:
+        coinbase_detail = "COINBASE_API_KEY, COINBASE_API_SECRET, COINBASE_PORTFOLIO_ID required"
+    elif not portfolio_id:
+        coinbase_detail = (
+            "COINBASE_PORTFOLIO_ID is empty; broker refuses unscoped Coinbase access. "
+            "Set the isolated bot portfolio UUID in VPS .env (Nick must set; do not invent one)"
+        )
+    else:
+        coinbase_detail = "COINBASE_API_KEY, COINBASE_API_SECRET, COINBASE_PORTFOLIO_ID configured"
     results.append(
         CheckResult(
             "coinbase_credentials",
             coinbase_ok,
-            "COINBASE_API_KEY, COINBASE_API_SECRET, COINBASE_PORTFOLIO_ID required",
+            coinbase_detail,
         )
     )
 

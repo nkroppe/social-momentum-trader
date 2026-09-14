@@ -265,6 +265,10 @@ trade-only assertion:
 3. Coinbase API key = **View + Trade only** (Transfer disabled). On startup the
    app calls `get_api_key_permissions()` and **refuses to run** if
    `can_transfer` is true.
+4. VPS `.env` must set `COINBASE_PORTFOLIO_ID` to the isolated bot portfolio
+   UUID. **Nick must set this** — do not invent a UUID. The broker **refuses
+   unscoped** Coinbase access when this key is empty or whitespace. `smt doctor
+   --live` fails `coinbase_credentials` until it is present.
 
 Advanced partial/Chandelier management is currently **PAPER-only**. `smt doctor
 --live` and Runner startup explicitly block LIVE while it is enabled because

@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
 
-from ..models import Trade
+from ..models import ExitReason, Trade
 from ..store import Store
 from ..trader.exit_policy import mfe_r
 
@@ -104,6 +104,36 @@ class MfeCaptureStats:
 
     n: int = 0
     mean: float = 0.0
+
+
+@dataclass(frozen=True)
+class StopLossFill:
+    """Hard-stop intended vs fill. TRAILING_STOP is excluded; intended is stop_loss."""
+
+    ticker: str
+    intended: float
+    fill: float
+    delta_dollars: float
+    delta_r: float
+    fee: float
+
+
+@dataclass(frozen=True)
+class StopLossFillStats:
+    n: int = 0
+    mean_delta_dollars: float = 0.0
+    mean_delta_r: float = 0.0
+    fees: float = 0.0
+
+
+@dataclass(frozen=True)
+class IntradayNotionalFee:
+    """Closed intraday row: size vs round-trip fee. Not a filtered global bucket."""
+
+    ticker: str
+    entry_notional: float
+    fees: float
+    fee_pct: float
 
 
 def aggregate_cost_stats(trades: Sequence[Trade]) -> CostStats:
@@ -235,6 +265,128 @@ def trade_realized_r(trade: Trade) -> float:
     return (float(trade.realized_pnl) / risk) if risk else 0.0
 
 
+def is_hard_stop_loss(trade: Trade) -> bool:
+    """True only for EXIT_REASON STOP_LOSS. TRAILING_STOP is a different exit."""
+    reason = trade.exit_reason
+    value = reason.value if isinstance(reason, ExitReason) else reason
+    return value == ExitReason.STOP_LOSS
+
+
+def stop_loss_fill_qty(trade: Trade) -> float:
+    return float(getattr(trade, "original_qty", 0.0) or trade.qty or 0.0)
+
+
+def stop_loss_dollar_slip(trade: Trade) -> float:
+    """(fill - intended stop) * qty. Long: negative means a worse fill than stop_loss."""
+    qty = stop_loss_fill_qty(trade)
+    return (float(trade.exit_price or 0.0) - float(trade.stop_loss or 0.0)) * qty
+
+
+def stop_loss_r_slip(trade: Trade) -> float:
+    """Δ$ / initial risk dollars. Zero when risk fields are missing."""
+    risk = trade_risk_dollars(trade)
+    return (stop_loss_dollar_slip(trade) / risk) if risk else 0.0
+
+
+def stop_loss_fill_row(trade: Trade) -> StopLossFill:
+    return StopLossFill(
+        ticker=trade.ticker,
+        intended=float(trade.stop_loss or 0.0),
+        fill=float(trade.exit_price or 0.0),
+        delta_dollars=stop_loss_dollar_slip(trade),
+        delta_r=stop_loss_r_slip(trade),
+        fee=float(trade.fees_paid or 0.0),
+    )
+
+
+def stop_loss_fills(trades: Sequence[Trade]) -> list[StopLossFill]:
+    return [stop_loss_fill_row(trade) for trade in trades if is_hard_stop_loss(trade)]
+
+
+def aggregate_stop_loss_fills(trades: Sequence[Trade]) -> StopLossFillStats:
+    rows = stop_loss_fills(trades)
+    n = len(rows)
+    if not n:
+        return StopLossFillStats()
+    return StopLossFillStats(
+        n=n,
+        mean_delta_dollars=sum(row.delta_dollars for row in rows) / n,
+        mean_delta_r=sum(row.delta_r for row in rows) / n,
+        fees=sum(row.fee for row in rows),
+    )
+
+
+def format_stop_loss_fill_row(row: StopLossFill) -> str:
+    return (
+        f"  {row.ticker:<5} intended ${row.intended:,.6f}  fill ${row.fill:,.6f}  "
+        f"Δ$ ${row.delta_dollars:>+,.2f}  ΔR {row.delta_r:>+.2f}  fee ${row.fee:,.2f}"
+    )
+
+
+def format_stop_loss_week_summary(stats: StopLossFillStats) -> str:
+    return (
+        f"STOP_LOSS week: n={stats.n}  mean Δ$=${stats.mean_delta_dollars:+,.2f}  "
+        f"mean ΔR={stats.mean_delta_r:+.2f}  fees ${stats.fees:,.2f}"
+    )
+
+
+def _stop_loss_fill_section(trades: Sequence[Trade]) -> list[str]:
+    rows = stop_loss_fills(trades)
+    if not rows:
+        return []
+    lines = ["", "STOP_LOSS intended vs fill:"]
+    lines.extend(format_stop_loss_fill_row(row) for row in rows)
+    lines.append(format_stop_loss_week_summary(aggregate_stop_loss_fills(trades)))
+    return lines
+
+
+def intraday_notional_fee_rows(trades: Sequence[Trade]) -> list[IntradayNotionalFee]:
+    """Closed-only intraday size vs fee. Callers pass already-closed trades."""
+    rows: list[IntradayNotionalFee] = []
+    for trade in trades:
+        if trade.strategy != "intraday":
+            continue
+        rows.append(
+            IntradayNotionalFee(
+                ticker=trade.ticker,
+                entry_notional=float(trade.entry_notional or 0.0),
+                fees=float(trade.fees_paid or 0.0),
+                fee_pct=trade_fee_pct_of_notional(trade),
+            )
+        )
+    return rows
+
+
+def format_intraday_notional_fee_row(row: IntradayNotionalFee) -> str:
+    return (
+        f"  {row.ticker:<5} notional ${row.entry_notional:>9,.2f}  "
+        f"fees ${row.fees:>8,.2f}  fee% {row.fee_pct:>6.2%}"
+    )
+
+
+def _intraday_notional_fee_section(trades: Sequence[Trade]) -> list[str]:
+    rows = intraday_notional_fee_rows(trades)
+    if not rows:
+        return []
+    lines = ["", "Intraday notional vs fee:"]
+    lines.extend(format_intraday_notional_fee_row(row) for row in rows)
+    if len(rows) > 1:
+        notional = sum(row.entry_notional for row in rows)
+        fees = sum(row.fees for row in rows)
+        fee_pct = (fees / notional) if notional else 0.0
+        lines.append(
+            format_intraday_notional_fee_row(
+                IntradayNotionalFee(
+                    ticker="TOTAL",
+                    entry_notional=notional,
+                    fees=fees,
+                    fee_pct=fee_pct,
+                )
+            )
+        )
+    return lines
+
+
 def trade_mfe_capture(trade: Trade, *, epsilon: float = MFE_R_EPSILON) -> float | None:
     """realized_R / MFE_R. None when MFE_R <= epsilon. Not capped at 1.0."""
     peak = _mfe_r(trade)
@@ -319,6 +471,7 @@ def _closed_trade_digest_sections(
     lines = _cost_section(setup_title, setup_cost_stats(trades, linked_setups))
     lines += _cost_section("By notional:", notional_cost_stats(trades))
     lines += _cost_section("By ticker:", ticker_cost_stats(trades))
+    lines += _intraday_notional_fee_section(trades)
     lines += _mfe_capture_section(trades)
     return lines
 
@@ -370,23 +523,30 @@ def trade_closed_alert(trade: Trade) -> tuple[str, str]:
     reason = trade.exit_reason.value if trade.exit_reason else "?"
 
     subject = f"SELL {trade.ticker} [{trade.strategy}] {result} ${pnl:+,.2f}"
-    body = "\n".join(
-        [
-            f"Sold {trade.qty:.8f} {trade.ticker} @ ${trade.exit_price:,.6f}",
-            f"Entry: ${trade.entry_price:,.6f}",
-            f"Reason: {reason}",
-            "",
-            f"P/L: ${pnl:+,.2f} ({_pnl_pct(trade):+.2%})",
-            f"Fees: ${trade.fees_paid:,.2f}",
-            f"Held: {_hold_hours(trade):.1f}h",
-            f"MFE: {_mfe_r(trade):.2f}R",
-            f"Exit profile: {trade.exit_profile_label or 'legacy'}",
-            f"Config fingerprint: {trade.config_fingerprint or 'legacy'}",
-            f"Exit snapshot: {_snapshot_text(trade)}",
-            f"Mode: {'LIVE' if trade.is_live else 'PAPER'}",
+    lines = [
+        f"Sold {trade.qty:.8f} {trade.ticker} @ ${trade.exit_price:,.6f}",
+        f"Entry: ${trade.entry_price:,.6f}",
+        f"Reason: {reason}",
+        "",
+        f"P/L: ${pnl:+,.2f} ({_pnl_pct(trade):+.2%})",
+        f"Fees: ${trade.fees_paid:,.2f}",
+    ]
+    if is_hard_stop_loss(trade):
+        fill = stop_loss_fill_row(trade)
+        lines += [
+            f"Intended stop: ${fill.intended:,.6f}",
+            f"Fill: ${fill.fill:,.6f}",
+            f"Δ$: ${fill.delta_dollars:+,.2f}  ΔR {fill.delta_r:+.2f}",
         ]
-    )
-    return subject, body
+    lines += [
+        f"Held: {_hold_hours(trade):.1f}h",
+        f"MFE: {_mfe_r(trade):.2f}R",
+        f"Exit profile: {trade.exit_profile_label or 'legacy'}",
+        f"Config fingerprint: {trade.config_fingerprint or 'legacy'}",
+        f"Exit snapshot: {_snapshot_text(trade)}",
+        f"Mode: {'LIVE' if trade.is_live else 'PAPER'}",
+    ]
+    return subject, "\n".join(lines)
 
 
 def trade_partial_alert(
@@ -482,6 +642,7 @@ def build_weekly_report(
         ]
         lines += _cost_section("By strategy:", by_strategy)
     lines += _closed_trade_digest_sections(closed, linked_setups, "By setup:")
+    lines += _stop_loss_fill_section(closed)
 
     open_trades = store.open_trades()
     if open_trades:
