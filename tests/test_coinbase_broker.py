@@ -327,6 +327,31 @@ def test_missing_portfolio_id_raises_before_any_client_call():
         CoinbaseBroker(blank, _security(), client=FakeREST())
 
 
+def test_live_preflight_empty_portfolio_id_hardens_doctor_detail(monkeypatch, tmp_path):
+    from smt.ops.preflight import run_preflight
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("smt.ops.preflight._market_data_checks", lambda: [])
+    settings = Settings(
+        coinbase_api_key="test-key",
+        coinbase_api_secret="test-secret",
+        coinbase_portfolio_id="",
+        paper_start_equity=5_000,
+    )
+    monkeypatch.setattr("smt.ops.preflight.get_settings", lambda: settings)
+    results = {row.name: row for row in run_preflight("live")}
+    creds = results["coinbase_credentials"]
+    assert creds.passed is False
+    assert "COINBASE_PORTFOLIO_ID is empty" in creds.detail
+    assert "refuses unscoped" in creds.detail
+
+    blank = settings.model_copy(update={"coinbase_portfolio_id": "   "})
+    monkeypatch.setattr("smt.ops.preflight.get_settings", lambda: blank)
+    blank_creds = {row.name: row for row in run_preflight("live")}["coinbase_credentials"]
+    assert blank_creds.passed is False
+    assert "COINBASE_PORTFOLIO_ID is empty" in blank_creds.detail
+
+
 def test_scoped_kwargs_inject_retail_portfolio_id_on_required_methods():
     broker, client = _broker()
     scoped = broker._scoped(product_ids=["BTC-USD"])
