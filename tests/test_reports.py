@@ -922,11 +922,12 @@ def test_intraday_notional_fee_is_dedicated_closed_subsection(tmp_path):
     closed = list(store.closed_trades())
     rows = intraday_notional_fee_rows(closed)
     assert [row.ticker for row in rows] == ["SOL", "SOL"]
-    assert rows[0].entry_notional == pytest.approx(250.0)
-    assert rows[0].fees == pytest.approx(1.00)
-    assert rows[0].fee_pct == pytest.approx(1.00 / 250.0)
-    assert rows[1].entry_notional == pytest.approx(400.0)
-    assert rows[1].fee_pct == pytest.approx(2.00 / 400.0)
+    by_notional = {row.entry_notional: row for row in rows}
+    assert set(by_notional) == {250.0, 400.0}
+    assert by_notional[250.0].fees == pytest.approx(1.00)
+    assert by_notional[250.0].fee_pct == pytest.approx(1.00 / 250.0)
+    assert by_notional[400.0].fees == pytest.approx(2.00)
+    assert by_notional[400.0].fee_pct == pytest.approx(2.00 / 400.0)
     assert all(row.ticker != "BTC" for row in rows)
 
     _, weekly = build_weekly_report(store, ["intraday", "swing"], start, end, UTC)
