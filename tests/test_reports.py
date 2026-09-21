@@ -152,6 +152,7 @@ def _closed_trade(
     exit_reason=None,
     trailing_stop=0.0,
     config_fingerprint="",
+    exit_snapshot=None,
 ):
     trade = Trade(
         ticker=ticker,
@@ -178,6 +179,7 @@ def _closed_trade(
         realized_pnl=pnl,
         fees_paid=fees,
         setup=setup,
+        exit_snapshot=exit_snapshot,
         config_fingerprint=config_fingerprint,
         opened_at=closed_at - timedelta(hours=3),
         closed_at=closed_at,
@@ -897,6 +899,41 @@ def test_weekly_report_stop_loss_rows_and_week_summary(tmp_path):
     assert "STOP_LOSS fill Δ by ticker × notional:" in compare
     assert "ETH   <$300      n=1  mean Δ$=$-0.50  mean ΔR=-0.10  fees $0.50" in compare
     assert "SOL   <$300      n=1  mean Δ$=$-1.00  mean ΔR=-0.20  fees $1.50" in compare
+
+
+def test_weekly_report_mfe_event_snapshot_section(tmp_path):
+    store = make_store(tmp_path)
+    end = datetime(2026, 8, 16, 20, tzinfo=UTC)
+    start = end - timedelta(days=7)
+    _closed_trade(
+        store,
+        "SOL",
+        8.0,
+        closed_at=end - timedelta(hours=2),
+        exit_snapshot={
+            "mfe_r_at_partial": 1.20,
+            "realized_r_at_partial": 0.45,
+            "mfe_r_at_trail": 1.50,
+            "realized_r_at_trail": 0.80,
+        },
+    )
+    _, body = build_weekly_report(store, ["intraday"], start, end, UTC)
+    assert "MFE / realized R at partial & trail:" in body
+    assert (
+        "SOL   partial MFE=1.20R realized=0.45R giveback=0.75R  |  "
+        "trail MFE=1.50R realized=0.80R giveback=0.70R"
+    ) in body
+    compare = build_compare_report(store, ["intraday"])
+    assert "MFE / realized R at partial & trail:" not in compare
+
+
+def test_weekly_report_omits_mfe_event_section_without_keys(tmp_path):
+    store = make_store(tmp_path)
+    end = datetime(2026, 8, 16, 20, tzinfo=UTC)
+    start = end - timedelta(days=7)
+    _closed_trade(store, "SOL", 8.0, closed_at=end - timedelta(hours=2))
+    _, body = build_weekly_report(store, ["intraday"], start, end, UTC)
+    assert "MFE / realized R at partial & trail:" not in body
 
 
 def _stop_loss_trade(

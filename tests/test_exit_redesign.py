@@ -15,6 +15,7 @@ from smt.trader.exit_policy import (
     bar_step,
     first_partial_quantity,
     legacy_profile,
+    mfe_r,
     quote_step,
     time_exit_reason,
 )
@@ -128,9 +129,15 @@ def test_trade_snapshot_and_fingerprint_are_persisted_and_immutable(tmp_path):
     assert trade.config_fingerprint == "a" * 64
     assert trade.exit_profile_label == "snapshot_test"
     assert trade.exit_snapshot["partial_take_profit_fraction"] == 0.25
-    trade.exit_profile_label = "mutated"
+    trade.exit_snapshot = {**trade.exit_snapshot, "mfe_r_at_partial": 1.2}
+    store.update_trade(trade)
+    persisted = store.open_trade_for("BTC", strategy.name)
+    assert persisted is not None
+    assert persisted.exit_snapshot["mfe_r_at_partial"] == pytest.approx(1.2)
+    assert persisted.exit_snapshot["partial_take_profit_fraction"] == 0.25
+    persisted.exit_profile_label = "mutated"
     with pytest.raises(ValueError, match="immutable"):
-        store.update_trade(trade)
+        store.update_trade(persisted)
 
 
 def test_migration_is_idempotent_and_adds_snapshot_columns(tmp_path):
@@ -182,8 +189,13 @@ def test_legacy_open_trade_keeps_frozen_pre_redesign_profile(tmp_path):
     persisted = store.open_trade_for("BTC", "intraday")
     assert persisted is not None
     assert persisted.qty == pytest.approx(5.0)
-    assert persisted.exit_snapshot is None
     assert persisted.exit_profile_label == ""
+    assert persisted.exit_snapshot is not None
+    assert persisted.exit_snapshot["label"] == "legacy_intraday"
+    assert persisted.exit_snapshot["partial_take_profit_fraction"] == 0.50
+    assert persisted.exit_snapshot["chandelier_atr_mult"] == 3.0
+    assert "mfe_r_at_partial" in persisted.exit_snapshot
+    assert "realized_r_at_partial" in persisted.exit_snapshot
     assert legacy_profile("swing").time_stop_hours == 48
     assert legacy_profile("bear_rally").chandelier_atr_mult == 2.5
 
@@ -259,11 +271,19 @@ def test_bear_bounded_target_label_still_runs_partial_and_trail(tmp_path):
     assert partial.partial_taken is True
     assert partial.qty == pytest.approx(partial.original_qty * 0.50)
     assert partial.trailing_stop > partial.entry_price
+    assert "mfe_r_at_partial" in partial.exit_snapshot
+    assert "realized_r_at_partial" in partial.exit_snapshot
+    assert "mfe_r_at_trail" not in partial.exit_snapshot
 
     broker.set_price("BTC-USD", partial.trailing_stop - 1.0)
     manager.manage_open_trades()
     closed = store.closed_trades_for("BTC", bear.name)[-1]
     assert closed.exit_reason == ExitReason.TRAILING_STOP
+    assert closed.exit_snapshot["mfe_r_at_partial"] == pytest.approx(
+        partial.exit_snapshot["mfe_r_at_partial"]
+    )
+    assert "mfe_r_at_trail" in closed.exit_snapshot
+    assert "realized_r_at_trail" in closed.exit_snapshot
 
 
 def test_chandelier_requests_the_explicit_slower_atr_granularity(tmp_path):
@@ -340,3 +360,116 @@ def test_stale_mfe_threshold_and_five_day_hard_stop_are_distinct():
         )
         == "TIME_STOP"
     )
+
+
+def _candidate(**overrides) -> TradeCandidate:
+    values = dict(
+        ticker="BTC",
+        product_id="BTC-USD",
+        zscore=5.0,
+        mentions=20,
+        sources=3,
+        reason="test",
+        strategy="intraday",
+        setup="breakout_close",
+        entry_price=100.0,
+        structure_stop=90.0,
+        stop_pct=0.10,
+    )
+    values.update(overrides)
+    return TradeCandidate(**values)
+
+
+def _risk_dollars(trade: Trade) -> float:
+    return max(trade.initial_risk_per_unit * (trade.original_qty or trade.qty), 0.0)
+
+
+def test_partial_fire_writes_mfe_r_into_exit_snapshot(tmp_path):
+    store = make_store(tmp_path)
+    broker = PaperBroker(seed=7)
+    broker.set_price("BTC-USD", 100.0)
+    strategy = make_strategy(
+        exit_profile={
+            "label": "partial_mfe",
+            "mode": "partial_trail",
+            "partial_take_profit_fraction": 0.25,
+            "partial_take_profit_r": 1.5,
+        }
+    )
+    manager = TradeManager(
+        Settings(paper_start_equity=5_000),
+        make_universe(),
+        store,
+        broker,
+        strategies=[strategy],
+        config_fingerprint="c" * 64,
+    )
+    opened = manager.open_position(_candidate(strategy=strategy.name), 1_000.0, strategy)
+    profile_keys = {
+        key: opened.exit_snapshot[key] for key in ("label", "mode", "partial_take_profit_fraction")
+    }
+    broker.set_price("BTC-USD", opened.take_profit)
+    manager.manage_open_trades()
+
+    partial = store.open_trade_for("BTC", strategy.name)
+    assert partial is not None and partial.partial_taken
+    assert partial.exit_snapshot["label"] == profile_keys["label"]
+    assert partial.exit_snapshot["mode"] == profile_keys["mode"]
+    assert (
+        partial.exit_snapshot["partial_take_profit_fraction"]
+        == profile_keys["partial_take_profit_fraction"]
+    )
+    expected_mfe = mfe_r(
+        partial.highest_price, partial.entry_price, partial.initial_risk_per_unit
+    )
+    risk = _risk_dollars(partial)
+    expected_realized = partial.partial_realized_pnl / risk if risk else 0.0
+    assert partial.exit_snapshot["mfe_r_at_partial"] == pytest.approx(expected_mfe)
+    assert partial.exit_snapshot["realized_r_at_partial"] == pytest.approx(expected_realized)
+    assert "mfe_r_at_trail" not in partial.exit_snapshot
+
+
+def test_trailing_stop_close_writes_trail_keys_stop_loss_does_not(tmp_path):
+    store = make_store(tmp_path)
+    broker = PaperBroker(seed=8)
+    broker.set_price("BTC-USD", 100.0)
+    strategy = make_strategy(
+        exit_profile={
+            "label": "trail_mfe",
+            "mode": "partial_trail",
+            "partial_take_profit_fraction": 0.25,
+        }
+    )
+    manager = TradeManager(
+        Settings(paper_start_equity=5_000),
+        make_universe(),
+        store,
+        broker,
+        strategies=[strategy],
+        config_fingerprint="d" * 64,
+    )
+
+    stop_trade = manager.open_position(_candidate(strategy=strategy.name), 1_000.0, strategy)
+    manager._close(stop_trade, 89.0, ExitReason.STOP_LOSS)  # noqa: SLF001
+    stopped = store.closed_trades_for("BTC", strategy.name)[-1]
+    assert stopped.exit_reason == ExitReason.STOP_LOSS
+    assert "mfe_r_at_trail" not in (stopped.exit_snapshot or {})
+    assert "realized_r_at_trail" not in (stopped.exit_snapshot or {})
+    assert stopped.exit_snapshot["label"] == "trail_mfe"
+
+    broker.set_price("SOL-USD", 100.0)
+    trail_trade = manager.open_position(
+        _candidate(ticker="SOL", product_id="SOL-USD", strategy=strategy.name),
+        1_000.0,
+        strategy,
+    )
+    trail_trade.highest_price = 120.0
+    manager._close(trail_trade, 110.0, ExitReason.TRAILING_STOP)  # noqa: SLF001
+    closed = store.closed_trades_for("SOL", strategy.name)[-1]
+    assert closed.exit_reason == ExitReason.TRAILING_STOP
+    expected_mfe = mfe_r(closed.highest_price, closed.entry_price, closed.initial_risk_per_unit)
+    risk = _risk_dollars(closed)
+    expected_realized = closed.realized_pnl / risk if risk else 0.0
+    assert closed.exit_snapshot["mfe_r_at_trail"] == pytest.approx(expected_mfe)
+    assert closed.exit_snapshot["realized_r_at_trail"] == pytest.approx(expected_realized)
+    assert closed.exit_snapshot["label"] == "trail_mfe"

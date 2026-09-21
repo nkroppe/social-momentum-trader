@@ -22,6 +22,12 @@ NOTIONAL_BUCKETS = ("<$300", "$300-500", "$500-700", ">=$700")
 MFE_R_EPSILON = 1e-12
 GEN8_CONFIG_FINGERPRINT_PREFIX = "c95a0ad410f4"
 _PREFERRED_SETUPS = SETUP_BUCKETS[:-1]
+MFE_EVENT_SNAPSHOT_KEYS = (
+    "mfe_r_at_partial",
+    "realized_r_at_partial",
+    "mfe_r_at_trail",
+    "realized_r_at_trail",
+)
 
 
 def _aware(dt: datetime) -> datetime:
@@ -407,6 +413,65 @@ def _stop_loss_fill_rollup_section(trades: Sequence[Trade]) -> list[str]:
     return lines
 
 
+def snapshot_event_float(trade: Trade, key: str) -> float | None:
+    """Read one exit_snapshot event float. Missing or non-numeric keys are omitted."""
+    snapshot = trade.exit_snapshot
+    if not isinstance(snapshot, dict) or key not in snapshot:
+        return None
+    try:
+        return float(snapshot[key])
+    except (TypeError, ValueError):
+        return None
+
+
+def has_mfe_event_snapshot(trade: Trade) -> bool:
+    snapshot = trade.exit_snapshot
+    if not isinstance(snapshot, dict):
+        return False
+    return any(key in snapshot for key in MFE_EVENT_SNAPSHOT_KEYS)
+
+
+def _event_r_clause(prefix: str, mfe: float | None, realized: float | None) -> str | None:
+    if mfe is None and realized is None:
+        return None
+    parts = [prefix]
+    if mfe is not None:
+        parts.append(f"MFE={mfe:.2f}R")
+    if realized is not None:
+        parts.append(f"realized={realized:.2f}R")
+    if mfe is not None and realized is not None:
+        parts.append(f"giveback={mfe - realized:.2f}R")
+    return " ".join(parts)
+
+
+def format_mfe_event_row(trade: Trade) -> str:
+    clauses: list[str] = []
+    partial = _event_r_clause(
+        "partial",
+        snapshot_event_float(trade, "mfe_r_at_partial"),
+        snapshot_event_float(trade, "realized_r_at_partial"),
+    )
+    trail = _event_r_clause(
+        "trail",
+        snapshot_event_float(trade, "mfe_r_at_trail"),
+        snapshot_event_float(trade, "realized_r_at_trail"),
+    )
+    if partial:
+        clauses.append(partial)
+    if trail:
+        clauses.append(trail)
+    return f"  {trade.ticker:<5} {'  |  '.join(clauses)}"
+
+
+def _mfe_event_snapshot_section(trades: Sequence[Trade]) -> list[str]:
+    rows = [trade for trade in trades if has_mfe_event_snapshot(trade)]
+    if not rows:
+        return []
+    lines = ["", "MFE / realized R at partial & trail:"]
+    lines.extend(format_mfe_event_row(trade) for trade in rows)
+    return lines
+
+
 def intraday_notional_fee_rows(trades: Sequence[Trade]) -> list[IntradayNotionalFee]:
     """Closed-only intraday size vs fee. Callers pass already-closed trades."""
     rows: list[IntradayNotionalFee] = []
@@ -740,6 +805,7 @@ def build_weekly_report(
     )
     lines += _stop_loss_fill_section(closed)
     lines += _stop_loss_fill_rollup_section(closed)
+    lines += _mfe_event_snapshot_section(closed)
 
     open_trades = store.open_trades()
     if open_trades:
