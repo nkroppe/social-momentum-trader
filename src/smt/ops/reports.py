@@ -20,7 +20,14 @@ UNKNOWN_SETUP = "unknown"
 SETUP_BUCKETS = ("breakout_retest", "breakout_close", "vwap", "unknown")
 NOTIONAL_BUCKETS = ("<$300", "$300-500", "$500-700", ">=$700")
 MFE_R_EPSILON = 1e-12
+GEN8_CONFIG_FINGERPRINT_PREFIX = "c95a0ad410f4"
 _PREFERRED_SETUPS = SETUP_BUCKETS[:-1]
+MFE_EVENT_SNAPSHOT_KEYS = (
+    "mfe_r_at_partial",
+    "realized_r_at_partial",
+    "mfe_r_at_trail",
+    "realized_r_at_trail",
+)
 
 
 def _aware(dt: datetime) -> datetime:
@@ -127,6 +134,18 @@ class StopLossFillStats:
 
 
 @dataclass(frozen=True)
+class StopLossFillRollupRow:
+    """Closed STOP_LOSS fill-delta means for one ticker × notional cell."""
+
+    ticker: str
+    notional_bucket: str
+    n: int
+    mean_delta_dollars: float
+    mean_delta_r: float
+    fees: float
+
+
+@dataclass(frozen=True)
 class IntradayNotionalFee:
     """Closed intraday row: size vs round-trip fee. Not a filtered global bucket."""
 
@@ -225,6 +244,17 @@ def setup_cost_stats(
     for trade in trades:
         buckets[resolve_setup_name(trade, linked_setups)].append(trade)
     return [(name, aggregate_cost_stats(buckets[name])) for name in SETUP_BUCKETS]
+
+
+def trades_matching_config_fingerprint(
+    trades: Sequence[Trade], fingerprint_prefix: str
+) -> list[Trade]:
+    """Closed-trade filter: config_fingerprint starts with prefix."""
+    return [
+        trade
+        for trade in trades
+        if (trade.config_fingerprint or "").startswith(fingerprint_prefix)
+    ]
 
 
 def classify_notional(notional: float) -> str:
@@ -337,6 +367,108 @@ def _stop_loss_fill_section(trades: Sequence[Trade]) -> list[str]:
     lines = ["", "STOP_LOSS intended vs fill:"]
     lines.extend(format_stop_loss_fill_row(row) for row in rows)
     lines.append(format_stop_loss_week_summary(aggregate_stop_loss_fills(trades)))
+    return lines
+
+
+def stop_loss_fill_rollup(trades: Sequence[Trade]) -> list[StopLossFillRollupRow]:
+    """Mean STOP_LOSS fill Δ by ticker × notional. Empty cells are omitted."""
+    groups: dict[tuple[str, str], list[Trade]] = {}
+    for trade in trades:
+        if not is_hard_stop_loss(trade):
+            continue
+        key = (trade.ticker, classify_notional(trade.entry_notional))
+        groups.setdefault(key, []).append(trade)
+    bucket_rank = {name: i for i, name in enumerate(NOTIONAL_BUCKETS)}
+    rows: list[StopLossFillRollupRow] = []
+    for (ticker, bucket), group in groups.items():
+        stats = aggregate_stop_loss_fills(group)
+        rows.append(
+            StopLossFillRollupRow(
+                ticker=ticker,
+                notional_bucket=bucket,
+                n=stats.n,
+                mean_delta_dollars=stats.mean_delta_dollars,
+                mean_delta_r=stats.mean_delta_r,
+                fees=stats.fees,
+            )
+        )
+    rows.sort(key=lambda row: (row.ticker, bucket_rank[row.notional_bucket]))
+    return rows
+
+
+def format_stop_loss_fill_rollup_row(row: StopLossFillRollupRow) -> str:
+    return (
+        f"  {row.ticker:<5} {row.notional_bucket:<10} n={row.n}  "
+        f"mean Δ$=${row.mean_delta_dollars:+,.2f}  "
+        f"mean ΔR={row.mean_delta_r:+.2f}  fees ${row.fees:,.2f}"
+    )
+
+
+def _stop_loss_fill_rollup_section(trades: Sequence[Trade]) -> list[str]:
+    rows = stop_loss_fill_rollup(trades)
+    if not rows:
+        return []
+    lines = ["", "STOP_LOSS fill Δ by ticker × notional:"]
+    lines.extend(format_stop_loss_fill_rollup_row(row) for row in rows)
+    return lines
+
+
+def snapshot_event_float(trade: Trade, key: str) -> float | None:
+    """Read one exit_snapshot event float. Missing or non-numeric keys are omitted."""
+    snapshot = trade.exit_snapshot
+    if not isinstance(snapshot, dict) or key not in snapshot:
+        return None
+    try:
+        return float(snapshot[key])
+    except (TypeError, ValueError):
+        return None
+
+
+def has_mfe_event_snapshot(trade: Trade) -> bool:
+    snapshot = trade.exit_snapshot
+    if not isinstance(snapshot, dict):
+        return False
+    return any(key in snapshot for key in MFE_EVENT_SNAPSHOT_KEYS)
+
+
+def _event_r_clause(prefix: str, mfe: float | None, realized: float | None) -> str | None:
+    if mfe is None and realized is None:
+        return None
+    parts = [prefix]
+    if mfe is not None:
+        parts.append(f"MFE={mfe:.2f}R")
+    if realized is not None:
+        parts.append(f"realized={realized:.2f}R")
+    if mfe is not None and realized is not None:
+        parts.append(f"giveback={mfe - realized:.2f}R")
+    return " ".join(parts)
+
+
+def format_mfe_event_row(trade: Trade) -> str:
+    clauses: list[str] = []
+    partial = _event_r_clause(
+        "partial",
+        snapshot_event_float(trade, "mfe_r_at_partial"),
+        snapshot_event_float(trade, "realized_r_at_partial"),
+    )
+    trail = _event_r_clause(
+        "trail",
+        snapshot_event_float(trade, "mfe_r_at_trail"),
+        snapshot_event_float(trade, "realized_r_at_trail"),
+    )
+    if partial:
+        clauses.append(partial)
+    if trail:
+        clauses.append(trail)
+    return f"  {trade.ticker:<5} {'  |  '.join(clauses)}"
+
+
+def _mfe_event_snapshot_section(trades: Sequence[Trade]) -> list[str]:
+    rows = [trade for trade in trades if has_mfe_event_snapshot(trade)]
+    if not rows:
+        return []
+    lines = ["", "MFE / realized R at partial & trail:"]
+    lines.extend(format_mfe_event_row(trade) for trade in rows)
     return lines
 
 
@@ -473,6 +605,25 @@ def _closed_trade_digest_sections(
     lines += _cost_section("By ticker:", ticker_cost_stats(trades))
     lines += _intraday_notional_fee_section(trades)
     lines += _mfe_capture_section(trades)
+    return lines
+
+
+def _setup_cohort_scoreboard_section(
+    *,
+    week_trades: Sequence[Trade],
+    week_linked: dict[int, str],
+    cumulative_trades: Sequence[Trade],
+    cumulative_linked: dict[int, str],
+    fingerprint_prefix: str = GEN8_CONFIG_FINGERPRINT_PREFIX,
+) -> list[str]:
+    """This-week vs cumulative CostStats by setup for one config-fingerprint prefix."""
+    week = trades_matching_config_fingerprint(week_trades, fingerprint_prefix)
+    cumulative = trades_matching_config_fingerprint(cumulative_trades, fingerprint_prefix)
+    if not week and not cumulative:
+        return []
+    lines = ["", f"Setup cohort since gen-8 (fp {fingerprint_prefix}):"]
+    lines += _cost_section("This week:", setup_cost_stats(week, week_linked))
+    lines += _cost_section("Cumulative:", setup_cost_stats(cumulative, cumulative_linked))
     return lines
 
 
@@ -642,7 +793,19 @@ def build_weekly_report(
         ]
         lines += _cost_section("By strategy:", by_strategy)
     lines += _closed_trade_digest_sections(closed, linked_setups, "By setup:")
+    all_closed = list(store.closed_trades())
+    cumulative_linked = store.setup_names_for_trade_ids(
+        trade.id for trade in all_closed if trade.id
+    )
+    lines += _setup_cohort_scoreboard_section(
+        week_trades=closed,
+        week_linked=linked_setups,
+        cumulative_trades=all_closed,
+        cumulative_linked=cumulative_linked,
+    )
     lines += _stop_loss_fill_section(closed)
+    lines += _stop_loss_fill_rollup_section(closed)
+    lines += _mfe_event_snapshot_section(closed)
 
     open_trades = store.open_trades()
     if open_trades:
@@ -749,6 +912,22 @@ def build_compare_report(
         lines += _closed_trade_digest_sections(
             closed, linked_setups, "By setup (closed trades):"
         )
+        lines += _stop_loss_fill_rollup_section(closed)
     else:
         lines += ["", "No closed trades."]
+    week_cutoff = datetime.now(UTC) - timedelta(days=7)
+    week_closed = [
+        trade
+        for trade in closed
+        if trade.closed_at is not None and _aware(trade.closed_at) >= week_cutoff
+    ]
+    week_linked = store.setup_names_for_trade_ids(
+        trade.id for trade in week_closed if trade.id
+    )
+    lines += _setup_cohort_scoreboard_section(
+        week_trades=week_closed,
+        week_linked=week_linked,
+        cumulative_trades=closed,
+        cumulative_linked=linked_setups,
+    )
     return "\n".join(lines)

@@ -33,6 +33,7 @@ from .exit_policy import (
     first_partial_quantity,
     initial_levels,
     legacy_profile,
+    mfe_r,
     quote_step,
     resolve_profile,
     time_exit_reason,
@@ -40,6 +41,21 @@ from .exit_policy import (
 from .signals import TradeCandidate
 
 log = get_logger("smt.manager")
+
+
+def merge_exit_snapshot_events(
+    trade: Trade,
+    profile_snapshot: dict | None = None,
+    **events: float,
+) -> None:
+    """Copy exit_snapshot, add event keys, assign back. Preserve profile fields."""
+    snapshot = dict(trade.exit_snapshot) if trade.exit_snapshot else dict(profile_snapshot or {})
+    snapshot.update(events)
+    trade.exit_snapshot = snapshot
+
+
+def _risk_dollars(trade: Trade) -> float:
+    return max(trade.initial_risk_per_unit * (trade.original_qty or trade.qty), 0.0)
 
 
 class TradeManager:
@@ -329,6 +345,16 @@ class TradeManager:
         trade.realized_pnl = trade.partial_realized_pnl + gross - fill.fee - remaining_entry_fee
         trade.status = TradeStatus.CLOSED
         trade.closed_at = utcnow()
+        if reason == ExitReason.TRAILING_STOP:
+            risk_dollars = _risk_dollars(trade)
+            merge_exit_snapshot_events(
+                trade,
+                self._profile_for(trade).snapshot(),
+                mfe_r_at_trail=mfe_r(
+                    trade.highest_price, trade.entry_price, trade.initial_risk_per_unit
+                ),
+                realized_r_at_trail=(trade.realized_pnl / risk_dollars if risk_dollars else 0.0),
+            )
         self.store.update_trade(trade)
         log.info(
             "CLOSED[%s] %s reason=%s exit=%.6f pnl=$%.2f (fees=$%.2f)",
@@ -486,6 +512,17 @@ class TradeManager:
         trade.trailing_stop = max(trade.stop_loss, round(breakeven_floor, 8))
         trade.trailing_stop = self._chandelier_stop(trade, profile)
         self._sync_protecting_bracket(trade)
+        risk_dollars = _risk_dollars(trade)
+        merge_exit_snapshot_events(
+            trade,
+            profile.snapshot(),
+            mfe_r_at_partial=mfe_r(
+                trade.highest_price, trade.entry_price, trade.initial_risk_per_unit
+            ),
+            realized_r_at_partial=(
+                trade.partial_realized_pnl / risk_dollars if risk_dollars else 0.0
+            ),
+        )
         self.store.update_trade(trade)
         log.info(
             "PARTIAL[%s] %s qty=%.8f exit=%.6f pnl=$%.2f trail=%.6f",

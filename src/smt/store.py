@@ -1244,7 +1244,7 @@ class Store:
         with self.session() as s:
             persisted = s.get(Trade, trade.id) if trade.id is not None else None
             if persisted is not None:
-                immutable = ("config_fingerprint", "exit_profile_label", "exit_snapshot")
+                immutable = ("config_fingerprint", "exit_profile_label")
                 for field in immutable:
                     if getattr(persisted, field) != getattr(trade, field):
                         raise ValueError(f"trade {field} is immutable")
