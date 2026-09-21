@@ -13,6 +13,7 @@ from smt.config import TradeAlertsConfig, WeeklyReportConfig
 from smt.models import ExitReason, Trade, TradeStatus
 from smt.ops.alerts import split_message
 from smt.ops.reports import (
+    GEN8_CONFIG_FINGERPRINT_PREFIX,
     MFE_R_EPSILON,
     NOTIONAL_BUCKETS,
     SETUP_BUCKETS,
@@ -42,6 +43,7 @@ from smt.ops.reports import (
     trade_mfe_capture,
     trade_opened_alert,
     trade_realized_r,
+    trades_matching_config_fingerprint,
 )
 from smt.ops.schedule import WeeklyScheduler
 from smt.store import OPPORTUNITY_LEDGER_VERSION, opportunity_key
@@ -149,6 +151,7 @@ def _closed_trade(
     exit_price=None,
     exit_reason=None,
     trailing_stop=0.0,
+    config_fingerprint="",
 ):
     trade = Trade(
         ticker=ticker,
@@ -175,6 +178,7 @@ def _closed_trade(
         realized_pnl=pnl,
         fees_paid=fees,
         setup=setup,
+        config_fingerprint=config_fingerprint,
         opened_at=closed_at - timedelta(hours=3),
         closed_at=closed_at,
     )
@@ -1172,6 +1176,273 @@ def test_buy_alert_carries_the_exit_levels(tmp_path):
 
 def test_trade_alerts_can_be_switched_off():
     assert TradeAlertsConfig(enabled=False).enabled is False
+
+
+# ---- Gen-8 setup cohort scoreboard ------------------------------------------
+
+GEN8_FP = GEN8_CONFIG_FINGERPRINT_PREFIX + "a" * (64 - len(GEN8_CONFIG_FINGERPRINT_PREFIX))
+GEN7_FP = "e788820ab5d0" + "b" * (64 - 12)
+COHORT_HEADER = "Setup cohort since gen-8 (fp c95a0ad410f4):"
+
+
+def _bare_closed_trade(
+    *,
+    ticker: str = "SOL",
+    pnl: float = 1.0,
+    fees: float = 1.0,
+    notional: float = 250.0,
+    setup: str = "breakout_retest",
+    config_fingerprint: str = "",
+    closed_at: datetime | None = None,
+    trade_id: int | None = None,
+) -> Trade:
+    closed_at = closed_at or datetime(2026, 8, 16, 20, tzinfo=UTC)
+    trade = Trade(
+        ticker=ticker,
+        product_id=f"{ticker}-USD",
+        qty=1.0,
+        original_qty=1.0,
+        entry_price=100.0,
+        entry_notional=notional,
+        take_profit=110.0,
+        stop_loss=95.0,
+        time_stop_at=closed_at,
+        exit_price=100.0 + pnl,
+        exit_reason=ExitReason.TAKE_PROFIT if pnl >= 0 else ExitReason.STOP_LOSS,
+        realized_pnl=pnl,
+        fees_paid=fees,
+        setup=setup,
+        config_fingerprint=config_fingerprint,
+        opened_at=closed_at - timedelta(hours=3),
+        closed_at=closed_at,
+    )
+    if trade_id is not None:
+        trade.id = trade_id
+    return trade
+
+
+def _cohort_blocks(body: str) -> tuple[str, str]:
+    assert COHORT_HEADER in body
+    after = body.split(COHORT_HEADER, 1)[1]
+    week, cumulative = after.split("This week:", 1)[1].split("Cumulative:", 1)
+    return week, cumulative
+
+
+def _cost_row_line(block: str, label: str) -> str:
+    for line in block.splitlines():
+        parts = line.split()
+        if parts and parts[0] == label:
+            return line
+    raise AssertionError(f"{label!r} cost row missing from:\n{block}")
+
+
+def _cost_row_n(block: str, label: str) -> int:
+    return int(_cost_row_line(block, label).split()[1])
+
+
+def test_trades_matching_config_fingerprint_uses_prefix_only():
+    gen8 = _bare_closed_trade(ticker="SOL", config_fingerprint=GEN8_FP)
+    gen8_short = _bare_closed_trade(
+        ticker="ETH", config_fingerprint=GEN8_CONFIG_FINGERPRINT_PREFIX
+    )
+    gen7 = _bare_closed_trade(ticker="BTC", config_fingerprint=GEN7_FP)
+    empty = _bare_closed_trade(ticker="HYPE", config_fingerprint="")
+    missing = _bare_closed_trade(ticker="ZEC", config_fingerprint="")
+    missing.config_fingerprint = None  # type: ignore[assignment]
+
+    matched = trades_matching_config_fingerprint(
+        [gen8, gen8_short, gen7, empty, missing], GEN8_CONFIG_FINGERPRINT_PREFIX
+    )
+    assert matched == [gen8, gen8_short]
+    assert GEN8_CONFIG_FINGERPRINT_PREFIX == "c95a0ad410f4"
+
+
+def test_weekly_setup_cohort_filters_fingerprint_and_splits_week_vs_cumulative(tmp_path):
+    store = make_store(tmp_path)
+    end = datetime(2026, 8, 16, 20, tzinfo=UTC)
+    start = end - timedelta(days=7)
+
+    week_gen8 = _closed_trade(
+        store,
+        "SOL",
+        5.0,
+        closed_at=end - timedelta(hours=2),
+        fees=1.0,
+        notional=250.0,
+        setup="breakout_retest",
+        config_fingerprint=GEN8_FP,
+    )
+    prior_gen8 = _closed_trade(
+        store,
+        "BTC",
+        -8.0,
+        strategy="swing",
+        closed_at=start - timedelta(hours=2),
+        fees=2.0,
+        notional=400.0,
+        setup="breakout_close",
+        config_fingerprint=GEN8_FP,
+    )
+    _closed_trade(
+        store,
+        "ETH",
+        9.0,
+        closed_at=end - timedelta(hours=3),
+        fees=1.0,
+        setup="vwap",
+        config_fingerprint=GEN7_FP,
+    )
+    _closed_trade(
+        store,
+        "HYPE",
+        4.0,
+        closed_at=end - timedelta(hours=4),
+        fees=1.0,
+        setup="breakout_retest",
+        config_fingerprint="",
+    )
+    _link_setup(store, week_gen8, "breakout_retest")
+    _link_setup(store, prior_gen8, "breakout_close")
+
+    _, body = build_weekly_report(store, ["intraday", "swing"], start, end, UTC)
+    assert COHORT_HEADER in body
+    assert "This week:" in body
+    assert "Cumulative:" in body
+    week_block, cum_block = _cohort_blocks(body)
+    for name in SETUP_BUCKETS:
+        assert name in week_block
+        assert name in cum_block
+    assert _cost_row_n(week_block, "breakout_retest") == 1
+    assert _cost_row_n(week_block, "breakout_close") == 0
+    assert _cost_row_n(week_block, "vwap") == 0
+    assert _cost_row_n(week_block, "unknown") == 0
+    assert _cost_row_n(week_block, "TOTAL") == 1
+    assert _cost_row_n(cum_block, "breakout_retest") == 1
+    assert _cost_row_n(cum_block, "breakout_close") == 1
+    assert _cost_row_n(cum_block, "TOTAL") == 2
+    week_total = _cost_row_line(week_block, "TOTAL")
+    assert "gross $     6.00" in week_total
+    assert "fees $    1.00" in week_total
+    assert "net $     5.00" in week_total
+    cum_total = _cost_row_line(cum_block, "TOTAL")
+    assert "gross $     0.00" in cum_total
+    assert "fees $    3.00" in cum_total
+    assert "net $    -3.00" in cum_total
+
+
+def test_weekly_setup_cohort_prints_empty_week_when_only_cumulative_has_gen8(tmp_path):
+    store = make_store(tmp_path)
+    end = datetime(2026, 8, 16, 20, tzinfo=UTC)
+    start = end - timedelta(days=7)
+    _closed_trade(
+        store,
+        "SOL",
+        5.0,
+        closed_at=start - timedelta(hours=2),
+        fees=1.0,
+        setup="breakout_retest",
+        config_fingerprint=GEN8_FP,
+    )
+    _closed_trade(
+        store,
+        "ETH",
+        2.0,
+        closed_at=end - timedelta(hours=2),
+        setup="vwap",
+        config_fingerprint=GEN7_FP,
+    )
+
+    _, body = build_weekly_report(store, ["intraday"], start, end, UTC)
+    week_block, cum_block = _cohort_blocks(body)
+    assert _cost_row_n(week_block, "TOTAL") == 0
+    assert _cost_row_n(cum_block, "TOTAL") == 1
+    assert _cost_row_n(cum_block, "breakout_retest") == 1
+    for name in SETUP_BUCKETS:
+        assert name in week_block
+
+
+def test_weekly_setup_cohort_omitted_when_no_gen8_trades(tmp_path):
+    store = make_store(tmp_path)
+    end = datetime(2026, 8, 16, 20, tzinfo=UTC)
+    start = end - timedelta(days=7)
+    _closed_trade(
+        store,
+        "SOL",
+        5.0,
+        closed_at=end - timedelta(hours=2),
+        setup="breakout_retest",
+        config_fingerprint=GEN7_FP,
+    )
+    _closed_trade(
+        store,
+        "BTC",
+        -2.0,
+        closed_at=end - timedelta(hours=3),
+        setup="vwap",
+        config_fingerprint="",
+    )
+
+    _, weekly = build_weekly_report(store, ["intraday"], start, end, UTC)
+    compare = build_compare_report(store, ["intraday"])
+    assert COHORT_HEADER not in weekly
+    assert "This week:" not in weekly
+    assert "Cumulative:" not in weekly
+    assert COHORT_HEADER not in compare
+    assert "This week:" not in compare
+    assert "Cumulative:" not in compare
+
+
+def test_compare_setup_cohort_rolling_week_and_cumulative(tmp_path):
+    store = make_store(tmp_path)
+    now = datetime.now(UTC)
+    recent = _closed_trade(
+        store,
+        "SOL",
+        5.0,
+        closed_at=now - timedelta(days=1),
+        fees=1.0,
+        setup="breakout_retest",
+        config_fingerprint=GEN8_FP,
+    )
+    older = _closed_trade(
+        store,
+        "BTC",
+        -8.0,
+        strategy="swing",
+        closed_at=now - timedelta(days=10),
+        fees=2.0,
+        setup="vwap",
+        config_fingerprint=GEN8_FP,
+    )
+    _closed_trade(
+        store,
+        "ETH",
+        3.0,
+        closed_at=now - timedelta(days=1),
+        setup="breakout_close",
+        config_fingerprint=GEN7_FP,
+    )
+    _link_setup(store, recent, "breakout_retest")
+    _link_setup(store, older, "vwap")
+
+    body = build_compare_report(store, ["intraday", "swing"])
+    assert COHORT_HEADER in body
+    week_block, cum_block = _cohort_blocks(body)
+    for name in SETUP_BUCKETS:
+        assert name in week_block
+        assert name in cum_block
+    assert _cost_row_n(week_block, "TOTAL") == 1
+    assert _cost_row_n(cum_block, "TOTAL") == 2
+    assert _cost_row_n(week_block, "breakout_retest") == 1
+    assert _cost_row_n(cum_block, "vwap") == 1
+    assert _cost_row_n(week_block, "vwap") == 0
+
+
+def test_compare_setup_cohort_omitted_when_empty_book(tmp_path):
+    store = make_store(tmp_path)
+    body = build_compare_report(store, ["intraday"], mode="PAPER")
+    assert "No closed trades." in body
+    assert COHORT_HEADER not in body
 
 
 # ---- Telegram message splitting ---------------------------------------------

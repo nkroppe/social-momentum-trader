@@ -20,6 +20,7 @@ UNKNOWN_SETUP = "unknown"
 SETUP_BUCKETS = ("breakout_retest", "breakout_close", "vwap", "unknown")
 NOTIONAL_BUCKETS = ("<$300", "$300-500", "$500-700", ">=$700")
 MFE_R_EPSILON = 1e-12
+GEN8_CONFIG_FINGERPRINT_PREFIX = "c95a0ad410f4"
 _PREFERRED_SETUPS = SETUP_BUCKETS[:-1]
 
 
@@ -237,6 +238,17 @@ def setup_cost_stats(
     for trade in trades:
         buckets[resolve_setup_name(trade, linked_setups)].append(trade)
     return [(name, aggregate_cost_stats(buckets[name])) for name in SETUP_BUCKETS]
+
+
+def trades_matching_config_fingerprint(
+    trades: Sequence[Trade], fingerprint_prefix: str
+) -> list[Trade]:
+    """Closed-trade filter: config_fingerprint starts with prefix."""
+    return [
+        trade
+        for trade in trades
+        if (trade.config_fingerprint or "").startswith(fingerprint_prefix)
+    ]
 
 
 def classify_notional(notional: float) -> str:
@@ -531,6 +543,25 @@ def _closed_trade_digest_sections(
     return lines
 
 
+def _setup_cohort_scoreboard_section(
+    *,
+    week_trades: Sequence[Trade],
+    week_linked: dict[int, str],
+    cumulative_trades: Sequence[Trade],
+    cumulative_linked: dict[int, str],
+    fingerprint_prefix: str = GEN8_CONFIG_FINGERPRINT_PREFIX,
+) -> list[str]:
+    """This-week vs cumulative CostStats by setup for one config-fingerprint prefix."""
+    week = trades_matching_config_fingerprint(week_trades, fingerprint_prefix)
+    cumulative = trades_matching_config_fingerprint(cumulative_trades, fingerprint_prefix)
+    if not week and not cumulative:
+        return []
+    lines = ["", f"Setup cohort since gen-8 (fp {fingerprint_prefix}):"]
+    lines += _cost_section("This week:", setup_cost_stats(week, week_linked))
+    lines += _cost_section("Cumulative:", setup_cost_stats(cumulative, cumulative_linked))
+    return lines
+
+
 def _current_hold_hours(trade: Trade) -> float:
     return max(
         (_aware(datetime.now(UTC)) - _aware(trade.opened_at)).total_seconds() / 3600.0,
@@ -697,6 +728,16 @@ def build_weekly_report(
         ]
         lines += _cost_section("By strategy:", by_strategy)
     lines += _closed_trade_digest_sections(closed, linked_setups, "By setup:")
+    all_closed = list(store.closed_trades())
+    cumulative_linked = store.setup_names_for_trade_ids(
+        trade.id for trade in all_closed if trade.id
+    )
+    lines += _setup_cohort_scoreboard_section(
+        week_trades=closed,
+        week_linked=linked_setups,
+        cumulative_trades=all_closed,
+        cumulative_linked=cumulative_linked,
+    )
     lines += _stop_loss_fill_section(closed)
     lines += _stop_loss_fill_rollup_section(closed)
 
@@ -808,4 +849,19 @@ def build_compare_report(
         lines += _stop_loss_fill_rollup_section(closed)
     else:
         lines += ["", "No closed trades."]
+    week_cutoff = datetime.now(UTC) - timedelta(days=7)
+    week_closed = [
+        trade
+        for trade in closed
+        if trade.closed_at is not None and _aware(trade.closed_at) >= week_cutoff
+    ]
+    week_linked = store.setup_names_for_trade_ids(
+        trade.id for trade in week_closed if trade.id
+    )
+    lines += _setup_cohort_scoreboard_section(
+        week_trades=week_closed,
+        week_linked=week_linked,
+        cumulative_trades=closed,
+        cumulative_linked=linked_setups,
+    )
     return "\n".join(lines)
