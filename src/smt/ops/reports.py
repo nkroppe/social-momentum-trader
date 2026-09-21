@@ -127,6 +127,18 @@ class StopLossFillStats:
 
 
 @dataclass(frozen=True)
+class StopLossFillRollupRow:
+    """Closed STOP_LOSS fill-delta means for one ticker × notional cell."""
+
+    ticker: str
+    notional_bucket: str
+    n: int
+    mean_delta_dollars: float
+    mean_delta_r: float
+    fees: float
+
+
+@dataclass(frozen=True)
 class IntradayNotionalFee:
     """Closed intraday row: size vs round-trip fee. Not a filtered global bucket."""
 
@@ -337,6 +349,49 @@ def _stop_loss_fill_section(trades: Sequence[Trade]) -> list[str]:
     lines = ["", "STOP_LOSS intended vs fill:"]
     lines.extend(format_stop_loss_fill_row(row) for row in rows)
     lines.append(format_stop_loss_week_summary(aggregate_stop_loss_fills(trades)))
+    return lines
+
+
+def stop_loss_fill_rollup(trades: Sequence[Trade]) -> list[StopLossFillRollupRow]:
+    """Mean STOP_LOSS fill Δ by ticker × notional. Empty cells are omitted."""
+    groups: dict[tuple[str, str], list[Trade]] = {}
+    for trade in trades:
+        if not is_hard_stop_loss(trade):
+            continue
+        key = (trade.ticker, classify_notional(trade.entry_notional))
+        groups.setdefault(key, []).append(trade)
+    bucket_rank = {name: i for i, name in enumerate(NOTIONAL_BUCKETS)}
+    rows: list[StopLossFillRollupRow] = []
+    for (ticker, bucket), group in groups.items():
+        stats = aggregate_stop_loss_fills(group)
+        rows.append(
+            StopLossFillRollupRow(
+                ticker=ticker,
+                notional_bucket=bucket,
+                n=stats.n,
+                mean_delta_dollars=stats.mean_delta_dollars,
+                mean_delta_r=stats.mean_delta_r,
+                fees=stats.fees,
+            )
+        )
+    rows.sort(key=lambda row: (row.ticker, bucket_rank[row.notional_bucket]))
+    return rows
+
+
+def format_stop_loss_fill_rollup_row(row: StopLossFillRollupRow) -> str:
+    return (
+        f"  {row.ticker:<5} {row.notional_bucket:<10} n={row.n}  "
+        f"mean Δ$=${row.mean_delta_dollars:+,.2f}  "
+        f"mean ΔR={row.mean_delta_r:+.2f}  fees ${row.fees:,.2f}"
+    )
+
+
+def _stop_loss_fill_rollup_section(trades: Sequence[Trade]) -> list[str]:
+    rows = stop_loss_fill_rollup(trades)
+    if not rows:
+        return []
+    lines = ["", "STOP_LOSS fill Δ by ticker × notional:"]
+    lines.extend(format_stop_loss_fill_rollup_row(row) for row in rows)
     return lines
 
 
@@ -643,6 +698,7 @@ def build_weekly_report(
         lines += _cost_section("By strategy:", by_strategy)
     lines += _closed_trade_digest_sections(closed, linked_setups, "By setup:")
     lines += _stop_loss_fill_section(closed)
+    lines += _stop_loss_fill_rollup_section(closed)
 
     open_trades = store.open_trades()
     if open_trades:
@@ -749,6 +805,7 @@ def build_compare_report(
         lines += _closed_trade_digest_sections(
             closed, linked_setups, "By setup (closed trades):"
         )
+        lines += _stop_loss_fill_rollup_section(closed)
     else:
         lines += ["", "No closed trades."]
     return "\n".join(lines)

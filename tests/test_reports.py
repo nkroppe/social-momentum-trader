@@ -24,6 +24,7 @@ from smt.ops.reports import (
     build_weekly_report,
     classify_notional,
     classify_setup,
+    format_stop_loss_fill_rollup_row,
     format_stop_loss_week_summary,
     intraday_notional_fee_rows,
     is_hard_stop_loss,
@@ -31,6 +32,7 @@ from smt.ops.reports import (
     resolve_setup_name,
     setup_cost_stats,
     stop_loss_dollar_slip,
+    stop_loss_fill_rollup,
     stop_loss_fills,
     stop_loss_r_slip,
     ticker_cost_stats,
@@ -881,9 +883,167 @@ def test_weekly_report_stop_loss_rows_and_week_summary(tmp_path):
     summary = format_stop_loss_week_summary(aggregate_stop_loss_fills(list(store.closed_trades())))
     assert summary in body
     assert "STOP_LOSS week: n=2  mean Δ$=$-0.75  mean ΔR=-0.15  fees $2.00" in body
+    assert "STOP_LOSS fill Δ by ticker × notional:" in body
+    assert "ETH   <$300      n=1  mean Δ$=$-0.50  mean ΔR=-0.10  fees $0.50" in body
+    assert "SOL   <$300      n=1  mean Δ$=$-1.00  mean ΔR=-0.20  fees $1.50" in body
     # TRAILING_STOP fill must not be treated as a hard-stop row.
     assert "intended $95.000000  fill $98.000000" not in body
     compare = build_compare_report(store, ["intraday", "swing"])
+    assert "STOP_LOSS intended vs fill:" not in compare
+    assert "STOP_LOSS fill Δ by ticker × notional:" in compare
+    assert "ETH   <$300      n=1  mean Δ$=$-0.50  mean ΔR=-0.10  fees $0.50" in compare
+    assert "SOL   <$300      n=1  mean Δ$=$-1.00  mean ΔR=-0.20  fees $1.50" in compare
+
+
+def _stop_loss_trade(
+    *,
+    ticker: str,
+    notional: float,
+    exit_price: float,
+    fees: float,
+    qty: float = 1.0,
+    stop_loss: float = 95.0,
+    risk: float = 5.0,
+    exit_reason=ExitReason.STOP_LOSS,
+    trailing_stop: float = 0.0,
+) -> Trade:
+    closed_at = datetime(2026, 8, 16, 20, tzinfo=UTC)
+    return Trade(
+        ticker=ticker,
+        product_id=f"{ticker}-USD",
+        qty=qty,
+        original_qty=qty,
+        entry_price=100.0,
+        entry_notional=notional,
+        take_profit=110.0,
+        stop_loss=stop_loss,
+        trailing_stop=trailing_stop,
+        initial_risk_per_unit=risk,
+        time_stop_at=closed_at,
+        exit_price=exit_price,
+        exit_reason=exit_reason,
+        realized_pnl=(exit_price - 100.0) * qty,
+        fees_paid=fees,
+        opened_at=closed_at,
+        closed_at=closed_at,
+    )
+
+
+def test_stop_loss_fill_rollup_means_by_ticker_and_notional_bucket():
+    # Two SOL <$300 stops average; SOL $300-500 and BTC <$300 stay separate.
+    sol_a = _stop_loss_trade(ticker="SOL", notional=250.0, exit_price=94.0, fees=1.50)
+    sol_b = _stop_loss_trade(ticker="SOL", notional=200.0, exit_price=93.0, fees=1.50)
+    sol_mid = _stop_loss_trade(ticker="SOL", notional=400.0, exit_price=94.5, fees=0.50)
+    btc = _stop_loss_trade(ticker="BTC", notional=250.0, exit_price=94.0, fees=1.00)
+    # Empty $500-700 / >=$700 cells and TRAILING_STOP must not appear.
+    trail = _stop_loss_trade(
+        ticker="ETH",
+        notional=250.0,
+        exit_price=98.5,
+        fees=1.00,
+        exit_reason=ExitReason.TRAILING_STOP,
+        trailing_stop=99.0,
+    )
+    take = _stop_loss_trade(
+        ticker="HYPE",
+        notional=700.0,
+        exit_price=110.0,
+        fees=1.00,
+        exit_reason=ExitReason.TAKE_PROFIT,
+    )
+    rows = stop_loss_fill_rollup([sol_a, sol_b, sol_mid, btc, trail, take])
+    assert [(row.ticker, row.notional_bucket, row.n) for row in rows] == [
+        ("BTC", "<$300", 1),
+        ("SOL", "<$300", 2),
+        ("SOL", "$300-500", 1),
+    ]
+    by_key = {(row.ticker, row.notional_bucket): row for row in rows}
+    sol_small = by_key[("SOL", "<$300")]
+    assert sol_small.mean_delta_dollars == pytest.approx(-1.50)
+    assert sol_small.mean_delta_r == pytest.approx(-0.30)
+    assert sol_small.fees == pytest.approx(3.00)
+    sol_mid_row = by_key[("SOL", "$300-500")]
+    assert sol_mid_row.mean_delta_dollars == pytest.approx(-0.50)
+    assert sol_mid_row.mean_delta_r == pytest.approx(-0.10)
+    assert sol_mid_row.fees == pytest.approx(0.50)
+    btc_row = by_key[("BTC", "<$300")]
+    assert btc_row.mean_delta_dollars == pytest.approx(-1.00)
+    assert btc_row.mean_delta_r == pytest.approx(-0.20)
+    assert btc_row.fees == pytest.approx(1.00)
+    assert all(row.n > 0 for row in rows)
+    assert all(row.ticker != "ETH" for row in rows)
+    assert all(row.ticker != "HYPE" for row in rows)
+    assert format_stop_loss_fill_rollup_row(sol_small) == (
+        "  SOL   <$300      n=2  mean Δ$=$-1.50  mean ΔR=-0.30  fees $3.00"
+    )
+
+
+def test_stop_loss_fill_rollup_ignores_trailing_stop():
+    hard = _stop_loss_trade(ticker="SOL", notional=250.0, exit_price=94.0, fees=1.50)
+    trail = _stop_loss_trade(
+        ticker="SOL",
+        notional=250.0,
+        exit_price=98.5,
+        fees=2.00,
+        exit_reason=ExitReason.TRAILING_STOP,
+        trailing_stop=99.0,
+    )
+    rows = stop_loss_fill_rollup([hard, trail])
+    assert len(rows) == 1
+    assert rows[0].ticker == "SOL"
+    assert rows[0].n == 1
+    assert rows[0].mean_delta_dollars == pytest.approx(stop_loss_dollar_slip(hard))
+    assert rows[0].mean_delta_r == pytest.approx(stop_loss_r_slip(hard))
+    assert rows[0].fees == pytest.approx(1.50)
+    assert is_hard_stop_loss(trail) is False
+
+
+def test_stop_loss_fill_rollup_omits_empty_cells_and_empty_section(tmp_path):
+    assert stop_loss_fill_rollup([]) == []
+    take = _stop_loss_trade(
+        ticker="SOL",
+        notional=250.0,
+        exit_price=110.0,
+        fees=1.00,
+        exit_reason=ExitReason.TAKE_PROFIT,
+    )
+    trail = _stop_loss_trade(
+        ticker="BTC",
+        notional=400.0,
+        exit_price=98.5,
+        fees=1.00,
+        exit_reason=ExitReason.TRAILING_STOP,
+        trailing_stop=99.0,
+    )
+    assert stop_loss_fill_rollup([take, trail]) == []
+
+    store = make_store(tmp_path)
+    end = datetime(2026, 8, 16, 20, tzinfo=UTC)
+    start = end - timedelta(days=7)
+    _closed_trade(
+        store,
+        "SOL",
+        8.0,
+        closed_at=end - timedelta(hours=2),
+        exit_reason=ExitReason.TAKE_PROFIT,
+        fees=1.00,
+    )
+    _closed_trade(
+        store,
+        "BTC",
+        2.0,
+        strategy="swing",
+        closed_at=end - timedelta(hours=3),
+        exit_reason=ExitReason.TRAILING_STOP,
+        trailing_stop=99.0,
+        exit_price=98.0,
+        fees=1.00,
+    )
+    _, weekly = build_weekly_report(store, ["intraday", "swing"], start, end, UTC)
+    compare = build_compare_report(store, ["intraday", "swing"])
+    assert "STOP_LOSS fill Δ by ticker × notional:" not in weekly
+    assert "STOP_LOSS fill Δ by ticker × notional:" not in compare
+    assert "STOP_LOSS intended vs fill:" not in weekly
     assert "STOP_LOSS intended vs fill:" not in compare
 
 
