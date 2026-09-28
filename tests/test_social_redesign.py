@@ -149,6 +149,10 @@ def test_count_trigger_persists_observation_then_samples_posts(tmp_path, monkeyp
 
 def test_setup_sample_persists_posts_and_respects_cooldown(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    # sample_for_ticker treats monotonic 0 as "never sampled". A VM whose
+    # uptime is still inside the setup-sample cooldown then skips the first
+    # call. Pin the module clock past that window.
+    monkeypatch.setattr("smt.ingest.x.time.monotonic", lambda: 100000.0)
     store = make_store(tmp_path)
     cfg = XSource(enabled=True, keywords=["$SOL"], sample_size=25, count_window_minutes=30)
     collector = XCollector(Settings(x_bearer_token="token"), cfg, make_universe(), store=store)

@@ -19,8 +19,10 @@ from ..config import (
     get_sources,
     get_strategies,
 )
+from ..ops.edge_gate import live_edge_gate
 from ..ops.soak import SoakTracker
 from ..policy import trading_policy_identity
+from ..store import Store
 
 REQUIRED_CONFIGS = (
     "risk.yaml",
@@ -467,6 +469,13 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
             ),
         )
     )
+
+    try:
+        store = Store(settings.database_url)
+        edge = live_edge_gate(store, policy.fingerprint)
+        results.append(CheckResult("live_edge_gate", edge.passed, edge.detail))
+    except Exception as exc:  # noqa: BLE001
+        results.append(CheckResult("live_edge_gate", False, str(exc)))
 
     if coinbase_ok and settings.live and settings.live_ack == LIVE_ACK_PHRASE:
         try:

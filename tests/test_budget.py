@@ -18,6 +18,23 @@ AUG_8 = datetime(2026, 8, 8, 12, tzinfo=UTC)
 AUG_9 = datetime(2026, 8, 9, 12, tzinfo=UTC)
 
 
+@pytest.fixture(autouse=True)
+def _freeze_x_clock(monkeypatch):
+    """Pin ReadBudget's module clock so property reads match the August fixtures.
+
+    ``register(..., now=AUG_8)`` writes month ``2026-08``, but accessors such as
+    ``reads_used`` call ``_load()`` with ``datetime.now(UTC)``. Without a frozen
+    clock those loads treat the ledger as a prior month and report zero.
+    """
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return AUG_8 if tz is not None else AUG_8.replace(tzinfo=None)
+
+    monkeypatch.setattr("smt.ingest.x.datetime", FrozenDateTime)
+
+
 # ---- Dedupe-aware counting --------------------------------------------------
 
 
@@ -115,7 +132,7 @@ def test_start_time_is_not_pushed_forward_by_later_reads(tmp_path):
 
 def test_a_new_month_seeds_opening_reads_from_the_console(tmp_path):
     path = tmp_path / "x_budget.json"
-    old = (datetime.now(UTC) - timedelta(days=40)).strftime("%Y-%m")
+    old = "2026-07"
     path.write_text(
         json.dumps({"month": old, "reads": 19_000, "started_at": "2020-01-01T00:00:00+00:00"}),
         encoding="utf-8",

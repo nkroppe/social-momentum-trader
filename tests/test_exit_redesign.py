@@ -10,16 +10,18 @@ from sqlalchemy import inspect
 
 from smt.config import ExitProfileConfig, RiskConfig, Settings, get_strategies
 from smt.models import ExitReason, Trade, TradeStatus, utcnow
+from smt.trader.broker import Fill
 from smt.trader.exit_policy import (
     ExitActionKind,
     bar_step,
+    fee_hurdle_r,
     first_partial_quantity,
     legacy_profile,
     mfe_r,
     quote_step,
     time_exit_reason,
 )
-from smt.trader.manager import TradeManager
+from smt.trader.manager import TradeManager, merge_exit_snapshot_events
 from smt.trader.paper import PaperBroker
 from smt.trader.signals import TradeCandidate
 
@@ -473,3 +475,149 @@ def test_trailing_stop_close_writes_trail_keys_stop_loss_does_not(tmp_path):
     assert closed.exit_snapshot["mfe_r_at_trail"] == pytest.approx(expected_mfe)
     assert closed.exit_snapshot["realized_r_at_trail"] == pytest.approx(expected_realized)
     assert closed.exit_snapshot["label"] == "trail_mfe"
+
+
+def test_fee_hurdle_r_round_trip_at_entry():
+    assert fee_hurdle_r(100.0, 2.0, 2.0, 0.006) == pytest.approx(0.6)
+    assert fee_hurdle_r(100.0, 2.0, 2.0, 0.006, est_exit_price=100.0) == pytest.approx(0.6)
+    assert fee_hurdle_r(100.0, 2.0, 2.0, 0.006, est_exit_price=110.0) == pytest.approx(0.63)
+    assert fee_hurdle_r(100.0, 2.0, 2.0, 0.0) == pytest.approx(0.0)
+
+
+def test_fee_hurdle_r_none_when_inputs_invalid():
+    assert fee_hurdle_r(100.0, 0.0, 2.0, 0.006) is None
+    assert fee_hurdle_r(100.0, -1.0, 2.0, 0.006) is None
+    assert fee_hurdle_r(100.0, 2.0, 0.0, 0.006) is None
+    assert fee_hurdle_r(100.0, 2.0, -0.5, 0.006) is None
+    assert fee_hurdle_r(100.0, 2.0, 2.0, -0.001) is None
+
+
+def test_open_position_writes_fee_hurdle_into_exit_snapshot(tmp_path):
+    store = make_store(tmp_path)
+    broker = PaperBroker(seed=3)
+    broker.set_price("BTC-USD", 100.0)
+    strategy = make_strategy(
+        assumed_fee_pct_per_side=0.01,
+        exit_profile={"label": "fee_hurdle_open", "mode": "partial_trail"},
+    )
+    manager = TradeManager(
+        Settings(paper_start_equity=5_000),
+        make_universe(),
+        store,
+        broker,
+        strategies=[strategy],
+        config_fingerprint="e" * 64,
+    )
+    trade = manager.open_position(_candidate(strategy=strategy.name), 1_000.0, strategy)
+    expected = fee_hurdle_r(
+        trade.entry_price,
+        trade.qty,
+        trade.initial_risk_per_unit,
+        strategy.assumed_fee_pct_per_side,
+    )
+    assert expected is not None
+    assert trade.status == TradeStatus.OPEN
+    assert trade.exit_snapshot["fee_hurdle_r"] == round(expected, 6)
+    assert trade.exit_snapshot["fee_hurdle_pct_per_side"] == pytest.approx(0.01)
+    assert trade.exit_snapshot["label"] == "fee_hurdle_open"
+    persisted = store.open_trade_for("BTC", strategy.name)
+    assert persisted is not None
+    assert persisted.exit_snapshot["fee_hurdle_r"] == round(expected, 6)
+
+
+def test_merge_exit_snapshot_events_preserves_fee_hurdle():
+    trade = Trade(
+        ticker="BTC",
+        product_id="BTC-USD",
+        qty=1.0,
+        entry_price=100.0,
+        entry_notional=100.0,
+        take_profit=110.0,
+        stop_loss=90.0,
+        time_stop_at=utcnow(),
+        exit_snapshot={
+            "label": "keep",
+            "fee_hurdle_r": 0.6,
+            "fee_hurdle_pct_per_side": 0.006,
+        },
+    )
+    merge_exit_snapshot_events(trade, mfe_r_at_partial=1.25)
+    assert trade.exit_snapshot["fee_hurdle_r"] == pytest.approx(0.6)
+    assert trade.exit_snapshot["fee_hurdle_pct_per_side"] == pytest.approx(0.006)
+    assert trade.exit_snapshot["label"] == "keep"
+    assert trade.exit_snapshot["mfe_r_at_partial"] == pytest.approx(1.25)
+
+
+def test_fee_hurdle_survives_partial_and_trailing_merge(tmp_path):
+    store = make_store(tmp_path)
+    broker = PaperBroker(seed=9)
+    broker.set_price("BTC-USD", 100.0)
+    strategy = make_strategy(
+        assumed_fee_pct_per_side=0.01,
+        exit_profile={
+            "label": "fee_hurdle_merge",
+            "mode": "partial_trail",
+            "partial_take_profit_fraction": 0.25,
+            "partial_take_profit_r": 1.5,
+        },
+    )
+    manager = TradeManager(
+        Settings(paper_start_equity=5_000),
+        make_universe(),
+        store,
+        broker,
+        strategies=[strategy],
+        config_fingerprint="f" * 64,
+    )
+    opened = manager.open_position(_candidate(strategy=strategy.name), 1_000.0, strategy)
+    hurdle = opened.exit_snapshot["fee_hurdle_r"]
+    rate = opened.exit_snapshot["fee_hurdle_pct_per_side"]
+    broker.set_price("BTC-USD", opened.take_profit)
+    manager.manage_open_trades()
+
+    partial = store.open_trade_for("BTC", strategy.name)
+    assert partial is not None and partial.partial_taken
+    assert partial.exit_snapshot["fee_hurdle_r"] == pytest.approx(hurdle)
+    assert partial.exit_snapshot["fee_hurdle_pct_per_side"] == pytest.approx(rate)
+    assert "mfe_r_at_partial" in partial.exit_snapshot
+
+    manager._close(partial, 110.0, ExitReason.TRAILING_STOP)  # noqa: SLF001
+    closed = store.closed_trades_for("BTC", strategy.name)[-1]
+    assert closed.exit_snapshot["fee_hurdle_r"] == pytest.approx(hurdle)
+    assert closed.exit_snapshot["fee_hurdle_pct_per_side"] == pytest.approx(rate)
+    assert "mfe_r_at_trail" in closed.exit_snapshot
+
+
+def test_entry_risk_unwind_does_not_write_fee_hurdle(tmp_path):
+    class GapBroker:
+        name = "paper"
+        server_side_brackets = False
+
+        def current_price(self, _product):
+            return 100.0
+
+        def open_long(self, _product, notional, _tp, _sl):
+            return Fill("buy", 110.0, notional / 110.0, 1.0)
+
+        def close_long(self, _product, qty, reference_price=None, *, emergency=False):
+            return Fill("sell", 109.0, qty, 1.0)
+
+    store = make_store(tmp_path)
+    strategy = make_strategy(exit_profile={"label": "fee_hurdle_unwind"})
+    manager = TradeManager(
+        Settings(paper_start_equity=5_000),
+        make_universe(),
+        store,
+        GapBroker(),
+        strategies=[strategy],
+    )
+    trade = manager.open_position(
+        _candidate(strategy=strategy.name),
+        1_000.0,
+        strategy,
+        risk_budget_usd=100.0,
+    )
+    assert trade.status == TradeStatus.CLOSED
+    assert trade.exit_reason == ExitReason.ENTRY_RISK
+    assert "fee_hurdle_r" not in (trade.exit_snapshot or {})
+    assert "fee_hurdle_pct_per_side" not in (trade.exit_snapshot or {})

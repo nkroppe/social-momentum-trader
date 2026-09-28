@@ -321,6 +321,8 @@ smt weekly-report       # preview this week's P/L (--send to deliver, --last for
 smt shadow-report       # social + Sonnet readiness evidence (--days N, --send)
 smt dashboard           # read-only web UI on http://127.0.0.1:8080
 smt backtest ...        # deterministic local price-only replay; never calls network
+smt fetch-candles       # public Coinbase OHLCV CSVs for closed trades (no orders)
+smt partial-replay      # report-only post-partial exit counterfactuals from those CSVs
 smt soak-reset          # intentional restart; policy changes reset automatically
 ```
 

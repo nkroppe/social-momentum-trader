@@ -225,6 +225,23 @@ def mfe_r(highest_price: float, entry_price: float, initial_risk_per_unit: float
     return max(highest_price - entry_price, 0.0) / initial_risk_per_unit
 
 
+def fee_hurdle_r(
+    entry_price: float,
+    qty: float,
+    initial_risk_per_unit: float,
+    fee_pct_per_side: float,
+    est_exit_price: float | None = None,
+) -> float | None:
+    """Round-trip fee as a multiple of initial risk. None when the ratio is undefined."""
+    rate = fee_pct_per_side
+    if qty <= 0 or initial_risk_per_unit <= 0 or rate < 0:
+        return None
+    exit_price = entry_price if est_exit_price is None else est_exit_price
+    entry_fee = entry_price * qty * rate
+    exit_fee = exit_price * qty * rate
+    return (entry_fee + exit_fee) / (initial_risk_per_unit * qty)
+
+
 def time_exit_reason(
     profile_value: Any,
     *,
