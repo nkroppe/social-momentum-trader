@@ -21,6 +21,8 @@ SETUP_BUCKETS = ("breakout_retest", "breakout_close", "vwap", "unknown")
 NOTIONAL_BUCKETS = ("<$300", "$300-500", "$500-700", ">=$700")
 MFE_R_EPSILON = 1e-12
 GEN8_CONFIG_FINGERPRINT_PREFIX = "c95a0ad410f4"
+COHORT_STRATEGY_NAMES = ("intraday", "swing", "bear_rally")
+SMALL_N_THRESHOLD = 5
 _PREFERRED_SETUPS = SETUP_BUCKETS[:-1]
 MFE_EVENT_SNAPSHOT_KEYS = (
     "mfe_r_at_partial",
@@ -60,6 +62,37 @@ def _snapshot_text(trade: Trade) -> str:
 def trade_gross_pnl(trade: Trade) -> float:
     """Gross P/L is net realized plus round-trip fees; slippage stays in the fill."""
     return float(trade.realized_pnl) + float(trade.fees_paid)
+
+
+def trade_fee_legs_notional(trade: Trade) -> float:
+    """Entry + optional paper-partial + remaining-qty exit notionals for a fee what-if.
+
+    Entry uses ``entry_price * original_qty``, falling back to ``qty`` when
+    ``original_qty`` is missing/zero, then to ``entry_notional`` when price is
+    missing. The partial leg is ``take_profit * (original_qty - qty)`` only when
+    ``partial_taken`` and ``original_qty > qty``. Final exit is ``exit_price * qty``.
+    """
+    qty = float(trade.qty or 0.0)
+    original_qty = float(getattr(trade, "original_qty", 0.0) or 0.0)
+    entry_qty = original_qty if original_qty else qty
+    entry_price = float(trade.entry_price or 0.0)
+    entry_leg = (
+        entry_price * entry_qty if entry_price else float(trade.entry_notional or 0.0)
+    )
+    partial_leg = 0.0
+    if getattr(trade, "partial_taken", False) and original_qty > qty:
+        partial_leg = float(trade.take_profit or 0.0) * (original_qty - qty)
+    exit_leg = float(trade.exit_price or 0.0) * qty
+    return entry_leg + partial_leg + exit_leg
+
+
+def trade_net_at_fee_rate(trade: Trade, rate: float) -> float:
+    """Gross P/L minus fee-leg notional charged at an alternate per-side rate."""
+    return trade_gross_pnl(trade) - trade_fee_legs_notional(trade) * rate
+
+
+def net_at_fee_rate(trades: Sequence[Trade], rate: float) -> float:
+    return sum(trade_net_at_fee_rate(trade, rate) for trade in trades)
 
 
 def trade_fee_pct_of_notional(trade: Trade) -> float:
@@ -153,6 +186,28 @@ class IntradayNotionalFee:
     entry_notional: float
     fees: float
     fee_pct: float
+
+
+@dataclass(frozen=True)
+class FeeHurdleRow:
+    """One closed intraday trade with a persisted fee_hurdle_r snapshot key."""
+
+    ticker: str
+    opened_at: datetime
+    hurdle_r: float
+    mfe_r: float
+    net_pnl: float
+    non_starter: bool
+
+
+@dataclass(frozen=True)
+class FeeHurdleSummary:
+    """Intraday fee-hurdle rows plus skip / non-starter counts."""
+
+    rows: tuple[FeeHurdleRow, ...] = ()
+    with_hurdle: int = 0
+    without_hurdle: int = 0
+    non_starters: int = 0
 
 
 def aggregate_cost_stats(trades: Sequence[Trade]) -> CostStats:
@@ -257,6 +312,33 @@ def trades_matching_config_fingerprint(
     ]
 
 
+def fee_rate_what_if_line(
+    trades: Sequence[Trade],
+    rate: float,
+    fingerprint_prefix: str = GEN8_CONFIG_FINGERPRINT_PREFIX,
+) -> list[str]:
+    """Report-only gen-8 net at an alternate per-side fee rate. Does not mutate trades."""
+    cohort = trades_matching_config_fingerprint(trades, fingerprint_prefix)
+    stats = aggregate_cost_stats(cohort)
+    alt_fees = sum(trade_fee_legs_notional(trade) * rate for trade in cohort)
+    recomputed = net_at_fee_rate(cohort, rate)
+    return [
+        f"What-if fee rate {rate:.2%}/side since gen-8 (fp {fingerprint_prefix}, n={stats.n}): "
+        f"net ${recomputed:+,.2f} (gross ${stats.gross_pnl:+,.2f} - fees ${alt_fees:,.2f} "
+        f"at alt rate) vs actual net ${stats.net_pnl:+,.2f}. Stored data unchanged."
+    ]
+
+
+def _fee_rate_what_if_section(
+    trades: Sequence[Trade],
+    fee_rate: float | None,
+    fingerprint_prefix: str = GEN8_CONFIG_FINGERPRINT_PREFIX,
+) -> list[str]:
+    if fee_rate is None:
+        return []
+    return ["", *fee_rate_what_if_line(trades, fee_rate, fingerprint_prefix)]
+
+
 def classify_notional(notional: float) -> str:
     """Map entry notional onto the four digest fee buckets."""
     size = float(notional or 0.0)
@@ -283,6 +365,25 @@ def ticker_cost_stats(trades: Sequence[Trade]) -> list[tuple[str, CostStats]]:
     for trade in trades:
         buckets.setdefault(trade.ticker, []).append(trade)
     return [(ticker, aggregate_cost_stats(buckets[ticker])) for ticker in sorted(buckets)]
+
+
+def strategy_cost_stats(
+    trades: Sequence[Trade],
+    names: Sequence[str] = COHORT_STRATEGY_NAMES,
+) -> list[tuple[str, CostStats]]:
+    """Canonical strategy names first (even n=0), then any others sorted."""
+    preferred = list(names)
+    buckets: dict[str, list[Trade]] = {name: [] for name in preferred}
+    extras: dict[str, list[Trade]] = {}
+    for trade in trades:
+        key = str(trade.strategy or "")
+        if key in buckets:
+            buckets[key].append(trade)
+        else:
+            extras.setdefault(key, []).append(trade)
+    rows = [(name, aggregate_cost_stats(buckets[name])) for name in preferred]
+    rows.extend((name, aggregate_cost_stats(extras[name])) for name in sorted(extras))
+    return rows
 
 
 def trade_risk_dollars(trade: Trade) -> float:
@@ -472,6 +573,83 @@ def _mfe_event_snapshot_section(trades: Sequence[Trade]) -> list[str]:
     return lines
 
 
+def trade_fee_hurdle_r(trade: Trade) -> float | None:
+    """Persisted fee_hurdle_r from exit_snapshot. Missing or non-numeric is omitted."""
+    return snapshot_event_float(trade, "fee_hurdle_r")
+
+
+def is_fee_hurdle_non_starter(trade: Trade) -> bool | None:
+    """True when final MFE_R is below the fee hurdle. None when hurdle data is missing."""
+    hurdle = trade_fee_hurdle_r(trade)
+    if hurdle is None:
+        return None
+    return _mfe_r(trade) < hurdle
+
+
+def fee_hurdle_rows(trades: Sequence[Trade]) -> FeeHurdleSummary:
+    """Closed-only intraday fee-hurdle rows. Callers pass already-closed trades."""
+    rows: list[FeeHurdleRow] = []
+    without = 0
+    for trade in trades:
+        if trade.strategy != "intraday":
+            continue
+        hurdle = trade_fee_hurdle_r(trade)
+        if hurdle is None:
+            without += 1
+            continue
+        mfe = _mfe_r(trade)
+        rows.append(
+            FeeHurdleRow(
+                ticker=trade.ticker,
+                opened_at=trade.opened_at,
+                hurdle_r=hurdle,
+                mfe_r=mfe,
+                net_pnl=float(trade.realized_pnl),
+                non_starter=mfe < hurdle,
+            )
+        )
+    return FeeHurdleSummary(
+        rows=tuple(rows),
+        with_hurdle=len(rows),
+        without_hurdle=without,
+        non_starters=sum(1 for row in rows if row.non_starter),
+    )
+
+
+def format_fee_hurdle_row(row: FeeHurdleRow) -> str:
+    opened = _aware(row.opened_at).astimezone(UTC).strftime("%Y-%m-%d %H:%MZ")
+    tag = " NON-STARTER" if row.non_starter else ""
+    return (
+        f"  {row.ticker:<5} {opened}  hurdle {row.hurdle_r:.2f}R  "
+        f"MFE {row.mfe_r:.2f}R  net ${row.net_pnl:+,.2f}{tag}"
+    )
+
+
+def _fee_hurdle_section(
+    week_trades: Sequence[Trade],
+    all_closed: Sequence[Trade],
+    *,
+    fingerprint_prefix: str = GEN8_CONFIG_FINGERPRINT_PREFIX,
+) -> list[str]:
+    week = fee_hurdle_rows(week_trades)
+    gen8 = fee_hurdle_rows(trades_matching_config_fingerprint(all_closed, fingerprint_prefix))
+    if week.with_hurdle + week.without_hurdle == 0 and gen8.with_hurdle + gen8.without_hurdle == 0:
+        return []
+    lines = [
+        "",
+        "Intraday fee hurdle vs final MFE (this week):",
+        f"  no hurdle data: {week.without_hurdle}",
+        f"  non-starters: {week.non_starters} of {week.with_hurdle} with hurdle data "
+        "(MFE_R < fee hurdle R)",
+    ]
+    lines.extend(format_fee_hurdle_row(row) for row in week.rows)
+    lines.append(
+        f"  since gen-8 (fp {fingerprint_prefix}): {gen8.non_starters} non-starters of "
+        f"{gen8.with_hurdle} with hurdle data; {gen8.without_hurdle} without"
+    )
+    return lines
+
+
 def intraday_notional_fee_rows(trades: Sequence[Trade]) -> list[IntradayNotionalFee]:
     """Closed-only intraday size vs fee. Callers pass already-closed trades."""
     rows: list[IntradayNotionalFee] = []
@@ -546,14 +724,22 @@ def _wl(wins: int, losses: int, breakeven: int) -> str:
     return f"{wins}W / {losses}L{extra}"
 
 
-def _cost_row(label: str, stats: CostStats, label_width: int) -> str:
-    return (
+def _cost_row(
+    label: str,
+    stats: CostStats,
+    label_width: int,
+    small_n_threshold: int | None = None,
+) -> str:
+    line = (
         f"  {label:<{label_width}} {stats.n:>3}  "
         f"{stats.net_win_rate:>4.0%} net  {stats.gross_win_rate:>4.0%} gross  "
         f"gross ${stats.gross_pnl:>9,.2f}  fees ${stats.fees:>8,.2f}  "
         f"net ${stats.net_pnl:>9,.2f}  fee% {stats.fee_pct_of_notional:>6.2%}  "
         f"fee/gross {stats.fee_to_gross:>6.2%}"
     )
+    if small_n_threshold is not None and stats.n < small_n_threshold:
+        line += " [small-n]"
+    return line
 
 
 def _merge_cost_stats(rows: Sequence[tuple[str, CostStats]]) -> CostStats:
@@ -573,14 +759,28 @@ def _merge_cost_stats(rows: Sequence[tuple[str, CostStats]]) -> CostStats:
     )
 
 
-def _cost_section(title: str, rows: Sequence[tuple[str, CostStats]]) -> list[str]:
+def _cost_section(
+    title: str,
+    rows: Sequence[tuple[str, CostStats]],
+    small_n_threshold: int | None = None,
+) -> list[str]:
     if not rows:
         return []
     width = max(len("TOTAL"), max(len(label) for label, _ in rows), 9)
     lines = ["", title]
-    lines.extend(_cost_row(label, stats, width) for label, stats in rows)
+    lines.extend(
+        _cost_row(label, stats, width, small_n_threshold=small_n_threshold)
+        for label, stats in rows
+    )
     if len(rows) > 1:
-        lines.append(_cost_row("TOTAL", _merge_cost_stats(rows), width))
+        lines.append(
+            _cost_row(
+                "TOTAL",
+                _merge_cost_stats(rows),
+                width,
+                small_n_threshold=small_n_threshold,
+            )
+        )
     return lines
 
 
@@ -616,14 +816,36 @@ def _setup_cohort_scoreboard_section(
     cumulative_linked: dict[int, str],
     fingerprint_prefix: str = GEN8_CONFIG_FINGERPRINT_PREFIX,
 ) -> list[str]:
-    """This-week vs cumulative CostStats by setup for one config-fingerprint prefix."""
+    """This-week vs cumulative CostStats by setup and strategy for one fingerprint prefix."""
     week = trades_matching_config_fingerprint(week_trades, fingerprint_prefix)
     cumulative = trades_matching_config_fingerprint(cumulative_trades, fingerprint_prefix)
     if not week and not cumulative:
         return []
-    lines = ["", f"Setup cohort since gen-8 (fp {fingerprint_prefix}):"]
-    lines += _cost_section("This week:", setup_cost_stats(week, week_linked))
-    lines += _cost_section("Cumulative:", setup_cost_stats(cumulative, cumulative_linked))
+    lines = [
+        "",
+        f"Setup cohort since gen-8 (fp {fingerprint_prefix}):",
+        "[small-n] = fewer than 5 closed trades; treat as anecdotal.",
+    ]
+    lines += _cost_section(
+        "This week:",
+        setup_cost_stats(week, week_linked),
+        small_n_threshold=SMALL_N_THRESHOLD,
+    )
+    lines += _cost_section(
+        "This week by strategy:",
+        strategy_cost_stats(week),
+        small_n_threshold=SMALL_N_THRESHOLD,
+    )
+    lines += _cost_section(
+        "Cumulative:",
+        setup_cost_stats(cumulative, cumulative_linked),
+        small_n_threshold=SMALL_N_THRESHOLD,
+    )
+    lines += _cost_section(
+        "Cumulative by strategy:",
+        strategy_cost_stats(cumulative),
+        small_n_threshold=SMALL_N_THRESHOLD,
+    )
     return lines
 
 
@@ -737,6 +959,7 @@ def build_weekly_report(
     mode: str = "PAPER",
     max_trades_listed: int = 40,
     mark_price: Callable[[str], float] | None = None,
+    fee_rate: float | None = None,
 ) -> tuple[str, str]:
     """Subject and body summarizing every trade closed in [start, end)."""
     local_start = start.astimezone(display_tz)
@@ -803,9 +1026,11 @@ def build_weekly_report(
         cumulative_trades=all_closed,
         cumulative_linked=cumulative_linked,
     )
+    lines += _fee_rate_what_if_section(all_closed, fee_rate)
     lines += _stop_loss_fill_section(closed)
     lines += _stop_loss_fill_rollup_section(closed)
     lines += _mfe_event_snapshot_section(closed)
+    lines += _fee_hurdle_section(closed, all_closed)
 
     open_trades = store.open_trades()
     if open_trades:
@@ -857,6 +1082,7 @@ def build_compare_report(
     strategies: Sequence[str | tuple[str, float | None, float | None]],
     *,
     mode: str = "PAPER",
+    fee_rate: float | None = None,
 ) -> str:
     """Side-by-side strategy costs plus a setup-family split of closed trades."""
     configured = _normalize_compare_strategies(strategies)
@@ -930,4 +1156,5 @@ def build_compare_report(
         cumulative_trades=closed,
         cumulative_linked=linked_setups,
     )
+    lines += _fee_rate_what_if_section(closed, fee_rate)
     return "\n".join(lines)

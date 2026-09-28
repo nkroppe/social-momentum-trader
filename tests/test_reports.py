@@ -9,14 +9,17 @@ from zoneinfo import ZoneInfo
 import pytest
 from _helpers import make_store
 
+from smt.cli import build_parser
 from smt.config import TradeAlertsConfig, WeeklyReportConfig
 from smt.models import ExitReason, Trade, TradeStatus
 from smt.ops.alerts import split_message
 from smt.ops.reports import (
+    COHORT_STRATEGY_NAMES,
     GEN8_CONFIG_FINGERPRINT_PREFIX,
     MFE_R_EPSILON,
     NOTIONAL_BUCKETS,
     SETUP_BUCKETS,
+    SMALL_N_THRESHOLD,
     UNKNOWN_SETUP,
     aggregate_cost_stats,
     aggregate_mfe_capture,
@@ -25,10 +28,15 @@ from smt.ops.reports import (
     build_weekly_report,
     classify_notional,
     classify_setup,
+    fee_hurdle_rows,
+    fee_rate_what_if_line,
+    format_fee_hurdle_row,
     format_stop_loss_fill_rollup_row,
     format_stop_loss_week_summary,
     intraday_notional_fee_rows,
+    is_fee_hurdle_non_starter,
     is_hard_stop_loss,
+    net_at_fee_rate,
     notional_cost_stats,
     resolve_setup_name,
     setup_cost_stats,
@@ -36,11 +44,15 @@ from smt.ops.reports import (
     stop_loss_fill_rollup,
     stop_loss_fills,
     stop_loss_r_slip,
+    strategy_cost_stats,
     ticker_cost_stats,
     trade_closed_alert,
+    trade_fee_hurdle_r,
+    trade_fee_legs_notional,
     trade_fee_pct_of_notional,
     trade_gross_pnl,
     trade_mfe_capture,
+    trade_net_at_fee_rate,
     trade_opened_alert,
     trade_realized_r,
     trades_matching_config_fingerprint,
@@ -936,6 +948,271 @@ def test_weekly_report_omits_mfe_event_section_without_keys(tmp_path):
     assert "MFE / realized R at partial & trail:" not in body
 
 
+_HURDLE_GEN8_FP = GEN8_CONFIG_FINGERPRINT_PREFIX + "hurdle"
+
+
+def _hurdle_closed(
+    store,
+    ticker,
+    pnl,
+    *,
+    closed_at,
+    hurdle=None,
+    highest_price=0.0,
+    initial_risk_per_unit=2.0,
+    strategy="intraday",
+    config_fingerprint="",
+    **kwargs,
+):
+    snapshot = kwargs.pop("exit_snapshot", None)
+    if hurdle is not None:
+        snapshot = {**(snapshot or {}), "fee_hurdle_r": hurdle}
+    return _closed_trade(
+        store,
+        ticker,
+        pnl,
+        strategy=strategy,
+        closed_at=closed_at,
+        highest_price=highest_price,
+        initial_risk_per_unit=initial_risk_per_unit,
+        exit_snapshot=snapshot,
+        config_fingerprint=config_fingerprint,
+        **kwargs,
+    )
+
+
+def test_trade_fee_hurdle_helpers_and_rows():
+    closed_at = datetime(2026, 9, 21, 16, 5, tzinfo=UTC)
+    non_starter = Trade(
+        ticker="SOL",
+        strategy="intraday",
+        product_id="SOL-USD",
+        qty=1.0,
+        original_qty=1.0,
+        entry_price=100.0,
+        entry_notional=250.0,
+        take_profit=110.0,
+        stop_loss=98.0,
+        highest_price=101.0,
+        initial_risk_per_unit=2.0,
+        time_stop_at=closed_at,
+        realized_pnl=-4.25,
+        fees_paid=1.0,
+        exit_snapshot={"fee_hurdle_r": 0.6},
+        opened_at=datetime(2026, 9, 21, 13, 5, tzinfo=UTC),
+        closed_at=closed_at,
+    )
+    starter = Trade(
+        ticker="ETH",
+        strategy="intraday",
+        product_id="ETH-USD",
+        qty=1.0,
+        original_qty=1.0,
+        entry_price=100.0,
+        entry_notional=250.0,
+        take_profit=110.0,
+        stop_loss=98.0,
+        highest_price=104.0,
+        initial_risk_per_unit=2.0,
+        time_stop_at=closed_at,
+        realized_pnl=8.0,
+        fees_paid=1.0,
+        exit_snapshot={"fee_hurdle_r": 0.6},
+        opened_at=datetime(2026, 9, 21, 14, 10, tzinfo=UTC),
+        closed_at=closed_at,
+    )
+    equal = Trade(
+        ticker="XRP",
+        strategy="intraday",
+        product_id="XRP-USD",
+        qty=1.0,
+        original_qty=1.0,
+        entry_price=100.0,
+        entry_notional=250.0,
+        take_profit=110.0,
+        stop_loss=98.0,
+        highest_price=101.2,
+        initial_risk_per_unit=2.0,
+        time_stop_at=closed_at,
+        realized_pnl=0.5,
+        fees_paid=1.0,
+        exit_snapshot={"fee_hurdle_r": 0.6},
+        opened_at=closed_at,
+        closed_at=closed_at,
+    )
+    missing = Trade(
+        ticker="DOGE",
+        strategy="intraday",
+        product_id="DOGE-USD",
+        qty=1.0,
+        original_qty=1.0,
+        entry_price=100.0,
+        entry_notional=250.0,
+        take_profit=110.0,
+        stop_loss=98.0,
+        time_stop_at=closed_at,
+        realized_pnl=-1.0,
+        fees_paid=1.0,
+        opened_at=closed_at,
+        closed_at=closed_at,
+    )
+    swing = Trade(
+        ticker="BTC",
+        strategy="swing",
+        product_id="BTC-USD",
+        qty=1.0,
+        original_qty=1.0,
+        entry_price=100.0,
+        entry_notional=700.0,
+        take_profit=110.0,
+        stop_loss=98.0,
+        highest_price=101.0,
+        initial_risk_per_unit=2.0,
+        time_stop_at=closed_at,
+        realized_pnl=2.0,
+        fees_paid=1.0,
+        exit_snapshot={"fee_hurdle_r": 0.6},
+        opened_at=closed_at,
+        closed_at=closed_at,
+    )
+
+    assert trade_fee_hurdle_r(non_starter) == pytest.approx(0.6)
+    assert trade_fee_hurdle_r(missing) is None
+    assert is_fee_hurdle_non_starter(non_starter) is True
+    assert is_fee_hurdle_non_starter(starter) is False
+    assert is_fee_hurdle_non_starter(equal) is False
+    assert is_fee_hurdle_non_starter(missing) is None
+
+    summary = fee_hurdle_rows([non_starter, starter, equal, missing, swing])
+    assert summary.with_hurdle == 3
+    assert summary.without_hurdle == 1
+    assert summary.non_starters == 1
+    assert [row.ticker for row in summary.rows] == ["SOL", "ETH", "XRP"]
+    assert [row.non_starter for row in summary.rows] == [True, False, False]
+    assert (
+        format_fee_hurdle_row(summary.rows[0])
+        == "  SOL   2026-09-21 13:05Z  hurdle 0.60R  MFE 0.50R  net $-4.25 NON-STARTER"
+    )
+    assert (
+        format_fee_hurdle_row(summary.rows[1])
+        == "  ETH   2026-09-21 14:10Z  hurdle 0.60R  MFE 2.00R  net $+8.00"
+    )
+
+
+def test_weekly_report_fee_hurdle_section(tmp_path):
+    store = make_store(tmp_path)
+    end = datetime(2026, 8, 16, 20, tzinfo=UTC)
+    start = end - timedelta(days=7)
+    # opened_at is closed_at - 3h → 2026-08-15 13:05Z
+    _hurdle_closed(
+        store,
+        "SOL",
+        -4.25,
+        closed_at=datetime(2026, 8, 15, 16, 5, tzinfo=UTC),
+        hurdle=0.6,
+        highest_price=101.0,
+        config_fingerprint=_HURDLE_GEN8_FP,
+    )
+    _hurdle_closed(
+        store,
+        "ETH",
+        8.0,
+        closed_at=datetime(2026, 8, 15, 17, 10, tzinfo=UTC),
+        hurdle=0.6,
+        highest_price=104.0,
+        config_fingerprint=_HURDLE_GEN8_FP,
+    )
+    _hurdle_closed(
+        store,
+        "DOGE",
+        -1.0,
+        closed_at=end - timedelta(hours=3),
+        highest_price=104.0,
+        config_fingerprint=_HURDLE_GEN8_FP,
+    )
+    _hurdle_closed(
+        store,
+        "BTC",
+        2.0,
+        strategy="swing",
+        closed_at=end - timedelta(hours=4),
+        hurdle=0.6,
+        highest_price=101.0,
+        config_fingerprint=_HURDLE_GEN8_FP,
+    )
+    _hurdle_closed(
+        store,
+        "XRP",
+        -2.0,
+        closed_at=start - timedelta(hours=2),
+        hurdle=0.6,
+        highest_price=101.0,
+        config_fingerprint=_HURDLE_GEN8_FP,
+    )
+
+    _, body = build_weekly_report(store, ["intraday", "swing"], start, end, UTC)
+    assert "Intraday fee hurdle vs final MFE (this week):" in body
+    assert "  no hurdle data: 1" in body
+    assert "  non-starters: 1 of 2 with hurdle data (MFE_R < fee hurdle R)" in body
+    assert (
+        "  SOL   2026-08-15 13:05Z  hurdle 0.60R  MFE 0.50R  net $-4.25 NON-STARTER"
+    ) in body
+    assert "  ETH   2026-08-15 14:10Z  hurdle 0.60R  MFE 2.00R  net $+8.00" in body
+    assert "DOGE" not in body.split("Intraday fee hurdle vs final MFE (this week):", 1)[1].split(
+        "since gen-8", 1
+    )[0]
+    assert "BTC" not in body.split("Intraday fee hurdle vs final MFE (this week):", 1)[1].split(
+        "since gen-8", 1
+    )[0]
+    assert (
+        f"  since gen-8 (fp {GEN8_CONFIG_FINGERPRINT_PREFIX}): "
+        "2 non-starters of 3 with hurdle data; 1 without"
+    ) in body
+    compare = build_compare_report(store, ["intraday", "swing"])
+    assert "Intraday fee hurdle vs final MFE (this week):" not in compare
+
+
+def test_weekly_report_omits_fee_hurdle_section_without_intraday(tmp_path):
+    store = make_store(tmp_path)
+    end = datetime(2026, 8, 16, 20, tzinfo=UTC)
+    start = end - timedelta(days=7)
+    _hurdle_closed(
+        store,
+        "BTC",
+        2.0,
+        strategy="swing",
+        closed_at=end - timedelta(hours=2),
+        hurdle=0.6,
+        highest_price=101.0,
+        config_fingerprint=_HURDLE_GEN8_FP,
+    )
+    _, body = build_weekly_report(store, ["intraday", "swing"], start, end, UTC)
+    assert "Intraday fee hurdle vs final MFE (this week):" not in body
+
+
+def test_weekly_report_fee_hurdle_section_when_only_gen8_cumulative(tmp_path):
+    store = make_store(tmp_path)
+    end = datetime(2026, 8, 16, 20, tzinfo=UTC)
+    start = end - timedelta(days=7)
+    _hurdle_closed(
+        store,
+        "SOL",
+        -2.0,
+        closed_at=start - timedelta(hours=2),
+        hurdle=0.6,
+        highest_price=101.0,
+        config_fingerprint=_HURDLE_GEN8_FP,
+    )
+    _, body = build_weekly_report(store, ["intraday"], start, end, UTC)
+    assert "Intraday fee hurdle vs final MFE (this week):" in body
+    assert "  no hurdle data: 0" in body
+    assert "  non-starters: 0 of 0 with hurdle data (MFE_R < fee hurdle R)" in body
+    assert (
+        f"  since gen-8 (fp {GEN8_CONFIG_FINGERPRINT_PREFIX}): "
+        "1 non-starters of 1 with hurdle data; 0 without"
+    ) in body
+
+
 def _stop_loss_trade(
     *,
     ticker: str,
@@ -1229,27 +1506,36 @@ def _bare_closed_trade(
     fees: float = 1.0,
     notional: float = 250.0,
     setup: str = "breakout_retest",
+    strategy: str = "intraday",
     config_fingerprint: str = "",
     closed_at: datetime | None = None,
     trade_id: int | None = None,
+    qty: float = 1.0,
+    original_qty: float = 1.0,
+    entry_price: float = 100.0,
+    exit_price: float | None = None,
+    take_profit: float = 110.0,
+    partial_taken: bool = False,
 ) -> Trade:
     closed_at = closed_at or datetime(2026, 8, 16, 20, tzinfo=UTC)
     trade = Trade(
         ticker=ticker,
         product_id=f"{ticker}-USD",
-        qty=1.0,
-        original_qty=1.0,
-        entry_price=100.0,
+        qty=qty,
+        original_qty=original_qty,
+        entry_price=entry_price,
         entry_notional=notional,
-        take_profit=110.0,
+        take_profit=take_profit,
         stop_loss=95.0,
         time_stop_at=closed_at,
-        exit_price=100.0 + pnl,
+        exit_price=100.0 + pnl if exit_price is None else exit_price,
         exit_reason=ExitReason.TAKE_PROFIT if pnl >= 0 else ExitReason.STOP_LOSS,
         realized_pnl=pnl,
         fees_paid=fees,
         setup=setup,
+        strategy=strategy,
         config_fingerprint=config_fingerprint,
+        partial_taken=partial_taken,
         opened_at=closed_at - timedelta(hours=3),
         closed_at=closed_at,
     )
@@ -1275,6 +1561,28 @@ def _cost_row_line(block: str, label: str) -> str:
 
 def _cost_row_n(block: str, label: str) -> int:
     return int(_cost_row_line(block, label).split()[1])
+
+
+def _cohort_strategy_blocks(body: str) -> tuple[str, str]:
+    assert "This week by strategy:" in body
+    after = body.split("This week by strategy:", 1)[1]
+    week, cumulative = after.split("Cumulative by strategy:", 1)
+    return week, cumulative
+
+
+def _cost_row_labels(block: str) -> list[str]:
+    labels: list[str] = []
+    for line in block.splitlines():
+        if not line.startswith("  "):
+            continue
+        parts = line.split()
+        if parts:
+            labels.append(parts[0])
+    return labels
+
+
+def _row_has_small_n(block: str, label: str) -> bool:
+    return _cost_row_line(block, label).rstrip().endswith("[small-n]")
 
 
 def test_trades_matching_config_fingerprint_uses_prefix_only():
@@ -1365,6 +1673,21 @@ def test_weekly_setup_cohort_filters_fingerprint_and_splits_week_vs_cumulative(t
     assert "gross $     0.00" in cum_total
     assert "fees $    3.00" in cum_total
     assert "net $    -3.00" in cum_total
+    week_strat, cum_strat = _cohort_strategy_blocks(body)
+    assert _cost_row_labels(week_strat)[:3] == list(COHORT_STRATEGY_NAMES)
+    assert _cost_row_labels(cum_strat)[:3] == list(COHORT_STRATEGY_NAMES)
+    assert _cost_row_n(week_strat, "intraday") == 1
+    assert _cost_row_n(week_strat, "swing") == 0
+    assert _cost_row_n(week_strat, "bear_rally") == 0
+    assert _cost_row_n(week_strat, "TOTAL") == 1
+    assert _cost_row_n(cum_strat, "intraday") == 1
+    assert _cost_row_n(cum_strat, "swing") == 1
+    assert _cost_row_n(cum_strat, "bear_rally") == 0
+    assert _cost_row_n(cum_strat, "TOTAL") == 2
+    assert _row_has_small_n(week_block, "breakout_retest")
+    assert _row_has_small_n(week_strat, "intraday")
+    assert _row_has_small_n(week_strat, "swing")
+    assert "[small-n] = fewer than 5 closed trades; treat as anecdotal." in body
 
 
 def test_weekly_setup_cohort_prints_empty_week_when_only_cumulative_has_gen8(tmp_path):
@@ -1396,6 +1719,13 @@ def test_weekly_setup_cohort_prints_empty_week_when_only_cumulative_has_gen8(tmp
     assert _cost_row_n(cum_block, "breakout_retest") == 1
     for name in SETUP_BUCKETS:
         assert name in week_block
+    week_strat, cum_strat = _cohort_strategy_blocks(body)
+    for name in COHORT_STRATEGY_NAMES:
+        assert _cost_row_n(week_strat, name) == 0
+        assert _row_has_small_n(week_strat, name)
+    assert _cost_row_n(cum_strat, "intraday") == 1
+    assert _cost_row_n(cum_strat, "swing") == 0
+    assert _cost_row_n(cum_strat, "bear_rally") == 0
 
 
 def test_weekly_setup_cohort_omitted_when_no_gen8_trades(tmp_path):
@@ -1473,6 +1803,18 @@ def test_compare_setup_cohort_rolling_week_and_cumulative(tmp_path):
     assert _cost_row_n(week_block, "breakout_retest") == 1
     assert _cost_row_n(cum_block, "vwap") == 1
     assert _cost_row_n(week_block, "vwap") == 0
+    week_strat, cum_strat = _cohort_strategy_blocks(body)
+    assert _cost_row_labels(week_strat)[:3] == list(COHORT_STRATEGY_NAMES)
+    assert _cost_row_n(week_strat, "intraday") == 1
+    assert _cost_row_n(week_strat, "swing") == 0
+    assert _cost_row_n(week_strat, "bear_rally") == 0
+    assert _cost_row_n(week_strat, "TOTAL") == 1
+    assert _cost_row_n(cum_strat, "intraday") == 1
+    assert _cost_row_n(cum_strat, "swing") == 1
+    assert _cost_row_n(cum_strat, "bear_rally") == 0
+    assert _cost_row_n(cum_strat, "TOTAL") == 2
+    assert _row_has_small_n(week_strat, "intraday")
+    assert _row_has_small_n(week_block, "breakout_retest")
 
 
 def test_compare_setup_cohort_omitted_when_empty_book(tmp_path):
@@ -1480,6 +1822,393 @@ def test_compare_setup_cohort_omitted_when_empty_book(tmp_path):
     body = build_compare_report(store, ["intraday"], mode="PAPER")
     assert "No closed trades." in body
     assert COHORT_HEADER not in body
+
+
+def test_strategy_cost_stats_canonical_then_sorted_extras():
+    trades = [
+        _bare_closed_trade(ticker="SOL", strategy="swing"),
+        _bare_closed_trade(ticker="ETH", strategy="zeta"),
+        _bare_closed_trade(ticker="BTC", strategy="alpha"),
+        _bare_closed_trade(ticker="HYPE", strategy="intraday"),
+        _bare_closed_trade(ticker="ZEC", strategy="intraday"),
+    ]
+    rows = strategy_cost_stats(trades)
+    names = [name for name, _ in rows]
+    assert names == [*COHORT_STRATEGY_NAMES, "alpha", "zeta"]
+    by_name = dict(rows)
+    assert by_name["intraday"].n == 2
+    assert by_name["swing"].n == 1
+    assert by_name["bear_rally"].n == 0
+    assert by_name["alpha"].n == 1
+    assert by_name["zeta"].n == 1
+    empty = dict(strategy_cost_stats([]))
+    assert [name for name, _ in strategy_cost_stats([])] == list(COHORT_STRATEGY_NAMES)
+    assert empty["intraday"].n == empty["swing"].n == empty["bear_rally"].n == 0
+
+
+def test_weekly_and_compare_cohort_strategy_extras_and_fingerprint(tmp_path):
+    store = make_store(tmp_path)
+    now = datetime.now(UTC)
+    end = now + timedelta(hours=1)
+    start = end - timedelta(days=7)
+    _closed_trade(
+        store,
+        "SOL",
+        5.0,
+        strategy="intraday",
+        closed_at=now - timedelta(hours=2),
+        setup="breakout_retest",
+        config_fingerprint=GEN8_FP,
+    )
+    _closed_trade(
+        store,
+        "BTC",
+        2.0,
+        strategy="alpha",
+        closed_at=now - timedelta(hours=3),
+        setup="vwap",
+        config_fingerprint=GEN8_FP,
+    )
+    _closed_trade(
+        store,
+        "HYPE",
+        3.0,
+        strategy="zeta",
+        closed_at=now - timedelta(days=10),
+        setup="breakout_close",
+        config_fingerprint=GEN8_FP,
+    )
+    _closed_trade(
+        store,
+        "ETH",
+        9.0,
+        strategy="swing",
+        closed_at=now - timedelta(hours=4),
+        setup="vwap",
+        config_fingerprint=GEN7_FP,
+    )
+
+    _, weekly = build_weekly_report(store, ["intraday", "swing"], start, end, UTC)
+    compare = build_compare_report(store, ["intraday", "swing"])
+    for body in (weekly, compare):
+        week_strat, cum_strat = _cohort_strategy_blocks(body)
+        assert _cost_row_labels(week_strat)[:5] == [*COHORT_STRATEGY_NAMES, "alpha", "TOTAL"]
+        assert _cost_row_n(week_strat, "intraday") == 1
+        assert _cost_row_n(week_strat, "swing") == 0
+        assert _cost_row_n(week_strat, "bear_rally") == 0
+        assert _cost_row_n(week_strat, "alpha") == 1
+        assert "zeta" not in _cost_row_labels(week_strat)
+        assert _cost_row_n(week_strat, "TOTAL") == 2
+        assert _cost_row_labels(cum_strat)[:6] == [
+            *COHORT_STRATEGY_NAMES,
+            "alpha",
+            "zeta",
+            "TOTAL",
+        ]
+        assert _cost_row_n(cum_strat, "intraday") == 1
+        assert _cost_row_n(cum_strat, "swing") == 0
+        assert _cost_row_n(cum_strat, "bear_rally") == 0
+        assert _cost_row_n(cum_strat, "alpha") == 1
+        assert _cost_row_n(cum_strat, "zeta") == 1
+        assert _cost_row_n(cum_strat, "TOTAL") == 3
+
+
+def test_cohort_small_n_marker_setup_and_strategy_rows(tmp_path):
+    store = make_store(tmp_path)
+    now = datetime.now(UTC)
+    end = now + timedelta(hours=1)
+    start = end - timedelta(days=7)
+    for i in range(SMALL_N_THRESHOLD):
+        _closed_trade(
+            store,
+            "SOL",
+            1.0,
+            strategy="intraday",
+            closed_at=now - timedelta(hours=i + 1),
+            setup="breakout_retest",
+            config_fingerprint=GEN8_FP,
+        )
+    _closed_trade(
+        store,
+        "BTC",
+        1.0,
+        strategy="swing",
+        closed_at=now - timedelta(hours=10),
+        setup="vwap",
+        config_fingerprint=GEN8_FP,
+    )
+    _closed_trade(
+        store,
+        "ETH",
+        1.0,
+        strategy="swing",
+        closed_at=now - timedelta(hours=11),
+        setup="vwap",
+        config_fingerprint=GEN7_FP,
+    )
+
+    _, weekly = build_weekly_report(store, ["intraday", "swing"], start, end, UTC)
+    compare = build_compare_report(store, ["intraday", "swing"])
+    for body in (weekly, compare):
+        assert "[small-n] = fewer than 5 closed trades; treat as anecdotal." in body
+        week_setup, cum_setup = _cohort_blocks(body)
+        week_strat, cum_strat = _cohort_strategy_blocks(body)
+        assert not _row_has_small_n(week_setup, "breakout_retest")
+        assert _row_has_small_n(week_setup, "vwap")
+        assert _row_has_small_n(week_setup, "breakout_close")
+        assert _row_has_small_n(week_setup, "unknown")
+        assert not _row_has_small_n(week_setup, "TOTAL")
+        assert not _row_has_small_n(week_strat, "intraday")
+        assert _row_has_small_n(week_strat, "swing")
+        assert _row_has_small_n(week_strat, "bear_rally")
+        assert not _row_has_small_n(week_strat, "TOTAL")
+        assert not _row_has_small_n(cum_strat, "intraday")
+        assert _row_has_small_n(cum_strat, "swing")
+        assert _row_has_small_n(cum_setup, "vwap")
+        assert not _row_has_small_n(cum_setup, "breakout_retest")
+
+    digest_strategy = weekly.split("By strategy:", 1)[1].split("By setup:", 1)[0]
+    assert "[small-n]" not in digest_strategy
+    digest_setup = weekly.split("By setup:", 1)[1].split(COHORT_HEADER, 1)[0]
+    assert "[small-n]" not in digest_setup
+
+
+# ---- Fee-rate what-if (report only) -----------------------------------------
+
+
+def test_trade_fee_legs_notional_without_partial():
+    trade = _bare_closed_trade(
+        original_qty=2.0,
+        qty=2.0,
+        entry_price=100.0,
+        exit_price=105.0,
+        take_profit=110.0,
+        partial_taken=False,
+    )
+    assert trade_fee_legs_notional(trade) == pytest.approx(100.0 * 2.0 + 105.0 * 2.0)
+
+
+def test_trade_fee_legs_notional_with_partial():
+    trade = _bare_closed_trade(
+        original_qty=2.0,
+        qty=1.0,
+        entry_price=50.0,
+        take_profit=60.0,
+        exit_price=40.0,
+        partial_taken=True,
+    )
+    assert trade_fee_legs_notional(trade) == pytest.approx(50.0 * 2.0 + 60.0 * 1.0 + 40.0 * 1.0)
+
+
+def test_trade_fee_legs_notional_legacy_qty_and_missing_price():
+    legacy = _bare_closed_trade(
+        original_qty=0.0,
+        qty=3.0,
+        entry_price=100.0,
+        exit_price=110.0,
+        partial_taken=False,
+        notional=999.0,
+    )
+    assert trade_fee_legs_notional(legacy) == pytest.approx(100.0 * 3.0 + 110.0 * 3.0)
+
+    no_price = _bare_closed_trade(
+        original_qty=2.0,
+        qty=2.0,
+        entry_price=0.0,
+        exit_price=105.0,
+        notional=250.0,
+        partial_taken=False,
+    )
+    assert trade_fee_legs_notional(no_price) == pytest.approx(250.0 + 105.0 * 2.0)
+
+    flagged_but_no_size_delta = _bare_closed_trade(
+        original_qty=2.0,
+        qty=2.0,
+        entry_price=100.0,
+        take_profit=110.0,
+        exit_price=105.0,
+        partial_taken=True,
+    )
+    assert trade_fee_legs_notional(flagged_but_no_size_delta) == pytest.approx(
+        100.0 * 2.0 + 105.0 * 2.0
+    )
+
+
+def test_net_at_fee_rate_zero_equals_gross():
+    trades = [
+        _bare_closed_trade(pnl=8.0, fees=2.0, original_qty=1.0, qty=1.0, exit_price=110.0),
+        _bare_closed_trade(
+            ticker="BTC",
+            pnl=-5.0,
+            fees=3.0,
+            original_qty=2.0,
+            qty=1.0,
+            entry_price=50.0,
+            take_profit=60.0,
+            exit_price=40.0,
+            partial_taken=True,
+        ),
+    ]
+    assert net_at_fee_rate(trades, 0.0) == pytest.approx(sum(trade_gross_pnl(t) for t in trades))
+    rate = 0.004
+    expected = sum(trade_gross_pnl(t) - trade_fee_legs_notional(t) * rate for t in trades)
+    assert net_at_fee_rate(trades, rate) == pytest.approx(expected)
+    assert trade_net_at_fee_rate(trades[0], rate) == pytest.approx(
+        trade_gross_pnl(trades[0]) - trade_fee_legs_notional(trades[0]) * rate
+    )
+
+
+def test_fee_rate_what_if_line_filters_to_gen8_prefix():
+    gen8 = _bare_closed_trade(
+        ticker="SOL",
+        pnl=8.0,
+        fees=2.0,
+        original_qty=1.0,
+        qty=1.0,
+        entry_price=100.0,
+        exit_price=110.0,
+        config_fingerprint=GEN8_FP,
+    )
+    gen8_short = _bare_closed_trade(
+        ticker="ETH",
+        pnl=-5.0,
+        fees=1.0,
+        original_qty=2.0,
+        qty=1.0,
+        entry_price=50.0,
+        take_profit=60.0,
+        exit_price=40.0,
+        partial_taken=True,
+        config_fingerprint=GEN8_CONFIG_FINGERPRINT_PREFIX,
+    )
+    gen7 = _bare_closed_trade(
+        ticker="BTC",
+        pnl=99.0,
+        fees=50.0,
+        original_qty=10.0,
+        qty=10.0,
+        entry_price=200.0,
+        exit_price=250.0,
+        config_fingerprint=GEN7_FP,
+    )
+    rate = 0.004
+    cohort = [gen8, gen8_short]
+    lines = fee_rate_what_if_line([gen8, gen8_short, gen7], rate)
+    assert len(lines) == 1
+    line = lines[0]
+    gross = sum(trade_gross_pnl(t) for t in cohort)
+    alt_fees = sum(trade_fee_legs_notional(t) * rate for t in cohort)
+    recomputed = net_at_fee_rate(cohort, rate)
+    actual = sum(t.realized_pnl for t in cohort)
+    assert "What-if fee rate 0.40%/side" in line
+    assert f"fp {GEN8_CONFIG_FINGERPRINT_PREFIX}" in line
+    assert "n=2" in line
+    assert f"net ${recomputed:+,.2f}" in line
+    assert f"gross ${gross:+,.2f}" in line
+    assert f"fees ${alt_fees:,.2f} at alt rate" in line
+    assert f"vs actual net ${actual:+,.2f}" in line
+    assert "Stored data unchanged." in line
+    assert "n=3" not in line
+    assert "99.00" not in line
+
+
+def test_weekly_report_fee_rate_line_only_when_passed_and_uses_all_closed(tmp_path):
+    store = make_store(tmp_path)
+    end = datetime(2026, 8, 16, 20, tzinfo=UTC)
+    start = end - timedelta(days=7)
+    week_gen8 = _closed_trade(
+        store,
+        "SOL",
+        5.0,
+        closed_at=end - timedelta(hours=2),
+        fees=1.0,
+        config_fingerprint=GEN8_FP,
+    )
+    prior_gen8 = _closed_trade(
+        store,
+        "BTC",
+        -8.0,
+        strategy="swing",
+        closed_at=start - timedelta(hours=2),
+        fees=2.0,
+        config_fingerprint=GEN8_FP,
+    )
+    _closed_trade(
+        store,
+        "ETH",
+        9.0,
+        closed_at=end - timedelta(hours=3),
+        fees=1.0,
+        config_fingerprint=GEN7_FP,
+    )
+
+    _, without = build_weekly_report(store, ["intraday", "swing"], start, end, UTC)
+    _, with_rate = build_weekly_report(
+        store, ["intraday", "swing"], start, end, UTC, fee_rate=0.004
+    )
+    expected = fee_rate_what_if_line(list(store.closed_trades()), 0.004)
+    assert "What-if fee rate" not in without
+    assert expected[0] in with_rate
+    assert "n=2" in expected[0]
+    assert with_rate.index(COHORT_HEADER) < with_rate.index(expected[0])
+    assert week_gen8.fees_paid == 1.0
+    assert prior_gen8.fees_paid == 2.0
+    assert week_gen8.realized_pnl == 5.0
+    assert prior_gen8.realized_pnl == -8.0
+
+
+def test_compare_report_fee_rate_line_only_when_passed(tmp_path):
+    store = make_store(tmp_path)
+    now = datetime.now(UTC)
+    _closed_trade(
+        store,
+        "SOL",
+        5.0,
+        closed_at=now - timedelta(days=1),
+        fees=1.0,
+        config_fingerprint=GEN8_FP,
+    )
+    _closed_trade(
+        store,
+        "BTC",
+        -8.0,
+        strategy="swing",
+        closed_at=now - timedelta(days=10),
+        fees=2.0,
+        config_fingerprint=GEN8_FP,
+    )
+    _closed_trade(
+        store,
+        "ETH",
+        3.0,
+        closed_at=now - timedelta(days=1),
+        config_fingerprint=GEN7_FP,
+    )
+
+    without = build_compare_report(store, ["intraday", "swing"])
+    with_rate = build_compare_report(store, ["intraday", "swing"], fee_rate=0.004)
+    expected = fee_rate_what_if_line(list(store.closed_trades()), 0.004)
+    assert "What-if fee rate" not in without
+    assert expected[0] in with_rate
+    assert "n=2" in expected[0]
+    assert with_rate.index(COHORT_HEADER) < with_rate.index(expected[0])
+
+
+def test_cli_fee_rate_flag_accepts_fraction_and_rejects_negative():
+    weekly = build_parser().parse_args(["weekly-report", "--fee-rate", "0.004"])
+    assert weekly.fee_rate == pytest.approx(0.004)
+    compare = build_parser().parse_args(["compare", "--fee-rate", "0.004"])
+    assert compare.fee_rate == pytest.approx(0.004)
+    default_weekly = build_parser().parse_args(["weekly-report"])
+    assert default_weekly.fee_rate is None
+    soak = build_parser().parse_args(["soak-report"])
+    assert not hasattr(soak, "fee_rate")
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["weekly-report", "--fee-rate", "-0.001"])
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["compare", "--fee-rate", "-0.001"])
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["weekly-report", "--fee-rate", "0.1"])
 
 
 # ---- Telegram message splitting ---------------------------------------------

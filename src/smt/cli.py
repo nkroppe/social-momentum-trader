@@ -18,6 +18,13 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _fee_rate(value: str) -> float:
+    parsed = float(value)
+    if not 0 <= parsed < 0.1:
+        raise argparse.ArgumentTypeError("must be a per-side fraction in [0, 0.1)")
+    return parsed
+
+
 def _cmd_run(_args: argparse.Namespace) -> int:
     from .run import Runner
 
@@ -111,7 +118,7 @@ def _cmd_status(_args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_compare(_args: argparse.Namespace) -> int:
+def _cmd_compare(args: argparse.Namespace) -> int:
     """Side-by-side performance of each strategy over the soak."""
     from .ops.reports import build_compare_report
     from .run import Runner
@@ -122,6 +129,7 @@ def _cmd_compare(_args: argparse.Namespace) -> int:
             r.store,
             [(st.name, st.allocation, r.manager.allocation_equity(st)) for st in r.strategies],
             mode="LIVE" if r.settings.live else "PAPER",
+            fee_rate=getattr(args, "fee_rate", None),
         )
     )
     return 0
@@ -203,7 +211,7 @@ def _cmd_weekly_report(args: argparse.Namespace) -> int:
 
     r = Runner()
     occurrence = r.weekly.previous_occurrence() if args.last else r.weekly.next_occurrence()
-    subject, body = r.weekly_report(occurrence)
+    subject, body = r.weekly_report(occurrence, fee_rate=args.fee_rate)
     print(subject)
     print("-" * len(subject))
     print(body)
@@ -474,6 +482,51 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_fetch_candles(args: argparse.Namespace) -> int:
+    """Public Coinbase candles for closed trades. No orders, no API key, no DB writes."""
+    from pathlib import Path
+
+    from .config import get_settings
+    from .ops.candle_fetch import fetch_trade_candles, format_fetch_line
+    from .store import Store
+
+    out_dir = Path(args.out_dir)
+    store = Store(get_settings().database_url)
+    results = fetch_trade_candles(
+        store,
+        out_dir,
+        fingerprint_prefix=args.fingerprint_prefix,
+        overwrite=args.overwrite,
+    )
+    for result in results:
+        print(format_fetch_line(result))
+    fetched = sum(1 for result in results if result.status == "ok")
+    cached = sum(1 for result in results if result.status == "cached")
+    errors = sum(1 for result in results if result.status == "error")
+    print(f"fetched {fetched}, cached {cached}, errors {errors} -> {out_dir}")
+    if results and errors == len(results):
+        return 1
+    return 0
+
+
+def _cmd_partial_replay(args: argparse.Namespace) -> int:
+    """Report-only post-partial exit replay from local CSVs. No network, no DB writes."""
+    from pathlib import Path
+
+    from .config import get_settings
+    from .ops.partial_replay import format_partial_replay, run_partial_replay
+    from .store import Store
+
+    store = Store(get_settings().database_url)
+    result = run_partial_replay(
+        store,
+        Path(args.candles_dir),
+        fingerprint_prefix=args.fingerprint_prefix,
+    )
+    print(format_partial_replay(result), end="")
+    return 0
+
+
 def _cmd_backtest(args: argparse.Namespace) -> int:
     """Replay deterministic price rules against strict local candle files."""
     from pathlib import Path
@@ -509,6 +562,8 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from .ops.reports import GEN8_CONFIG_FINGERPRINT_PREFIX
+
     p = argparse.ArgumentParser(prog="smt", description="Social Momentum Trader")
     p.add_argument("--version", action="version", version=f"smt {__version__}")
     sub = p.add_subparsers(dest="command", required=True)
@@ -521,9 +576,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="Show open positions and PnL by strategy").set_defaults(
         func=_cmd_status
     )
-    sub.add_parser("compare", help="Compare strategy performance side by side").set_defaults(
-        func=_cmd_compare
+    compare = sub.add_parser("compare", help="Compare strategy performance side by side")
+    compare.add_argument(
+        "--fee-rate",
+        type=_fee_rate,
+        default=None,
+        metavar="RATE",
+        help="Report-only per-side fee fraction (e.g. 0.004); stored data unchanged",
     )
+    compare.set_defaults(func=_cmd_compare)
 
     k = sub.add_parser("kill", help="Trip the kill switch")
     k.add_argument("--reason", default="")
@@ -552,6 +613,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--send", action="store_true", help="Also deliver it to the alert channels now"
     )
     weekly.add_argument("--last", action="store_true", help="Show the last completed week instead")
+    weekly.add_argument(
+        "--fee-rate",
+        type=_fee_rate,
+        default=None,
+        metavar="RATE",
+        help="Report-only per-side fee fraction (e.g. 0.004); stored data unchanged",
+    )
     weekly.set_defaults(func=_cmd_weekly_report)
 
     shadow = sub.add_parser("shadow-report", help="Assess social and Sonnet shadow readiness")
@@ -590,6 +658,43 @@ def build_parser() -> argparse.ArgumentParser:
     )
     replay.add_argument("--output-dir", required=True, help="Artifact output directory")
     replay.set_defaults(func=_cmd_backtest)
+
+    fetch_candles = sub.add_parser(
+        "fetch-candles",
+        help="Download public Coinbase candles for closed trades (no orders, no API key)",
+    )
+    fetch_candles.add_argument(
+        "--out-dir",
+        default="data/candles",
+        help="Directory for per-trade CSVs (default: data/candles)",
+    )
+    fetch_candles.add_argument(
+        "--fingerprint-prefix",
+        default=GEN8_CONFIG_FINGERPRINT_PREFIX,
+        help=f"Closed-trade config_fingerprint prefix (default: {GEN8_CONFIG_FINGERPRINT_PREFIX})",
+    )
+    fetch_candles.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Re-fetch even when the CSV already exists",
+    )
+    fetch_candles.set_defaults(func=_cmd_fetch_candles)
+
+    partial_replay = sub.add_parser(
+        "partial-replay",
+        help="Report-only post-partial exit replay from fetch-candles CSVs (no network)",
+    )
+    partial_replay.add_argument(
+        "--candles-dir",
+        default="data/candles",
+        help="Directory of per-trade CSVs from fetch-candles (default: data/candles)",
+    )
+    partial_replay.add_argument(
+        "--fingerprint-prefix",
+        default=GEN8_CONFIG_FINGERPRINT_PREFIX,
+        help=f"Closed-trade config_fingerprint prefix (default: {GEN8_CONFIG_FINGERPRINT_PREFIX})",
+    )
+    partial_replay.set_defaults(func=_cmd_partial_replay)
 
     dash = sub.add_parser("dashboard", help="Serve the read-only monitoring web UI")
     dash.add_argument("--host", default="127.0.0.1", help="Bind address (default 127.0.0.1)")

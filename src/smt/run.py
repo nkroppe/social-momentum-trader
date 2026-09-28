@@ -26,6 +26,7 @@ from .logging_setup import get_logger
 from .market import MarketData
 from .models import utcnow
 from .ops import Alerter, KillSwitch, TelegramControl
+from .ops.edge_gate import live_edge_gate
 from .ops.reports import build_weekly_report
 from .ops.schedule import WeeklyScheduler
 from .ops.soak import SoakTracker
@@ -239,7 +240,7 @@ class Runner:
         )
 
     def _enforce_live_latches(self) -> None:
-        """Second latch: force paper unless LIVE and the ack phrase are both set.
+        """Force paper unless LIVE ack, paper soak, and edge gate all pass.
 
         Advanced partial/Chandelier exits are no longer a live blocker:
         CoinbaseBroker reconciles fills and cancel/replaces leftover TP/SL.
@@ -264,6 +265,27 @@ class Runner:
                     min_days,
                 )
                 self.settings.live = False
+
+        if self.settings.live:
+            try:
+                store = getattr(self, "store", None)
+                if store is None:
+                    store = Store(self.settings.database_url)
+                    store.init_db()
+                result = live_edge_gate(store, self.config_fingerprint)
+            except Exception as exc:  # noqa: BLE001
+                log.critical(
+                    "LIVE=true but live_edge_gate failed (%s) -> forcing PAPER.",
+                    exc,
+                )
+                self.settings.live = False
+            else:
+                if not result.passed:
+                    log.critical(
+                        "LIVE=true but live_edge_gate failed (%s) -> forcing PAPER.",
+                        result.detail,
+                    )
+                    self.settings.live = False
 
     # ---- one iteration -----------------------------------------------------
 
@@ -567,7 +589,11 @@ class Runner:
         self.alerter.notify("Daily soak digest", body, critical=False)
         log.info("Sent soak digest")
 
-    def weekly_report(self, occurrence: datetime | None = None) -> tuple[str, str]:
+    def weekly_report(
+        self,
+        occurrence: datetime | None = None,
+        fee_rate: float | None = None,
+    ) -> tuple[str, str]:
         """Build the report for `occurrence` (defaults to the latest due window)."""
         occurrence = occurrence or self.weekly.previous_occurrence()
         start, end = self.weekly.report_window(occurrence)
@@ -580,6 +606,7 @@ class Runner:
             mode="LIVE" if self.broker.name == "coinbase" else "PAPER",
             max_trades_listed=self.ops.weekly_report.max_trades_listed,
             mark_price=self.broker.current_price,
+            fee_rate=fee_rate,
         )
 
     def _send_weekly_if_due(self) -> None:

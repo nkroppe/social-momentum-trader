@@ -29,6 +29,7 @@ from .exit_policy import (
     ExitActionKind,
     bar_step,
     chandelier_ratchet,
+    fee_hurdle_r,
     first_partial_economics,
     first_partial_quantity,
     initial_levels,
@@ -264,6 +265,16 @@ class TradeManager:
             if self.trade_alerts.on_close:
                 self._notify(*trade_closed_alert(trade))
             return trade
+
+        hurdle = fee_hurdle_r(
+            fill.price,
+            fill.qty,
+            initial_risk,
+            strategy.assumed_fee_pct_per_side,
+        )
+        if hurdle is not None:
+            exit_snapshot["fee_hurdle_r"] = round(hurdle, 6)
+            exit_snapshot["fee_hurdle_pct_per_side"] = strategy.assumed_fee_pct_per_side
 
         trade = Trade(
             ticker=candidate.ticker,

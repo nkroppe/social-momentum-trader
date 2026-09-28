@@ -21,6 +21,7 @@ from .config import (
     get_strategies,
     get_universe,
 )
+
 if TYPE_CHECKING:
     from .llm.config import LLMConfig
 
