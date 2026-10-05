@@ -468,11 +468,33 @@ class TradeManager:
         return atr_abs
 
     def _sync_protecting_bracket(self, trade: Trade) -> None:
-        """Cancel/replace remaining live TP/SL after a partial or Chandelier ratchet."""
-        replacer = getattr(self.broker, "replace_remaining_bracket", None)
-        if not callable(replacer) or trade.qty <= 0:
+        """Cancel/replace remaining live protection after a partial or Chandelier ratchet.
+
+        Paper post-partial policy (exit_policy.quote_step) only exits on the
+        chandelier trailing stop — take-profit is never re-checked. Live must
+        match: after partial_taken, replace with a stop-only order. Pre-partial
+        still uses the TP/SL bracket. PaperBroker has neither method; getattr
+        checks keep it unaffected. Live advanced support is still detected via
+        replace_remaining_bracket.
+        """
+        if trade.qty <= 0:
             return
         sl = trade.trailing_stop or trade.stop_loss
+        if trade.partial_taken:
+            stopper = getattr(self.broker, "replace_remaining_stop", None)
+            if not callable(stopper):
+                return
+            try:
+                new_id = stopper(trade.product_id, trade.qty, sl)
+            except Exception as exc:  # noqa: BLE001 - position remains; retry next loop
+                log.warning("replace remaining stop failed for %s: %s", trade.product_id, exc)
+                return
+            if new_id:
+                trade.broker_entry_order_id = str(new_id)
+            return
+        replacer = getattr(self.broker, "replace_remaining_bracket", None)
+        if not callable(replacer):
+            return
         tp = trade.take_profit
         if tp <= sl:
             tp = sl * 1.02 if sl > 0 else tp

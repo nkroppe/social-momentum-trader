@@ -18,8 +18,11 @@ exercised in paper mode.
 from __future__ import annotations
 
 import contextlib
+import inspect
+import time
 import uuid
 from collections.abc import Iterable, Sequence
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from typing import Any
 
 from ..config import SecurityConfig, Settings
@@ -27,6 +30,16 @@ from ..logging_setup import get_logger
 from .broker import Fill
 
 log = get_logger("smt.broker.coinbase")
+
+# Stop-limit sell buffer below the stop trigger so the limit is not a take-profit.
+# Module constant on purpose — not a config field.
+LIVE_STOP_LIMIT_BUFFER_PCT = 0.01
+
+FILL_RECONCILE_ATTEMPTS = 3
+FILL_RECONCILE_SLEEP_S = 0.25
+
+_DEFAULT_BASE_INCREMENT = Decimal("0.00000001")
+_DEFAULT_QUOTE_INCREMENT = Decimal("0.01")
 
 
 class TransferPermissionError(RuntimeError):
@@ -39,6 +52,54 @@ class ForbiddenApiPathError(RuntimeError):
 
 class PortfolioScopeError(RuntimeError):
     """Raised when the isolated Coinbase portfolio cannot be scoped."""
+
+
+def _fill_retry_sleep(seconds: float) -> None:
+    """Sleep between get_order retries. Tests monkeypatch this to avoid waiting."""
+    time.sleep(seconds)
+
+
+def _round_down_to_increment(value: float | Decimal | str, increment: float | Decimal | str) -> str:
+    """Round *value* down to a multiple of *increment* as a plain decimal string."""
+    amount = Decimal(str(value))
+    try:
+        step = Decimal(str(increment))
+    except (InvalidOperation, ArithmeticError, ValueError):
+        step = Decimal("0")
+    if step <= 0:
+        return format(amount, "f")
+    rounded = (amount / step).to_integral_value(rounding=ROUND_DOWN) * step
+    if rounded < 0:
+        rounded = Decimal("0")
+    return format(rounded, "f")
+
+
+def _as_decimal(raw: Any, default: Decimal) -> Decimal:
+    if raw is None or raw == "":
+        return default
+    try:
+        value = Decimal(str(raw))
+    except (InvalidOperation, ArithmeticError, ValueError):
+        return default
+    if value <= 0:
+        return default
+    return value
+
+
+def _method_accepts_retail_portfolio_id(method: Any) -> bool:
+    """True if *method* can take retail_portfolio_id (named param or **kwargs).
+
+    MagicMock / objects without a signature are treated as accepting so tests
+    and wrapped clients still run.
+    """
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):
+        return True
+    parameters = signature.parameters
+    if "retail_portfolio_id" in parameters:
+        return True
+    return any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
 
 
 def _field(obj: Any, *names: str, default: Any = None) -> Any:
@@ -125,6 +186,7 @@ class CoinbaseBroker:
                 "COINBASE_PORTFOLIO_ID is required; refusing unscoped Coinbase access"
             )
         self._protect_orders: dict[str, set[str]] = {}
+        self._increment_cache: dict[str, tuple[Decimal, Decimal]] = {}
         self._assert_trade_only()
 
     # ---- Guardrails --------------------------------------------------------
@@ -166,15 +228,20 @@ class CoinbaseBroker:
         return {**kwargs, "retail_portfolio_id": self._portfolio_id}
 
     def _call_scoped(self, method: Any, **kwargs: Any) -> Any:
-        """Call a client method with portfolio scope. TypeError is fail-closed."""
-        scoped = self._scoped(**kwargs)
-        try:
-            return method(**scoped)
-        except TypeError as exc:
+        """Call a client method with portfolio scope.
+
+        Only a genuine scope problem becomes PortfolioScopeError: the method
+        has neither a ``retail_portfolio_id`` parameter nor ``**kwargs``.
+        TypeError from an SDK argument mismatch (wrong kwarg on a method that
+        *does* accept the portfolio id) propagates unchanged. MagicMock and
+        other objects without a signature are treated as accepting.
+        """
+        if not _method_accepts_retail_portfolio_id(method):
             name = getattr(method, "__name__", "client method")
             raise PortfolioScopeError(
-                f"{name} rejected retail_portfolio_id; refusing unscoped Coinbase call"
-            ) from exc
+                f"{name} does not accept retail_portfolio_id; refusing unscoped Coinbase call"
+            )
+        return method(**self._scoped(**kwargs))
 
     def _track(self, product_id: str, order_id: str) -> None:
         if order_id:
@@ -191,11 +258,48 @@ class CoinbaseBroker:
     # ---- Market data -------------------------------------------------------
 
     def current_price(self, product_id: str) -> float:
-        self._guard_path(f"/products/{product_id}")
-        product = self.client.get_product(product_id)
+        product = self._get_product(product_id)
         return float(product["price"] if isinstance(product, dict) else product.price)
 
+    def _get_product(self, product_id: str) -> Any:
+        self._guard_path(f"/products/{product_id}")
+        return self.client.get_product(product_id)
+
+    def _product_increments(self, product_id: str) -> tuple[Decimal, Decimal]:
+        cached = self._increment_cache.get(product_id)
+        if cached is not None:
+            return cached
+        product = self._get_product(product_id)
+        base = _as_decimal(
+            _field(product, "base_increment", "baseIncrement", default=None),
+            _DEFAULT_BASE_INCREMENT,
+        )
+        quote = _as_decimal(
+            _field(product, "quote_increment", "quoteIncrement", default=None),
+            _DEFAULT_QUOTE_INCREMENT,
+        )
+        pair = (base, quote)
+        self._increment_cache[product_id] = pair
+        return pair
+
+    def _rounded_base_size(self, product_id: str, qty: float) -> str:
+        base_inc, _quote_inc = self._product_increments(product_id)
+        return _round_down_to_increment(qty, base_inc)
+
+    def _rounded_price(self, product_id: str, price: float | Decimal) -> str:
+        _base_inc, quote_inc = self._product_increments(product_id)
+        return _round_down_to_increment(price, quote_inc)
+
     # ---- Fill reconcile ----------------------------------------------------
+
+    def _read_fill_from_order(self, order_id: str) -> tuple[float, float, float]:
+        self._guard_path(f"/orders/historical/{order_id}")
+        resp = self.client.get_order(order_id)
+        order = _unwrap_order(resp)
+        price = _float_field(order, "average_filled_price", "averageFilledPrice")
+        qty = _float_field(order, "filled_size", "filledSize")
+        fee = _float_field(order, "total_fees", "totalFees")
+        return price, qty, max(fee, 0.0)
 
     def reconcile_fill(
         self,
@@ -207,17 +311,50 @@ class CoinbaseBroker:
         """Read average fill price/qty/fee from get_order; fall back if unfilled."""
         if not order_id:
             return Fill(order_id="", price=fallback_price, qty=fallback_qty, fee=0.0)
-        self._guard_path(f"/orders/historical/{order_id}")
-        resp = self.client.get_order(order_id)
-        order = _unwrap_order(resp)
-        price = _float_field(order, "average_filled_price", "averageFilledPrice")
-        qty = _float_field(order, "filled_size", "filledSize")
-        fee = _float_field(order, "total_fees", "totalFees")
+        price, qty, fee = self._read_fill_from_order(order_id)
         if price <= 0:
             price = fallback_price
         if qty <= 0:
             qty = fallback_qty
-        return Fill(order_id=order_id, price=price, qty=qty, fee=max(fee, 0.0))
+        return Fill(order_id=order_id, price=price, qty=qty, fee=fee)
+
+    def _reconcile_fill_with_retry(
+        self,
+        order_id: str,
+        *,
+        fallback_price: float,
+        fallback_qty: float,
+    ) -> Fill:
+        """Retry get_order when filled_size is still 0, then fall back with a warning."""
+        if not order_id:
+            return Fill(order_id="", price=fallback_price, qty=fallback_qty, fee=0.0)
+        last_price = 0.0
+        last_fee = 0.0
+        for attempt in range(1, FILL_RECONCILE_ATTEMPTS + 1):
+            price, qty, fee = self._read_fill_from_order(order_id)
+            last_price = price
+            last_fee = fee
+            if qty > 0:
+                return Fill(
+                    order_id=order_id,
+                    price=price if price > 0 else fallback_price,
+                    qty=qty,
+                    fee=fee,
+                )
+            if attempt < FILL_RECONCILE_ATTEMPTS:
+                _fill_retry_sleep(FILL_RECONCILE_SLEEP_S)
+        log.warning(
+            "[live] get_order filled_size<=0 after %s attempts for %s; "
+            "falling back to notional/price estimate",
+            FILL_RECONCILE_ATTEMPTS,
+            order_id,
+        )
+        return Fill(
+            order_id=order_id,
+            price=last_price if last_price > 0 else fallback_price,
+            qty=fallback_qty,
+            fee=last_fee,
+        )
 
     def _list_open_order_ids(self, product_id: str) -> list[str]:
         self._guard_path("/orders/historical/batch")
@@ -227,7 +364,7 @@ class CoinbaseBroker:
                 product_ids=[product_id],
                 order_status=["OPEN", "PENDING"],
             )
-        except PortfolioScopeError:
+        except (PortfolioScopeError, TypeError):
             raise
         except Exception as exc:  # noqa: BLE001 - cancel still proceeds with known ids
             log.warning("list_orders failed for %s leftover brackets: %s", product_id, exc)
@@ -269,31 +406,97 @@ class CoinbaseBroker:
         tp_price: float,
         sl_price: float,
     ) -> str:
-        """Cancel leftover TP/SL and place a reduce-only bracket for remaining qty."""
+        """Cancel leftover TP/SL and place a reduce-only bracket for remaining qty.
+
+        Pre-partial use: take-profit + stop. Sizes/prices are rounded to product
+        increments. After a partial, use :meth:`replace_remaining_stop` instead.
+        """
         self.cancel_leftover_brackets(product_id)
         if qty <= 0:
             return ""
+        base_size = self._rounded_base_size(product_id, qty)
+        if Decimal(base_size) <= 0:
+            log.error(
+                "[live] skipping remaining bracket for %s: rounded base size is 0 (qty=%s)",
+                product_id,
+                qty,
+            )
+            return ""
+        sl = self._rounded_price(product_id, sl_price)
+        tp_source = tp_price
+        if tp_price <= sl_price:
+            tp_source = sl_price * 1.02 if sl_price > 0 else tp_price
+        tp = self._rounded_price(product_id, tp_source)
+        if Decimal(tp) <= Decimal(sl) and Decimal(sl) > 0:
+            tp = self._rounded_price(product_id, Decimal(sl) * Decimal("1.02"))
         self._guard_path("/orders")
-        tp = tp_price
-        if tp <= sl_price:
-            tp = sl_price * 1.02 if sl_price > 0 else tp_price
         client_order_id = f"smt-{uuid.uuid4().hex}"
         resp = self._call_scoped(
             self.client.trigger_bracket_order_gtc_sell,
             client_order_id=client_order_id,
             product_id=product_id,
-            base_size=str(qty),
-            limit_price=str(tp),
-            stop_trigger_price=str(sl_price),
+            base_size=base_size,
+            limit_price=tp,
+            stop_trigger_price=sl,
         )
         order_id = _order_id(resp, fallback=client_order_id)
         self._track(product_id, order_id)
         log.warning(
-            "[live] replace remaining bracket %s qty=%.8f tp=%.6f sl=%.6f oid=%s",
+            "[live] replace remaining bracket %s qty=%s tp=%s sl=%s oid=%s",
             product_id,
-            qty,
+            base_size,
             tp,
-            sl_price,
+            sl,
+            order_id,
+        )
+        return order_id
+
+    def replace_remaining_stop(self, product_id: str, qty: float, stop_price: float) -> str:
+        """Cancel leftovers and place a stop-limit sell (no take-profit).
+
+        Matches paper post-partial policy: only the chandelier trailing stop is
+        armed. The limit sits ``LIVE_STOP_LIMIT_BUFFER_PCT`` below the stop so
+        it cannot fill as a take-profit.
+        """
+        self.cancel_leftover_brackets(product_id)
+        if qty <= 0 or stop_price <= 0:
+            return ""
+        base_size = self._rounded_base_size(product_id, qty)
+        if Decimal(base_size) <= 0:
+            log.error(
+                "[live] skipping remaining stop for %s: rounded base size is 0 (qty=%s)",
+                product_id,
+                qty,
+            )
+            return ""
+        _base_inc, quote_inc = self._product_increments(product_id)
+        stop = _round_down_to_increment(stop_price, quote_inc)
+        limit_raw = Decimal(str(stop_price)) * (
+            Decimal("1") - Decimal(str(LIVE_STOP_LIMIT_BUFFER_PCT))
+        )
+        limit = _round_down_to_increment(limit_raw, quote_inc)
+        if Decimal(limit) >= Decimal(stop):
+            bumped = Decimal(stop) - quote_inc
+            limit = _round_down_to_increment(max(bumped, quote_inc), quote_inc)
+        self._guard_path("/orders")
+        client_order_id = f"smt-{uuid.uuid4().hex}"
+        resp = self._call_scoped(
+            self.client.stop_limit_order_gtc_sell,
+            client_order_id=client_order_id,
+            product_id=product_id,
+            base_size=base_size,
+            limit_price=limit,
+            stop_price=stop,
+            stop_direction="STOP_DIRECTION_STOP_DOWN",
+        )
+        order_id = _order_id(resp, fallback=client_order_id)
+        self._track(product_id, order_id)
+        log.warning(
+            "[live] replace remaining stop %s qty=%s stop=%s limit=%s oid=%s",
+            product_id,
+            base_size,
+            stop,
+            limit,
             order_id,
         )
         return order_id
@@ -303,25 +506,24 @@ class CoinbaseBroker:
     def open_long(
         self, product_id: str, notional_usd: float, tp_price: float, sl_price: float
     ) -> Fill:
-        """Market buy with an attached take-profit/stop-loss bracket."""
+        """Market buy, then a reduce-only sell bracket for TP/SL protection."""
         self._guard_path("/orders")
         client_order_id = f"smt-{uuid.uuid4().hex}"
-        # Attached bracket: server-side TP/SL that reduce/close the position.
         resp = self._call_scoped(
-            self.client.trigger_bracket_order_gtc_buy,
+            self.client.market_order_buy,
             client_order_id=client_order_id,
             product_id=product_id,
             quote_size=str(round(notional_usd, 2)),
-            limit_price=str(tp_price),
-            stop_trigger_price=str(sl_price),
         )
         order_id = _order_id(resp, fallback=client_order_id)
+        self._track(product_id, order_id)
         price = self.current_price(product_id)
-        qty = notional_usd / price if price else 0.0
-        fill = self.reconcile_fill(order_id, fallback_price=price, fallback_qty=qty)
-        self._track(product_id, fill.order_id)
+        fallback_qty = notional_usd / price if price else 0.0
+        fill = self._reconcile_fill_with_retry(
+            order_id, fallback_price=price, fallback_qty=fallback_qty
+        )
         log.warning(
-            "[live] bracket BUY %s $%.2f oid=%s fill=%.6f qty=%.8f fee=%.4f",
+            "[live] market BUY %s $%.2f oid=%s fill=%.6f qty=%.8f fee=%.4f",
             product_id,
             notional_usd,
             fill.order_id,
@@ -329,7 +531,61 @@ class CoinbaseBroker:
             fill.qty,
             fill.fee,
         )
+        self._place_entry_protection(product_id, fill.qty, tp_price, sl_price)
         return fill
+
+    def _place_entry_protection(
+        self, product_id: str, qty: float, tp_price: float, sl_price: float
+    ) -> None:
+        """Attach a GTC sell bracket. Never raises after a filled buy.
+
+        The market buy has already filled. Re-raising here would skip
+        TradeManager.open_position persistence and leave an untracked live
+        position. Log CRITICAL on failure and return so the entry Fill is
+        recorded; `_protect_orders` still holds the entry id for leftover
+        cancel. Do not invent a bracket id.
+        """
+        base_size = self._rounded_base_size(product_id, qty)
+        if Decimal(base_size) <= 0:
+            log.error(
+                "[live] skipping protection bracket for %s: rounded base size is 0 (qty=%s)",
+                product_id,
+                qty,
+            )
+            return
+        sl = self._rounded_price(product_id, sl_price)
+        tp_source = tp_price
+        if tp_price <= sl_price:
+            tp_source = sl_price * 1.02 if sl_price > 0 else tp_price
+        tp = self._rounded_price(product_id, tp_source)
+        protect_client_id = f"smt-{uuid.uuid4().hex}"
+        try:
+            resp = self._call_scoped(
+                self.client.trigger_bracket_order_gtc_sell,
+                client_order_id=protect_client_id,
+                product_id=product_id,
+                base_size=base_size,
+                limit_price=tp,
+                stop_trigger_price=sl,
+            )
+        except Exception:
+            log.critical(
+                "[live] protection bracket failed for %s after filled buy; "
+                "entry remains tracked for leftover-cancel",
+                product_id,
+                exc_info=True,
+            )
+            return
+        protect_id = _order_id(resp, fallback=protect_client_id)
+        self._track(product_id, protect_id)
+        log.warning(
+            "[live] protection bracket SELL %s qty=%s tp=%s sl=%s oid=%s",
+            product_id,
+            base_size,
+            tp,
+            sl,
+            protect_id,
+        )
 
     def close_long(
         self,
@@ -351,8 +607,10 @@ class CoinbaseBroker:
             base_size=str(qty),
         )
         order_id = _order_id(resp, fallback=client_order_id)
-        price = reference_price if reference_price and reference_price > 0 else self.current_price(
-            product_id
+        price = (
+            reference_price
+            if reference_price and reference_price > 0
+            else self.current_price(product_id)
         )
         fill = self.reconcile_fill(order_id, fallback_price=price, fallback_qty=qty)
         log.warning(
