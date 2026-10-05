@@ -30,6 +30,7 @@ from .models import (
     TradeStatus,
     utcnow,
 )
+from .security_utils import mask_database_url
 
 log = get_logger("smt.store")
 
@@ -152,7 +153,7 @@ class Store:
     def init_db(self) -> None:
         Base.metadata.create_all(self.engine)
         self._migrate()
-        log.info("Database ready at %s", self.database_url)
+        log.info("Database ready at %s", mask_database_url(self.database_url))
 
     def _migrate(self) -> None:
         """Lightweight, idempotent schema migrations for existing dev DBs.
@@ -1282,6 +1283,34 @@ class Store:
             if prev is None or (nonempty, int(row_id)) > (prev[0], prev[2]):
                 chosen[tid] = (nonempty, name, int(row_id))
         return {tid: item[1] for tid, item in chosen.items()}
+
+    def proposed_entry_prices_for_trade_ids(self, trade_ids: Iterable[int]) -> dict[int, float]:
+        """Map trade_id -> opportunity proposed_entry_price for linked ledger rows.
+
+        A non-null proposed_entry_price wins; remaining ties take the latest row.
+        Trade ids with no usable proposed price are omitted.
+        """
+        ids = {int(value) for value in trade_ids if value is not None and int(value) > 0}
+        if not ids:
+            return {}
+        with self.session() as s:
+            rows = list(
+                s.execute(
+                    select(
+                        OpportunityDecision.trade_id,
+                        OpportunityDecision.proposed_entry_price,
+                        OpportunityDecision.id,
+                    ).where(OpportunityDecision.trade_id.in_(ids))
+                )
+            )
+        chosen: dict[int, tuple[int, float | None, int]] = {}
+        for trade_id, price, row_id in rows:
+            tid = int(trade_id)
+            nonempty = 1 if price is not None else 0
+            prev = chosen.get(tid)
+            if prev is None or (nonempty, int(row_id)) > (prev[0], prev[2]):
+                chosen[tid] = (nonempty, price, int(row_id))
+        return {tid: float(item[1]) for tid, item in chosen.items() if item[1] is not None}
 
     def strategy_stats(self, strategy: str) -> dict:
         """Aggregate performance metrics for one strategy."""

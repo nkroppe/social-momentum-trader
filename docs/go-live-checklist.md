@@ -49,7 +49,10 @@ If any check fails, **do not** restart with live mode.
 
 - [ ] Start with **minimal capital** ($500–1,000) in the isolated portfolio
 - [ ] Watch first 24h manually via `smt status` and Coinbase dashboard
-- [ ] Confirm bracket TP/SL appear on Coinbase after each entry
+- [ ] Confirm a market buy fills, then a reduce-only sell bracket (TP/SL)
+      appears on Coinbase after each entry (fixed in code, not live-verified)
+- [ ] After a partial, confirm the leftover is a stop-limit sell on the
+      trailing stop only (no take-profit re-armed)
 - [ ] Keep kill switch path ready (`control/KILL`)
 
 ## If something goes wrong

@@ -18,6 +18,37 @@ from .provider import CursorJSONProvider
 
 log = get_logger("smt.llm.reflection")
 
+_SENTENCE_ENDS = (". ", "! ", "? ")
+_CLIP_SENTENCE_KEEP_RATIO = 0.60
+_ITEM_CHAR_LIMIT = 400
+_SUMMARY_CHAR_LIMIT = 300
+_PROMPT_ITEM_CHAR_LIMIT = 240
+
+
+def _clip_text(text: str, limit: int) -> str:
+    """Return ``text`` unchanged if it fits, else cut on a sentence or word boundary.
+
+    Prefers the last sentence end (``. ``, ``! ``, ``? ``) inside ``limit`` when
+    that keeps at least 60% of ``limit``. Otherwise cuts at the last space.
+    Always appends ``…`` after a cut. Never splits a word when a space exists
+    inside the window.
+    """
+    value = str(text)
+    if len(value) <= limit:
+        return value
+    window = value[:limit]
+    sentence_at = -1
+    for sep in _SENTENCE_ENDS:
+        idx = window.rfind(sep)
+        if idx > sentence_at:
+            sentence_at = idx
+    if sentence_at >= 0 and (sentence_at + 1) >= limit * _CLIP_SENTENCE_KEEP_RATIO:
+        return value[: sentence_at + 1] + "…"
+    space_at = window.rfind(" ")
+    if space_at > 0:
+        return value[:space_at].rstrip() + "…"
+    return window.rstrip() + "…"
+
 
 @dataclass(frozen=True)
 class WeeklyReflection:
@@ -176,7 +207,7 @@ class WeeklyReflector:
         return reflection
 
     def _run(self, week_ending: str, payload: dict[str, Any]) -> WeeklyReflection:
-        instruction = """
+        instruction = f"""
 You are a quantitative trading-review analyst. Review the supplied completed
 paper trades, setup metadata, exits, and aggregate performance. Identify
 specific ways the deterministic rules may improve risk-adjusted profit.
@@ -187,10 +218,12 @@ Constraints:
 - Recommend only testable paper-trading experiments.
 - Never instruct the system to change configuration automatically.
 - Do not recommend leverage, derivatives, or bypassing risk limits.
+- Each list item must be one complete sentence of at most {_PROMPT_ITEM_CHAR_LIMIT} characters.
+- Summary at most {_SUMMARY_CHAR_LIMIT} characters.
 
 Schema:
-{"summary":string <=300 chars,"strengths":[string],"weaknesses":[string],
-"recommendations":[string],"rule_experiments":[string]}
+{{"summary":string <=300 chars,"strengths":[string],"weaknesses":[string],
+"recommendations":[string],"rule_experiments":[string]}}
 """
         raw = self.provider.complete_json(instruction, payload)
 
@@ -198,11 +231,13 @@ Schema:
             value = raw.get(name, [])
             if not isinstance(value, list):
                 return []
-            return [str(item)[:300] for item in value[:limit]]
+            return [_clip_text(str(item), _ITEM_CHAR_LIMIT) for item in value[:limit]]
 
         return WeeklyReflection(
             week_ending=week_ending,
-            summary=str(raw.get("summary", "No summary returned."))[:300],
+            summary=_clip_text(
+                str(raw.get("summary", "No summary returned.")), _SUMMARY_CHAR_LIMIT
+            ),
             strengths=rows("strengths"),
             weaknesses=rows("weaknesses"),
             recommendations=rows("recommendations"),

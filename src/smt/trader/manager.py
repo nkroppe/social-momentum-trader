@@ -55,6 +55,41 @@ def merge_exit_snapshot_events(
     trade.exit_snapshot = snapshot
 
 
+def entry_slippage_snapshot(
+    *,
+    signal_price: float,
+    quote_price: float,
+    fill_price: float,
+    qty: float,
+) -> dict[str, float | None]:
+    """Forward-only fill vs signal / quote. Positive bps/usd means paid more than reference.
+
+    Never raises. Keys are prefixed ``entry_`` so they do not collide with exit-profile
+    snapshot fields. Does not affect trading decisions.
+    """
+    try:
+        snap: dict[str, float | None] = {
+            "entry_quote_price": float(quote_price),
+            "entry_fill_price": float(fill_price),
+        }
+        if signal_price > 0:
+            snap["entry_signal_price"] = float(signal_price)
+            snap["entry_slippage_bps_vs_signal"] = (
+                (fill_price - signal_price) / signal_price * 10_000.0
+            )
+            snap["entry_slippage_usd_vs_signal"] = (fill_price - signal_price) * qty
+        else:
+            snap["entry_signal_price"] = None
+        if quote_price > 0:
+            snap["entry_slippage_bps_vs_quote"] = (
+                (fill_price - quote_price) / quote_price * 10_000.0
+            )
+            snap["entry_slippage_usd_vs_quote"] = (fill_price - quote_price) * qty
+        return snap
+    except Exception:  # noqa: BLE001 - reporting must never fail an entry
+        return {}
+
+
 def _risk_dollars(trade: Trade) -> float:
     return max(trade.initial_risk_per_unit * (trade.original_qty or trade.qty), 0.0)
 
@@ -72,6 +107,8 @@ class TradeManager:
         trade_alerts: TradeAlertsConfig | None = None,
         strategies: list[StrategyConfig] | None = None,
         config_fingerprint: str | None = None,
+        shadow_gate_fee_hurdle_r_max: float = 0.5,
+        shadow_gates_enabled: bool = True,
     ):
         self.settings = settings
         self.universe = universe
@@ -83,6 +120,8 @@ class TradeManager:
         self.trade_alerts = trade_alerts if trade_alerts is not None else TradeAlertsConfig()
         self.strategies = {strategy.name: strategy for strategy in (strategies or [])}
         self.config_fingerprint = config_fingerprint or stable_config_fingerprint()
+        self.shadow_gate_fee_hurdle_r_max = shadow_gate_fee_hurdle_r_max
+        self.shadow_gates_enabled = shadow_gates_enabled
 
     # ---- Notifications -------------------------------------------------------
 
@@ -180,6 +219,39 @@ class TradeManager:
         )
         return levels.take_profit, levels.stop_loss, levels.note
 
+    def _record_shadow_entry_gates(
+        self,
+        exit_snapshot: dict,
+        *,
+        ticker: str,
+        strategy_name: str,
+        hurdle: float | None,
+    ) -> None:
+        """Write would-block flags. Never raises into the entry path."""
+        if not self.shadow_gates_enabled:
+            return
+        try:
+            threshold = float(self.shadow_gate_fee_hurdle_r_max)
+            block_hurdle = None if hurdle is None else bool(hurdle > threshold)
+            holders = sorted(
+                {
+                    trade.strategy
+                    for trade in self.store.open_trades()
+                    if trade.ticker == ticker and trade.strategy != strategy_name
+                }
+            )
+            exit_snapshot.update(
+                {
+                    "shadow_gate_fee_hurdle_r_max": threshold,
+                    "shadow_block_fee_hurdle": block_hurdle,
+                    "shadow_block_cross_sleeve": bool(holders),
+                    "shadow_cross_sleeve_holders": holders,
+                    "shadow_gates_version": 1,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 - flags are observational only
+            log.warning("shadow entry gates failed: %s", exc)
+
     def open_position(
         self,
         candidate: TradeCandidate,
@@ -193,6 +265,14 @@ class TradeManager:
         tp, sl, exit_note = self.exit_levels(entry_price, candidate, strategy)
 
         fill = self.broker.open_long(candidate.product_id, notional_usd, tp, sl)
+        exit_snapshot.update(
+            entry_slippage_snapshot(
+                signal_price=float(candidate.entry_price or 0.0),
+                quote_price=entry_price,
+                fill_price=fill.price,
+                qty=fill.qty,
+            )
+        )
         paper_bar_cursor = 0
         cursor_reader = getattr(self.broker, "last_closed_bar_ts", None)
         if (
@@ -220,6 +300,19 @@ class TradeManager:
                 actual_risk > risk_budget_usd * 1.02
                 or fill_slippage > strategy.entry.max_entry_slippage_pct
             )
+        )
+
+        hurdle = fee_hurdle_r(
+            fill.price,
+            fill.qty,
+            initial_risk,
+            strategy.assumed_fee_pct_per_side,
+        )
+        self._record_shadow_entry_gates(
+            exit_snapshot,
+            ticker=candidate.ticker,
+            strategy_name=strategy.name,
+            hurdle=hurdle,
         )
 
         if entry_risk_breach and self.broker.name == "paper":
@@ -266,12 +359,6 @@ class TradeManager:
                 self._notify(*trade_closed_alert(trade))
             return trade
 
-        hurdle = fee_hurdle_r(
-            fill.price,
-            fill.qty,
-            initial_risk,
-            strategy.assumed_fee_pct_per_side,
-        )
         if hurdle is not None:
             exit_snapshot["fee_hurdle_r"] = round(hurdle, 6)
             exit_snapshot["fee_hurdle_pct_per_side"] = strategy.assumed_fee_pct_per_side
@@ -424,11 +511,33 @@ class TradeManager:
         return atr_abs
 
     def _sync_protecting_bracket(self, trade: Trade) -> None:
-        """Cancel/replace remaining live TP/SL after a partial or Chandelier ratchet."""
-        replacer = getattr(self.broker, "replace_remaining_bracket", None)
-        if not callable(replacer) or trade.qty <= 0:
+        """Cancel/replace remaining live protection after a partial or Chandelier ratchet.
+
+        Paper post-partial policy (exit_policy.quote_step) only exits on the
+        chandelier trailing stop — take-profit is never re-checked. Live must
+        match: after partial_taken, replace with a stop-only order. Pre-partial
+        still uses the TP/SL bracket. PaperBroker has neither method; getattr
+        checks keep it unaffected. Live advanced support is still detected via
+        replace_remaining_bracket.
+        """
+        if trade.qty <= 0:
             return
         sl = trade.trailing_stop or trade.stop_loss
+        if trade.partial_taken:
+            stopper = getattr(self.broker, "replace_remaining_stop", None)
+            if not callable(stopper):
+                return
+            try:
+                new_id = stopper(trade.product_id, trade.qty, sl)
+            except Exception as exc:  # noqa: BLE001 - position remains; retry next loop
+                log.warning("replace remaining stop failed for %s: %s", trade.product_id, exc)
+                return
+            if new_id:
+                trade.broker_entry_order_id = str(new_id)
+            return
+        replacer = getattr(self.broker, "replace_remaining_bracket", None)
+        if not callable(replacer):
+            return
         tp = trade.take_profit
         if tp <= sl:
             tp = sl * 1.02 if sl > 0 else tp

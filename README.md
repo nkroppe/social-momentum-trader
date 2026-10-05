@@ -35,7 +35,7 @@ Coinbase candles + L1 book
    -> multi-timeframe price setup (per strategy)
    -> HARD RISK GATE (strategy + global heat/exposure)
    -> executable PAPER fill (ask/bid, spread, depth)
-   -> 25% partial + Chandelier runner (PAPER-only advanced exits)
+   -> 25% partial + Chandelier runner (paper today; live order flow is in code, not live-verified)
 ```
 
 - **Direction:** long-only spot (USD pairs on an allowlist).
@@ -125,7 +125,8 @@ short-lived RISK-OFF relief rallies on BTC/ETH/SOL (RSI reclaim, failed
 breakdown, relative-strength bounce) with **50%** off at **1.0R**, 6h / 2h
 stops. After the partial, the remainder uses a Chandelier ATR stop that only
 ratchets upward and cannot fall below a cost-adjusted breakeven floor. Advanced
-partial/Chandelier management is **PAPER-only**.
+partial/Chandelier management runs in paper today. The matching live order
+flow is implemented in code and is **not live-verified** (`LIVE` stays off).
 
 Position size starts from a 0.5% equity risk budget divided by the candidate's
 structure-stop percentage. The result is capped by the hard max-position
@@ -270,9 +271,18 @@ trade-only assertion:
    unscoped** Coinbase access when this key is empty or whitespace. `smt doctor
    --live` fails `coinbase_credentials` until it is present.
 
-Advanced partial/Chandelier management is currently **PAPER-only**. `smt doctor
---live` and Runner startup explicitly block LIVE while it is enabled because
-safe Coinbase server-side bracket adjustment parity is not implemented.
+Live order flow is implemented in code (not live-verified; `LIVE` stays off
+until soak and latches pass):
+
+1. Entry is a `market_order_buy` sized in quote (`quote_size`), then a
+   reduce-only `trigger_bracket_order_gtc_sell` using the reconciled fill
+   quantity (rounded down to `base_increment`) and TP/SL rounded to
+   `quote_increment`.
+2. After a partial, protection is a stop-only `stop_limit_order_gtc_sell`
+   on the chandelier trail — the already-hit take-profit is not re-armed.
+   Pre-partial still uses the TP/SL bracket.
+3. Paper behavior is unchanged. This path is not exercised unless `LIVE`
+   and `LIVE_ACK` are both set after a completed soak.
 
 See `docs/compromise-runbook.md` and the fund-protection layers below.
 
@@ -285,6 +295,10 @@ See `docs/compromise-runbook.md` and the fund-protection layers below.
 5. **Code deny-list** - executor blocks any transfer/withdraw/convert path.
 6. **Monitoring + kill** - transfer/anomaly alerts; `touch control/KILL`.
 7. **VPS hygiene** - non-root, SSH keys only, secrets not in git, rotation.
+   Database passwords are masked in doctor output and app logs
+   (`postgresql+psycopg://user:***@host/...`). `logs/smt.log` uses a 50 MB
+   rotating file (5 backups); Compose JSON logs cap at 20 MB × 5 files. See
+   [docs/deploy-vps.md](docs/deploy-vps.md).
 
 ## Deploy on the VPS
 
@@ -323,6 +337,7 @@ smt dashboard           # read-only web UI on http://127.0.0.1:8080
 smt backtest ...        # deterministic local price-only replay; never calls network
 smt fetch-candles       # public Coinbase OHLCV CSVs for closed trades (no orders)
 smt partial-replay      # report-only post-partial exit counterfactuals from those CSVs
+smt replays             # retrospective gen-8 fee/gate/setup tables (read-only); see docs/replays.md
 smt soak-reset          # intentional restart; policy changes reset automatically
 ```
 
@@ -431,7 +446,7 @@ src/smt/
   demo.py   deterministic seeding for simulate/tests
   run.py    orchestrator     cli.py  CLI
 config/     risk, strategies, universe, sources, security, ops, market, signals
-docs/       venue.md, deploy-vps.md, go-live-checklist.md, compromise-runbook.md
+docs/       venue.md, deploy-vps.md, go-live-checklist.md, compromise-runbook.md, replays.md
 ```
 
 ## Roadmap

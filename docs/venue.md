@@ -5,7 +5,11 @@ This bot trades **only** on **Coinbase Advanced Trade** (US spot, USD pairs).
 ## Why Coinbase Advanced
 
 - **Long-only spot** on liquid majors (BTC, ETH, SOL, …) via `config/universe.yaml`
-- **Attached TP/SL** on entry (`trigger_bracket_gtc`) — server-side exits in live mode
+- **Live order flow** (fixed in code, not live-verified): market buy
+  (`market_order_buy` with `quote_size`), then a reduce-only sell bracket
+  (`trigger_bracket_order_gtc_sell` with filled `base_size`, TP/SL). After a
+  partial, protection is a stop-only `stop_limit_order_gtc_sell` on the
+  chandelier trail — matching paper, which never re-checks take-profit.
 - **Trade-only API keys** — View + Trade, Transfer disabled; startup asserts `can_transfer=false`
 - **Isolated portfolio** — bot capital in a dedicated Coinbase portfolio, separate from savings
 - **Deterministic REST API** — Python service on a VPS, not wallet signing or agent CLI
