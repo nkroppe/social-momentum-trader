@@ -756,14 +756,12 @@ def test_weekly_and_compare_wire_notional_ticker_and_mfe_capture(tmp_path):
     assert "By ticker:" in weekly
     assert "SOL" in weekly and "BTC" in weekly
     assert "fee/gross" in weekly
-    assert "MFE capture (realized_R / MFE_R, exclude MFE_R<=0):" in weekly
-    assert "n=2" in weekly
+    assert "MFE capture (realized_R / MFE_R, only MFE_R >= 0.25R; n=2 used, 0 excluded):" in weekly
 
     compare = build_compare_report(store, ["intraday", "swing"])
     assert "By notional:" in compare
     assert "By ticker:" in compare
-    assert "MFE capture (realized_R / MFE_R, exclude MFE_R<=0):" in compare
-    assert "n=2" in compare
+    assert "MFE capture (realized_R / MFE_R, only MFE_R >= 0.25R; n=2 used, 0 excluded):" in compare
 
 
 def test_stop_loss_fill_uses_hard_stop_not_trailing_and_existing_risk():
@@ -1084,18 +1082,19 @@ def test_trade_fee_hurdle_helpers_and_rows():
     assert is_fee_hurdle_non_starter(missing) is None
 
     summary = fee_hurdle_rows([non_starter, starter, equal, missing, swing])
-    assert summary.with_hurdle == 3
+    assert summary.with_hurdle == 4
     assert summary.without_hurdle == 1
-    assert summary.non_starters == 1
-    assert [row.ticker for row in summary.rows] == ["SOL", "ETH", "XRP"]
-    assert [row.non_starter for row in summary.rows] == [True, False, False]
+    assert summary.non_starters == 2
+    assert [row.ticker for row in summary.rows] == ["SOL", "ETH", "XRP", "BTC"]
+    assert [row.strategy for row in summary.rows] == ["intraday", "intraday", "intraday", "swing"]
+    assert [row.non_starter for row in summary.rows] == [True, False, False, True]
     assert (
         format_fee_hurdle_row(summary.rows[0])
-        == "  SOL   2026-09-21 13:05Z  hurdle 0.60R  MFE 0.50R  net $-4.25 NON-STARTER"
+        == "  SOL   intraday   2026-09-21 13:05Z  hurdle 0.60R  MFE 0.50R  net $-4.25 NON-STARTER"
     )
     assert (
         format_fee_hurdle_row(summary.rows[1])
-        == "  ETH   2026-09-21 14:10Z  hurdle 0.60R  MFE 2.00R  net $+8.00"
+        == "  ETH   intraday   2026-09-21 14:10Z  hurdle 0.60R  MFE 2.00R  net $+8.00"
     )
 
 
@@ -1151,25 +1150,30 @@ def test_weekly_report_fee_hurdle_section(tmp_path):
     )
 
     _, body = build_weekly_report(store, ["intraday", "swing"], start, end, UTC)
-    assert "Intraday fee hurdle vs final MFE (this week):" in body
+    assert "Fee hurdle vs final MFE (this week):" in body
     assert "  no hurdle data: 1" in body
-    assert "  non-starters: 1 of 2 with hurdle data (MFE_R < fee hurdle R)" in body
+    assert "  non-starters: 2 of 3 with hurdle data (MFE_R < fee hurdle R)" in body
     assert (
-        "  SOL   2026-08-15 13:05Z  hurdle 0.60R  MFE 0.50R  net $-4.25 NON-STARTER"
+        "  SOL   intraday   2026-08-15 13:05Z  hurdle 0.60R  MFE 0.50R  net $-4.25 NON-STARTER"
     ) in body
-    assert "  ETH   2026-08-15 14:10Z  hurdle 0.60R  MFE 2.00R  net $+8.00" in body
-    assert "DOGE" not in body.split("Intraday fee hurdle vs final MFE (this week):", 1)[1].split(
-        "since gen-8", 1
-    )[0]
-    assert "BTC" not in body.split("Intraday fee hurdle vs final MFE (this week):", 1)[1].split(
-        "since gen-8", 1
-    )[0]
+    assert "  ETH   intraday   2026-08-15 14:10Z  hurdle 0.60R  MFE 2.00R  net $+8.00" in body
+    hurdle_week = body.split("Fee hurdle vs final MFE (this week):", 1)[1].split("since gen-8", 1)[
+        0
+    ]
+    assert "DOGE" not in hurdle_week
+    assert "BTC" in hurdle_week
+    assert "  this week by strategy:" in body
+    assert "    intraday: 1 non-starters of 2 with hurdle data; 1 without" in body
+    assert "    swing: 1 non-starters of 1 with hurdle data; 0 without" in body
     assert (
         f"  since gen-8 (fp {GEN8_CONFIG_FINGERPRINT_PREFIX}): "
-        "2 non-starters of 3 with hurdle data; 1 without"
+        "3 non-starters of 4 with hurdle data; 1 without"
     ) in body
+    assert "  since gen-8 by strategy:" in body
+    assert "    intraday: 2 non-starters of 3 with hurdle data; 1 without" in body
+    assert "    swing: 1 non-starters of 1 with hurdle data; 0 without" in body
     compare = build_compare_report(store, ["intraday", "swing"])
-    assert "Intraday fee hurdle vs final MFE (this week):" not in compare
+    assert "Fee hurdle vs final MFE (this week):" not in compare
 
 
 def test_weekly_report_omits_fee_hurdle_section_without_intraday(tmp_path):
@@ -1187,7 +1191,11 @@ def test_weekly_report_omits_fee_hurdle_section_without_intraday(tmp_path):
         config_fingerprint=_HURDLE_GEN8_FP,
     )
     _, body = build_weekly_report(store, ["intraday", "swing"], start, end, UTC)
-    assert "Intraday fee hurdle vs final MFE (this week):" not in body
+    assert "Fee hurdle vs final MFE (this week):" in body
+    assert "    swing: 1 non-starters of 1 with hurdle data; 0 without" in body
+    assert (
+        "    intraday:" not in body.split("this week by strategy:", 1)[1].split("since gen-8", 1)[0]
+    )
 
 
 def test_weekly_report_fee_hurdle_section_when_only_gen8_cumulative(tmp_path):
@@ -1204,7 +1212,7 @@ def test_weekly_report_fee_hurdle_section_when_only_gen8_cumulative(tmp_path):
         config_fingerprint=_HURDLE_GEN8_FP,
     )
     _, body = build_weekly_report(store, ["intraday"], start, end, UTC)
-    assert "Intraday fee hurdle vs final MFE (this week):" in body
+    assert "Fee hurdle vs final MFE (this week):" in body
     assert "  no hurdle data: 0" in body
     assert "  non-starters: 0 of 0 with hurdle data (MFE_R < fee hurdle R)" in body
     assert (
@@ -1587,9 +1595,7 @@ def _row_has_small_n(block: str, label: str) -> bool:
 
 def test_trades_matching_config_fingerprint_uses_prefix_only():
     gen8 = _bare_closed_trade(ticker="SOL", config_fingerprint=GEN8_FP)
-    gen8_short = _bare_closed_trade(
-        ticker="ETH", config_fingerprint=GEN8_CONFIG_FINGERPRINT_PREFIX
-    )
+    gen8_short = _bare_closed_trade(ticker="ETH", config_fingerprint=GEN8_CONFIG_FINGERPRINT_PREFIX)
     gen7 = _bare_closed_trade(ticker="BTC", config_fingerprint=GEN7_FP)
     empty = _bare_closed_trade(ticker="HYPE", config_fingerprint="")
     missing = _bare_closed_trade(ticker="ZEC", config_fingerprint="")

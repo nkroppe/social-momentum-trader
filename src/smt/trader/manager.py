@@ -55,6 +55,41 @@ def merge_exit_snapshot_events(
     trade.exit_snapshot = snapshot
 
 
+def entry_slippage_snapshot(
+    *,
+    signal_price: float,
+    quote_price: float,
+    fill_price: float,
+    qty: float,
+) -> dict[str, float | None]:
+    """Forward-only fill vs signal / quote. Positive bps/usd means paid more than reference.
+
+    Never raises. Keys are prefixed ``entry_`` so they do not collide with exit-profile
+    snapshot fields. Does not affect trading decisions.
+    """
+    try:
+        snap: dict[str, float | None] = {
+            "entry_quote_price": float(quote_price),
+            "entry_fill_price": float(fill_price),
+        }
+        if signal_price > 0:
+            snap["entry_signal_price"] = float(signal_price)
+            snap["entry_slippage_bps_vs_signal"] = (
+                (fill_price - signal_price) / signal_price * 10_000.0
+            )
+            snap["entry_slippage_usd_vs_signal"] = (fill_price - signal_price) * qty
+        else:
+            snap["entry_signal_price"] = None
+        if quote_price > 0:
+            snap["entry_slippage_bps_vs_quote"] = (
+                (fill_price - quote_price) / quote_price * 10_000.0
+            )
+            snap["entry_slippage_usd_vs_quote"] = (fill_price - quote_price) * qty
+        return snap
+    except Exception:  # noqa: BLE001 - reporting must never fail an entry
+        return {}
+
+
 def _risk_dollars(trade: Trade) -> float:
     return max(trade.initial_risk_per_unit * (trade.original_qty or trade.qty), 0.0)
 
@@ -230,6 +265,14 @@ class TradeManager:
         tp, sl, exit_note = self.exit_levels(entry_price, candidate, strategy)
 
         fill = self.broker.open_long(candidate.product_id, notional_usd, tp, sl)
+        exit_snapshot.update(
+            entry_slippage_snapshot(
+                signal_price=float(candidate.entry_price or 0.0),
+                quote_price=entry_price,
+                fill_price=fill.price,
+                qty=fill.qty,
+            )
+        )
         paper_bar_cursor = 0
         cursor_reader = getattr(self.broker, "last_closed_bar_ts", None)
         if (

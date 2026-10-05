@@ -8,6 +8,8 @@ than one without bold text.
 from __future__ import annotations
 
 import json
+import statistics
+from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, tzinfo
@@ -20,6 +22,10 @@ UNKNOWN_SETUP = "unknown"
 SETUP_BUCKETS = ("breakout_retest", "breakout_close", "vwap", "unknown")
 NOTIONAL_BUCKETS = ("<$300", "$300-500", "$500-700", ">=$700")
 MFE_R_EPSILON = 1e-12
+# Tiny favorable excursions make realized_R / MFE_R explode; the capture mean
+# keeps only trades whose MFE_R meets this floor. trade_mfe_capture still uses
+# MFE_R_EPSILON so other callers can see the raw ratio.
+MFE_CAPTURE_MIN_MFE_R = 0.25
 GEN8_CONFIG_FINGERPRINT_PREFIX = "c95a0ad410f4"
 COHORT_STRATEGY_NAMES = ("intraday", "swing", "bear_rally")
 SMALL_N_THRESHOLD = 5
@@ -37,6 +43,15 @@ SHADOW_GATE_SNAPSHOT_KEYS = (
     "shadow_cross_sleeve_holders",
     "shadow_gates_version",
 )
+# Hours [start, end) UTC, tagged by trade.opened_at.
+SESSION_BOUNDARIES_UTC = (("Asia", 0, 8), ("Europe", 8, 13), ("US", 13, 21), ("Late-US", 21, 24))
+ENTRY_SIGNAL_PRICE_KEY = "entry_signal_price"
+ENTRY_QUOTE_PRICE_KEY = "entry_quote_price"
+ENTRY_FILL_PRICE_KEY = "entry_fill_price"
+ENTRY_SLIPPAGE_BPS_VS_SIGNAL_KEY = "entry_slippage_bps_vs_signal"
+ENTRY_SLIPPAGE_USD_VS_SIGNAL_KEY = "entry_slippage_usd_vs_signal"
+ENTRY_SLIPPAGE_BPS_VS_QUOTE_KEY = "entry_slippage_bps_vs_quote"
+ENTRY_SLIPPAGE_USD_VS_QUOTE_KEY = "entry_slippage_usd_vs_quote"
 
 
 def _aware(dt: datetime) -> datetime:
@@ -83,9 +98,7 @@ def trade_fee_legs_notional(trade: Trade) -> float:
     original_qty = float(getattr(trade, "original_qty", 0.0) or 0.0)
     entry_qty = original_qty if original_qty else qty
     entry_price = float(trade.entry_price or 0.0)
-    entry_leg = (
-        entry_price * entry_qty if entry_price else float(trade.entry_notional or 0.0)
-    )
+    entry_leg = entry_price * entry_qty if entry_price else float(trade.entry_notional or 0.0)
     partial_leg = 0.0
     if getattr(trade, "partial_taken", False) and original_qty > qty:
         partial_leg = float(trade.take_profit or 0.0) * (original_qty - qty)
@@ -147,10 +160,16 @@ class CostStats:
 
 @dataclass(frozen=True)
 class MfeCaptureStats:
-    """Mean realized_R / MFE_R over trades with MFE_R > epsilon. Not capped at 1.0."""
+    """Mean/median realized_R / MFE_R over trades with MFE_R >= min floor.
+
+    ``n`` is the used count. ``n_excluded`` is trades with MFE_R above
+    ``MFE_R_EPSILON`` but below the capture floor. Not capped at 1.0.
+    """
 
     n: int = 0
+    n_excluded: int = 0
     mean: float = 0.0
+    median: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -197,9 +216,10 @@ class IntradayNotionalFee:
 
 @dataclass(frozen=True)
 class FeeHurdleRow:
-    """One closed intraday trade with a persisted fee_hurdle_r snapshot key."""
+    """One closed trade with a persisted fee_hurdle_r snapshot key."""
 
     ticker: str
+    strategy: str
     opened_at: datetime
     hurdle_r: float
     mfe_r: float
@@ -208,13 +228,68 @@ class FeeHurdleRow:
 
 
 @dataclass(frozen=True)
+class FeeHurdleStrategyStats:
+    """Fee-hurdle skip / non-starter counts for one strategy."""
+
+    strategy: str
+    with_hurdle: int = 0
+    without_hurdle: int = 0
+    non_starters: int = 0
+
+
+@dataclass(frozen=True)
 class FeeHurdleSummary:
-    """Intraday fee-hurdle rows plus skip / non-starter counts."""
+    """Fee-hurdle rows plus skip / non-starter counts, overall and per strategy."""
 
     rows: tuple[FeeHurdleRow, ...] = ()
     with_hurdle: int = 0
     without_hurdle: int = 0
     non_starters: int = 0
+    by_strategy: tuple[FeeHurdleStrategyStats, ...] = ()
+
+
+@dataclass(frozen=True)
+class OverlapMember:
+    """One trade in a same-ticker cross-sleeve overlap group."""
+
+    trade_id: int | None
+    strategy: str
+    ticker: str
+    opened_at: datetime
+    closed_at: datetime | None
+    net_pnl: float | None
+
+
+@dataclass(frozen=True)
+class CrossSleeveOverlapGroup:
+    """Overlapping open intervals on one ticker from two or more strategies."""
+
+    ticker: str
+    members: tuple[OverlapMember, ...]
+    overlap_start: datetime
+    overlap_end: datetime
+    combined_net_pnl: float
+    open_count: int
+
+
+@dataclass(frozen=True)
+class CrossSleeveOverlapSummary:
+    groups: tuple[CrossSleeveOverlapGroup, ...] = ()
+    combined_net_pnl: float = 0.0
+
+
+@dataclass(frozen=True)
+class EntrySlippageStats:
+    """Fill vs signal / quote for closed trades that carry forward-only keys."""
+
+    n: int = 0
+    n_signal: int = 0
+    n_quote: int = 0
+    mean_bps_vs_signal: float = 0.0
+    median_bps_vs_signal: float = 0.0
+    mean_bps_vs_quote: float = 0.0
+    median_bps_vs_quote: float = 0.0
+    total_usd_vs_signal: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -341,9 +416,7 @@ def trades_matching_config_fingerprint(
 ) -> list[Trade]:
     """Closed-trade filter: config_fingerprint starts with prefix."""
     return [
-        trade
-        for trade in trades
-        if (trade.config_fingerprint or "").startswith(fingerprint_prefix)
+        trade for trade in trades if (trade.config_fingerprint or "").startswith(fingerprint_prefix)
     ]
 
 
@@ -621,33 +694,53 @@ def is_fee_hurdle_non_starter(trade: Trade) -> bool | None:
     return _mfe_r(trade) < hurdle
 
 
+def _fee_hurdle_strategy_order(names: Iterable[str]) -> list[str]:
+    present = set(names)
+    ordered = [name for name in COHORT_STRATEGY_NAMES if name in present]
+    ordered.extend(sorted(present - set(ordered)))
+    return ordered
+
+
 def fee_hurdle_rows(trades: Sequence[Trade]) -> FeeHurdleSummary:
-    """Closed-only intraday fee-hurdle rows. Callers pass already-closed trades."""
+    """Closed-only fee-hurdle rows for every strategy. Callers pass already-closed trades."""
     rows: list[FeeHurdleRow] = []
     without = 0
+    without_by: dict[str, int] = defaultdict(int)
+    rows_by: dict[str, list[FeeHurdleRow]] = defaultdict(list)
     for trade in trades:
-        if trade.strategy != "intraday":
-            continue
+        name = str(trade.strategy or "")
         hurdle = trade_fee_hurdle_r(trade)
         if hurdle is None:
             without += 1
+            without_by[name] += 1
             continue
         mfe = _mfe_r(trade)
-        rows.append(
-            FeeHurdleRow(
-                ticker=trade.ticker,
-                opened_at=trade.opened_at,
-                hurdle_r=hurdle,
-                mfe_r=mfe,
-                net_pnl=float(trade.realized_pnl),
-                non_starter=mfe < hurdle,
-            )
+        row = FeeHurdleRow(
+            ticker=trade.ticker,
+            strategy=name,
+            opened_at=trade.opened_at,
+            hurdle_r=hurdle,
+            mfe_r=mfe,
+            net_pnl=float(trade.realized_pnl),
+            non_starter=mfe < hurdle,
         )
+        rows.append(row)
+        rows_by[name].append(row)
+    by_strategy = tuple(
+        FeeHurdleStrategyStats(
+            strategy=name,
+            with_hurdle=len(rows_by.get(name, ())),
+            without_hurdle=without_by.get(name, 0),
+            non_starters=sum(1 for row in rows_by.get(name, ()) if row.non_starter),
+        )
+        for name in _fee_hurdle_strategy_order(set(rows_by) | set(without_by))
+    )
     return FeeHurdleSummary(
         rows=tuple(rows),
         with_hurdle=len(rows),
         without_hurdle=without,
         non_starters=sum(1 for row in rows if row.non_starter),
+        by_strategy=by_strategy,
     )
 
 
@@ -655,8 +748,15 @@ def format_fee_hurdle_row(row: FeeHurdleRow) -> str:
     opened = _aware(row.opened_at).astimezone(UTC).strftime("%Y-%m-%d %H:%MZ")
     tag = " NON-STARTER" if row.non_starter else ""
     return (
-        f"  {row.ticker:<5} {opened}  hurdle {row.hurdle_r:.2f}R  "
+        f"  {row.ticker:<5} {row.strategy:<10} {opened}  hurdle {row.hurdle_r:.2f}R  "
         f"MFE {row.mfe_r:.2f}R  net ${row.net_pnl:+,.2f}{tag}"
+    )
+
+
+def _format_fee_hurdle_strategy_line(stats: FeeHurdleStrategyStats, *, indent: str = "    ") -> str:
+    return (
+        f"{indent}{stats.strategy}: {stats.non_starters} non-starters of "
+        f"{stats.with_hurdle} with hurdle data; {stats.without_hurdle} without"
     )
 
 
@@ -672,16 +772,22 @@ def _fee_hurdle_section(
         return []
     lines = [
         "",
-        "Intraday fee hurdle vs final MFE (this week):",
+        "Fee hurdle vs final MFE (this week):",
         f"  no hurdle data: {week.without_hurdle}",
         f"  non-starters: {week.non_starters} of {week.with_hurdle} with hurdle data "
         "(MFE_R < fee hurdle R)",
     ]
     lines.extend(format_fee_hurdle_row(row) for row in week.rows)
+    if week.by_strategy:
+        lines.append("  this week by strategy:")
+        lines.extend(_format_fee_hurdle_strategy_line(stats) for stats in week.by_strategy)
     lines.append(
         f"  since gen-8 (fp {fingerprint_prefix}): {gen8.non_starters} non-starters of "
         f"{gen8.with_hurdle} with hurdle data; {gen8.without_hurdle} without"
     )
+    if gen8.by_strategy:
+        lines.append("  since gen-8 by strategy:")
+        lines.extend(_format_fee_hurdle_strategy_line(stats) for stats in gen8.by_strategy)
     return lines
 
 
@@ -845,7 +951,12 @@ def _intraday_notional_fee_section(trades: Sequence[Trade]) -> list[str]:
 
 
 def trade_mfe_capture(trade: Trade, *, epsilon: float = MFE_R_EPSILON) -> float | None:
-    """realized_R / MFE_R. None when MFE_R <= epsilon. Not capped at 1.0."""
+    """realized_R / MFE_R. None when MFE_R <= epsilon. Not capped at 1.0.
+
+    The weekly capture mean uses ``MFE_CAPTURE_MIN_MFE_R`` via
+    ``aggregate_mfe_capture``; this helper keeps the epsilon floor for other
+    callers.
+    """
     peak = _mfe_r(trade)
     if peak <= epsilon:
         return None
@@ -856,19 +967,43 @@ def aggregate_mfe_capture(
     trades: Sequence[Trade],
     *,
     epsilon: float = MFE_R_EPSILON,
+    min_mfe_r: float = MFE_CAPTURE_MIN_MFE_R,
 ) -> MfeCaptureStats:
-    captures = [
-        capture
-        for trade in trades
-        if (capture := trade_mfe_capture(trade, epsilon=epsilon)) is not None
-    ]
-    n = len(captures)
-    return MfeCaptureStats(n=n, mean=(sum(captures) / n) if n else 0.0)
+    """Mean/median capture for trades with MFE_R >= ``min_mfe_r``.
+
+    Trades with ``epsilon < MFE_R < min_mfe_r`` count as excluded. Trades with
+    MFE_R <= epsilon are omitted from both counts (same as ``trade_mfe_capture``).
+    """
+    used: list[float] = []
+    excluded = 0
+    for trade in trades:
+        peak = _mfe_r(trade)
+        if peak <= epsilon:
+            continue
+        capture = trade_realized_r(trade) / peak
+        if peak < min_mfe_r:
+            excluded += 1
+            continue
+        used.append(capture)
+    n = len(used)
+    return MfeCaptureStats(
+        n=n,
+        n_excluded=excluded,
+        mean=(sum(used) / n) if n else 0.0,
+        median=statistics.median(used) if n else 0.0,
+    )
 
 
 def _wl(wins: int, losses: int, breakeven: int) -> str:
     extra = f" / {breakeven}BE" if breakeven else ""
     return f"{wins}W / {losses}L{extra}"
+
+
+def _format_fee_to_gross(stats: CostStats) -> str:
+    """Display fee/gross as n/a when gross P/L is not positive. Raw ratio stays on CostStats."""
+    if stats.gross_pnl <= 0:
+        return "n/a"
+    return f"{stats.fee_to_gross:>6.2%}"
 
 
 def _cost_row(
@@ -882,7 +1017,8 @@ def _cost_row(
         f"{stats.net_win_rate:>4.0%} net  {stats.gross_win_rate:>4.0%} gross  "
         f"gross ${stats.gross_pnl:>9,.2f}  fees ${stats.fees:>8,.2f}  "
         f"net ${stats.net_pnl:>9,.2f}  fee% {stats.fee_pct_of_notional:>6.2%}  "
-        f"fee/gross {stats.fee_to_gross:>6.2%}"
+        f"fee/gross {_format_fee_to_gross(stats)}  "
+        f"fees {stats.fee_pct_of_notional:.2%} ntl"
     )
     if small_n_threshold is not None and stats.n < small_n_threshold:
         line += " [small-n]"
@@ -916,8 +1052,7 @@ def _cost_section(
     width = max(len("TOTAL"), max(len(label) for label, _ in rows), 9)
     lines = ["", title]
     lines.extend(
-        _cost_row(label, stats, width, small_n_threshold=small_n_threshold)
-        for label, stats in rows
+        _cost_row(label, stats, width, small_n_threshold=small_n_threshold) for label, stats in rows
     )
     if len(rows) > 1:
         lines.append(
@@ -933,10 +1068,12 @@ def _cost_section(
 
 def _mfe_capture_section(trades: Sequence[Trade]) -> list[str]:
     stats = aggregate_mfe_capture(trades)
+    floor = MFE_CAPTURE_MIN_MFE_R
     return [
         "",
-        "MFE capture (realized_R / MFE_R, exclude MFE_R<=0): "
-        f"n={stats.n}  mean={stats.mean:.2f}",
+        f"MFE capture (realized_R / MFE_R, only MFE_R >= {floor:g}R; "
+        f"n={stats.n} used, {stats.n_excluded} excluded): "
+        f"mean {stats.mean:.2f}, median {stats.median:.2f}",
     ]
 
 
@@ -944,6 +1081,7 @@ def _closed_trade_digest_sections(
     trades: Sequence[Trade],
     linked_setups: dict[int, str],
     setup_title: str,
+    store: Store | None = None,
 ) -> list[str]:
     if not trades:
         return []
@@ -952,6 +1090,8 @@ def _closed_trade_digest_sections(
     lines += _cost_section("By ticker:", ticker_cost_stats(trades))
     lines += _intraday_notional_fee_section(trades)
     lines += _mfe_capture_section(trades)
+    lines += _session_cost_section(trades)
+    lines += _entry_slippage_section(trades, store)
     return lines
 
 
@@ -996,6 +1136,333 @@ def _setup_cohort_scoreboard_section(
     return lines
 
 
+def trade_session(trade: Trade) -> str:
+    """UTC session name for ``trade.opened_at`` using ``SESSION_BOUNDARIES_UTC``."""
+    hour = _aware(trade.opened_at).astimezone(UTC).hour
+    for name, start, end in SESSION_BOUNDARIES_UTC:
+        if start <= hour < end:
+            return name
+    return "Unknown"
+
+
+def session_cost_stats(trades: Sequence[Trade]) -> list[tuple[str, CostStats]]:
+    """Always emit the four UTC sessions so counts sum to closed trades."""
+    buckets: dict[str, list[Trade]] = {name: [] for name, _, _ in SESSION_BOUNDARIES_UTC}
+    extras: dict[str, list[Trade]] = {}
+    for trade in trades:
+        key = trade_session(trade)
+        if key in buckets:
+            buckets[key].append(trade)
+        else:
+            extras.setdefault(key, []).append(trade)
+    rows = [(name, aggregate_cost_stats(buckets[name])) for name, _, _ in SESSION_BOUNDARIES_UTC]
+    rows.extend((name, aggregate_cost_stats(extras[name])) for name in sorted(extras))
+    return rows
+
+
+def _session_boundaries_header() -> str:
+    parts = [
+        f"{name} [{start:02d}:00, {end:02d}:00)" for name, start, end in SESSION_BOUNDARIES_UTC
+    ]
+    return "By entry session (UTC, " + ", ".join(parts) + "):"
+
+
+def _session_cost_section(trades: Sequence[Trade]) -> list[str]:
+    return _cost_section(_session_boundaries_header(), session_cost_stats(trades))
+
+
+def _effective_close(trade: Trade, horizon: datetime) -> datetime:
+    if trade.closed_at is None:
+        return horizon
+    return _aware(trade.closed_at)
+
+
+def _intervals_overlap(
+    a_open: datetime, a_close: datetime, b_open: datetime, b_close: datetime
+) -> bool:
+    return a_open < b_close and b_open < a_close
+
+
+def same_ticker_cross_sleeve_overlaps(
+    trades: Sequence[Trade],
+    *,
+    window_start: datetime,
+    window_end: datetime,
+    now: datetime | None = None,
+) -> CrossSleeveOverlapSummary:
+    """Groups of same-ticker trades from different strategies with overlapping opens.
+
+    Open trades (``closed_at is None``) stay open until ``now``, or until
+    ``window_end`` when that instant is already in the past. A group is kept
+    when at least one member closed inside ``[window_start, window_end)``.
+    Still-open trades stay in the group.
+    """
+    start = _aware(window_start)
+    end = _aware(window_end)
+    if now is not None:
+        horizon = _aware(now)
+    else:
+        clock = datetime.now(UTC)
+        horizon = end if end <= clock else clock
+
+    items = list(trades)
+    n = len(items)
+    if n < 2:
+        return CrossSleeveOverlapSummary()
+
+    opens = [_aware(trade.opened_at) for trade in items]
+    closes = [_effective_close(trade, horizon) for trade in items]
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    pair_overlaps: list[tuple[int, int, datetime, datetime]] = []
+    for i in range(n):
+        if closes[i] <= opens[i]:
+            continue
+        for j in range(i + 1, n):
+            if items[i].ticker != items[j].ticker:
+                continue
+            if str(items[i].strategy or "") == str(items[j].strategy or ""):
+                continue
+            if closes[j] <= opens[j]:
+                continue
+            if not _intervals_overlap(opens[i], closes[i], opens[j], closes[j]):
+                continue
+            overlap_start = max(opens[i], opens[j])
+            overlap_end = min(closes[i], closes[j])
+            if overlap_end <= overlap_start:
+                continue
+            union(i, j)
+            pair_overlaps.append((i, j, overlap_start, overlap_end))
+
+    clusters: dict[int, list[int]] = defaultdict(list)
+    for i in range(n):
+        clusters[find(i)].append(i)
+
+    pair_by_root: dict[int, list[tuple[datetime, datetime]]] = defaultdict(list)
+    for i, _j, overlap_start, overlap_end in pair_overlaps:
+        pair_by_root[find(i)].append((overlap_start, overlap_end))
+
+    groups: list[CrossSleeveOverlapGroup] = []
+    for root, idxs in clusters.items():
+        if len(idxs) < 2 or root not in pair_by_root:
+            continue
+        members_closed_in_window = False
+        members: list[OverlapMember] = []
+        closed_net = 0.0
+        open_count = 0
+        strategies: set[str] = set()
+        for i in idxs:
+            trade = items[i]
+            closed_at = trade.closed_at
+            is_open = closed_at is None
+            if is_open:
+                open_count += 1
+                net: float | None = None
+            else:
+                closed_aware = _aware(closed_at)
+                if start <= closed_aware < end:
+                    members_closed_in_window = True
+                net = float(trade.realized_pnl)
+                closed_net += net
+            strategies.add(str(trade.strategy or ""))
+            members.append(
+                OverlapMember(
+                    trade_id=getattr(trade, "id", None),
+                    strategy=str(trade.strategy or ""),
+                    ticker=trade.ticker,
+                    opened_at=opens[i],
+                    closed_at=None if is_open else _aware(closed_at),
+                    net_pnl=net,
+                )
+            )
+        if not members_closed_in_window or len(strategies) < 2:
+            continue
+        members.sort(key=lambda m: (m.opened_at, m.strategy, m.trade_id or 0))
+        span_start = min(pair[0] for pair in pair_by_root[root])
+        span_end = max(pair[1] for pair in pair_by_root[root])
+        groups.append(
+            CrossSleeveOverlapGroup(
+                ticker=items[idxs[0]].ticker,
+                members=tuple(members),
+                overlap_start=span_start,
+                overlap_end=span_end,
+                combined_net_pnl=closed_net,
+                open_count=open_count,
+            )
+        )
+
+    groups.sort(key=lambda g: (g.ticker, g.overlap_start, g.members[0].trade_id or 0))
+    return CrossSleeveOverlapSummary(
+        groups=tuple(groups),
+        combined_net_pnl=sum(group.combined_net_pnl for group in groups),
+    )
+
+
+def format_cross_sleeve_overlap_group(group: CrossSleeveOverlapGroup) -> str:
+    bits: list[str] = []
+    for member in group.members:
+        ident = f"#{member.trade_id}" if member.trade_id is not None else "#?"
+        if member.closed_at is None:
+            bits.append(f"{ident} {member.strategy} open")
+        else:
+            bits.append(f"{ident} {member.strategy} net ${member.net_pnl:+,.2f}")
+    start = group.overlap_start.astimezone(UTC).strftime("%Y-%m-%d %H:%MZ")
+    end = group.overlap_end.astimezone(UTC).strftime("%Y-%m-%d %H:%MZ")
+    return (
+        f"  {group.ticker:<5} {' + '.join(bits)}  "
+        f"overlap {start} – {end}  combined net ${group.combined_net_pnl:+,.2f}"
+    )
+
+
+def format_cross_sleeve_overlap_summary(summary: CrossSleeveOverlapSummary) -> list[str]:
+    if not summary.groups:
+        return []
+    lines = ["", "Same-ticker cross-sleeve overlap:"]
+    lines.extend(format_cross_sleeve_overlap_group(group) for group in summary.groups)
+    lines.append(
+        f"  week combined net of closed members across groups: ${summary.combined_net_pnl:+,.2f}"
+    )
+    return lines
+
+
+def _cross_sleeve_overlap_section(
+    trades: Sequence[Trade],
+    *,
+    window_start: datetime,
+    window_end: datetime,
+    now: datetime | None = None,
+) -> list[str]:
+    return format_cross_sleeve_overlap_summary(
+        same_ticker_cross_sleeve_overlaps(
+            trades, window_start=window_start, window_end=window_end, now=now
+        )
+    )
+
+
+def _mean_median(values: Sequence[float]) -> tuple[float, float]:
+    if not values:
+        return 0.0, 0.0
+    return sum(values) / len(values), float(statistics.median(values))
+
+
+def trade_has_entry_slippage(trade: Trade) -> bool:
+    snapshot = trade.exit_snapshot
+    if not isinstance(snapshot, dict):
+        return False
+    return ENTRY_FILL_PRICE_KEY in snapshot or ENTRY_SLIPPAGE_BPS_VS_QUOTE_KEY in snapshot
+
+
+def aggregate_entry_slippage(trades: Sequence[Trade]) -> EntrySlippageStats:
+    """Forward-only fill vs signal / quote from exit_snapshot keys written at open."""
+    rows = [trade for trade in trades if trade_has_entry_slippage(trade)]
+    if not rows:
+        return EntrySlippageStats()
+    signal_bps: list[float] = []
+    quote_bps: list[float] = []
+    signal_usd: list[float] = []
+    for trade in rows:
+        bps_signal = snapshot_event_float(trade, ENTRY_SLIPPAGE_BPS_VS_SIGNAL_KEY)
+        if bps_signal is not None:
+            signal_bps.append(bps_signal)
+        usd_signal = snapshot_event_float(trade, ENTRY_SLIPPAGE_USD_VS_SIGNAL_KEY)
+        if usd_signal is not None:
+            signal_usd.append(usd_signal)
+        bps_quote = snapshot_event_float(trade, ENTRY_SLIPPAGE_BPS_VS_QUOTE_KEY)
+        if bps_quote is not None:
+            quote_bps.append(bps_quote)
+    mean_sig, med_sig = _mean_median(signal_bps)
+    mean_q, med_q = _mean_median(quote_bps)
+    return EntrySlippageStats(
+        n=len(rows),
+        n_signal=len(signal_bps),
+        n_quote=len(quote_bps),
+        mean_bps_vs_signal=mean_sig,
+        median_bps_vs_signal=med_sig,
+        mean_bps_vs_quote=mean_q,
+        median_bps_vs_quote=med_q,
+        total_usd_vs_signal=sum(signal_usd),
+    )
+
+
+def backfill_entry_slippage_vs_proposed(
+    trades: Sequence[Trade],
+    proposed_prices: dict[int, float],
+) -> EntrySlippageStats:
+    """Historical fill vs ``opportunity_decisions.proposed_entry_price`` (signal)."""
+    signal_bps: list[float] = []
+    signal_usd: list[float] = []
+    for trade in trades:
+        trade_id = getattr(trade, "id", None)
+        if trade_id is None or int(trade_id) not in proposed_prices:
+            continue
+        signal = float(proposed_prices[int(trade_id)])
+        fill = float(trade.entry_price or 0.0)
+        if signal <= 0 or fill <= 0:
+            continue
+        qty = float(getattr(trade, "original_qty", 0.0) or trade.qty or 0.0)
+        signal_bps.append((fill - signal) / signal * 10_000.0)
+        signal_usd.append((fill - signal) * qty)
+    n = len(signal_bps)
+    mean_sig, med_sig = _mean_median(signal_bps)
+    return EntrySlippageStats(
+        n=n,
+        n_signal=n,
+        mean_bps_vs_signal=mean_sig,
+        median_bps_vs_signal=med_sig,
+        total_usd_vs_signal=sum(signal_usd),
+    )
+
+
+def format_entry_slippage_stats(stats: EntrySlippageStats, *, n_zero_note: str) -> str:
+    if stats.n == 0:
+        return f"  n=0 ({n_zero_note})"
+    return (
+        f"  n={stats.n}  mean {stats.mean_bps_vs_signal:.2f} bps vs signal "
+        f"(median {stats.median_bps_vs_signal:.2f}, n={stats.n_signal})  "
+        f"mean {stats.mean_bps_vs_quote:.2f} bps vs quote "
+        f"(median {stats.median_bps_vs_quote:.2f}, n={stats.n_quote})  "
+        f"total $ vs signal ${stats.total_usd_vs_signal:+,.2f}"
+    )
+
+
+def _entry_slippage_section(trades: Sequence[Trade], store: Store | None = None) -> list[str]:
+    stats = aggregate_entry_slippage(trades)
+    lines = [
+        "",
+        "Entry slippage (forward-only):",
+        format_entry_slippage_stats(stats, n_zero_note="forward-only since this ship"),
+    ]
+    if store is None:
+        return lines
+    ids = [int(trade.id) for trade in trades if getattr(trade, "id", None)]
+    lookup = getattr(store, "proposed_entry_prices_for_trade_ids", None)
+    if not callable(lookup) or not ids:
+        return lines
+    proposed = lookup(ids)
+    backfill = backfill_entry_slippage_vs_proposed(trades, proposed)
+    if backfill.n == 0:
+        lines.append("  backfill (signal=proposed_entry_price): n=0")
+        return lines
+    lines.append(
+        "  backfill (signal=proposed_entry_price): "
+        f"n={backfill.n}  mean {backfill.mean_bps_vs_signal:.2f} bps "
+        f"(median {backfill.median_bps_vs_signal:.2f})  "
+        f"total $ vs signal ${backfill.total_usd_vs_signal:+,.2f}"
+    )
+    return lines
+
+
 def _current_hold_hours(trade: Trade) -> float:
     return max(
         (_aware(datetime.now(UTC)) - _aware(trade.opened_at)).total_seconds() / 3600.0,
@@ -1009,6 +1476,7 @@ def format_trade_row(trade: Trade) -> str:
         f"{trade.ticker:<5} {trade.strategy:<9} {reason:<15} "
         f"${trade.realized_pnl:>8,.2f}  {_pnl_pct(trade):>+7.2%}  "
         f"{_hold_hours(trade):>5.1f}h MFE={_mfe_r(trade):.2f}R "
+        f"session={trade_session(trade)} "
         f"profile={trade.exit_profile_label or 'legacy'} "
         f"fp={(trade.config_fingerprint or '-')[:12]}"
     )
@@ -1162,7 +1630,7 @@ def build_weekly_report(
             for name in strategy_names
         ]
         lines += _cost_section("By strategy:", by_strategy)
-    lines += _closed_trade_digest_sections(closed, linked_setups, "By setup:")
+    lines += _closed_trade_digest_sections(closed, linked_setups, "By setup:", store)
     all_closed = list(store.closed_trades())
     cumulative_linked = store.setup_names_for_trade_ids(
         trade.id for trade in all_closed if trade.id
@@ -1181,6 +1649,11 @@ def build_weekly_report(
     lines += _shadow_entry_gates_section(closed, all_closed)
 
     open_trades = store.open_trades()
+    lines += _cross_sleeve_overlap_section(
+        [*all_closed, *open_trades],
+        window_start=start,
+        window_end=end,
+    )
     if open_trades:
         lines += ["", f"Still open: {len(open_trades)}"]
         for t in open_trades:
@@ -1284,7 +1757,7 @@ def build_compare_report(
         )
     if closed:
         lines += _closed_trade_digest_sections(
-            closed, linked_setups, "By setup (closed trades):"
+            closed, linked_setups, "By setup (closed trades):", store
         )
         lines += _stop_loss_fill_rollup_section(closed)
     else:
@@ -1295,9 +1768,7 @@ def build_compare_report(
         for trade in closed
         if trade.closed_at is not None and _aware(trade.closed_at) >= week_cutoff
     ]
-    week_linked = store.setup_names_for_trade_ids(
-        trade.id for trade in week_closed if trade.id
-    )
+    week_linked = store.setup_names_for_trade_ids(trade.id for trade in week_closed if trade.id)
     lines += _setup_cohort_scoreboard_section(
         week_trades=week_closed,
         week_linked=week_linked,
