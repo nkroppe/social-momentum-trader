@@ -25,6 +25,15 @@ def _fee_rate(value: str) -> float:
     return parsed
 
 
+def _fee_rates(value: str) -> tuple[float, ...]:
+    parts = [item.strip() for item in value.split(",") if item.strip()]
+    if not parts:
+        raise argparse.ArgumentTypeError(
+            "must be a comma-separated list of per-side fractions in [0, 0.1)"
+        )
+    return tuple(_fee_rate(item) for item in parts)
+
+
 def _cmd_run(_args: argparse.Namespace) -> int:
     from .run import Runner
 
@@ -509,6 +518,25 @@ def _cmd_fetch_candles(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_replays(args: argparse.Namespace) -> int:
+    """Retrospective gen-8 fee/gate/setup tables. Read-only: Store reads, no DB writes."""
+    from .config import get_settings
+    from .ops.replays import format_replays, format_replays_json, run_replays
+    from .store import Store
+
+    store = Store(get_settings().database_url)
+    result = run_replays(
+        store,
+        fingerprint_prefix=args.fingerprint_prefix,
+        fee_rates=args.fee_rates,
+    )
+    if args.json:
+        print(format_replays_json(result), end="")
+    else:
+        print(format_replays(result), end="")
+    return 0
+
+
 def _cmd_partial_replay(args: argparse.Namespace) -> int:
     """Report-only post-partial exit replay from local CSVs. No network, no DB writes."""
     from pathlib import Path
@@ -562,6 +590,7 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from .ops.replays import DEFAULT_FEE_RATES_TEXT
     from .ops.reports import GEN8_CONFIG_FINGERPRINT_PREFIX
 
     p = argparse.ArgumentParser(prog="smt", description="Social Momentum Trader")
@@ -695,6 +724,29 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Closed-trade config_fingerprint prefix (default: {GEN8_CONFIG_FINGERPRINT_PREFIX})",
     )
     partial_replay.set_defaults(func=_cmd_partial_replay)
+
+    replays = sub.add_parser(
+        "replays",
+        help="Retrospective gen-8 fee/gate/setup tables (read-only, no DB writes)",
+    )
+    replays.add_argument(
+        "--fingerprint-prefix",
+        default=GEN8_CONFIG_FINGERPRINT_PREFIX,
+        help=f"Closed-trade config_fingerprint prefix (default: {GEN8_CONFIG_FINGERPRINT_PREFIX})",
+    )
+    replays.add_argument(
+        "--fee-rates",
+        type=_fee_rates,
+        default=_fee_rates(DEFAULT_FEE_RATES_TEXT),
+        metavar="RATES",
+        help=(f"Comma-separated per-side fee fractions (default: {DEFAULT_FEE_RATES_TEXT})"),
+    )
+    replays.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON instead of tables",
+    )
+    replays.set_defaults(func=_cmd_replays)
 
     dash = sub.add_parser("dashboard", help="Serve the read-only monitoring web UI")
     dash.add_argument("--host", default="127.0.0.1", help="Bind address (default 127.0.0.1)")

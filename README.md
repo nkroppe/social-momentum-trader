@@ -337,6 +337,7 @@ smt dashboard           # read-only web UI on http://127.0.0.1:8080
 smt backtest ...        # deterministic local price-only replay; never calls network
 smt fetch-candles       # public Coinbase OHLCV CSVs for closed trades (no orders)
 smt partial-replay      # report-only post-partial exit counterfactuals from those CSVs
+smt replays             # retrospective gen-8 fee/gate/setup tables (read-only); see docs/replays.md
 smt soak-reset          # intentional restart; policy changes reset automatically
 ```
 
@@ -445,7 +446,7 @@ src/smt/
   demo.py   deterministic seeding for simulate/tests
   run.py    orchestrator     cli.py  CLI
 config/     risk, strategies, universe, sources, security, ops, market, signals
-docs/       venue.md, deploy-vps.md, go-live-checklist.md, compromise-runbook.md
+docs/       venue.md, deploy-vps.md, go-live-checklist.md, compromise-runbook.md, replays.md
 ```
 
 ## Roadmap
