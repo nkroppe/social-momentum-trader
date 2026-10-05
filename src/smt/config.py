@@ -805,6 +805,13 @@ class WeeklyReportConfig(BaseModel):
         return WEEKDAYS.index(self.weekday)
 
 
+class ShadowGatesConfig(BaseModel):
+    """Forward-only would-block entry flags. Logging and reporting only."""
+
+    fee_hurdle_r_max: float = 0.5
+    enabled: bool = True
+
+
 class ShadowReportConfig(BaseModel):
     """Conservative evidence floors for staged shadow activation reviews."""
 
@@ -851,6 +858,9 @@ class OpsConfig(BaseModel):
     telegram_control: TelegramControlConfig = Field(default_factory=TelegramControlConfig)
     weekly_report: WeeklyReportConfig = Field(default_factory=WeeklyReportConfig)
     shadow_report: ShadowReportConfig = Field(default_factory=ShadowReportConfig)
+    # Would-block entry flags. Defaults live in code so ops.yaml does not need
+    # a matching key; not part of the hashed trading-policy identity.
+    shadow_gates: ShadowGatesConfig = Field(default_factory=ShadowGatesConfig)
     # App file-log rotation. Defaults live in code so ops.yaml does not need
     # a matching key; logging_setup reads these (with the same fallbacks).
     log_max_bytes: int = 50 * 1024 * 1024

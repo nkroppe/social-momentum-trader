@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, tzinfo
 
 from ..models import ExitReason, Trade
@@ -29,6 +29,13 @@ MFE_EVENT_SNAPSHOT_KEYS = (
     "realized_r_at_partial",
     "mfe_r_at_trail",
     "realized_r_at_trail",
+)
+SHADOW_GATE_SNAPSHOT_KEYS = (
+    "shadow_gate_fee_hurdle_r_max",
+    "shadow_block_fee_hurdle",
+    "shadow_block_cross_sleeve",
+    "shadow_cross_sleeve_holders",
+    "shadow_gates_version",
 )
 
 
@@ -208,6 +215,34 @@ class FeeHurdleSummary:
     with_hurdle: int = 0
     without_hurdle: int = 0
     non_starters: int = 0
+
+
+@dataclass(frozen=True)
+class ShadowGateCohortStats:
+    """Net dollars and mean net R for one flagged or not-flagged cohort."""
+
+    n: int = 0
+    net_pnl: float = 0.0
+    mean_net_r: float = 0.0
+
+
+@dataclass(frozen=True)
+class ShadowGateSplit:
+    """Flagged vs not-flagged stats for one shadow gate."""
+
+    flagged: ShadowGateCohortStats = field(default_factory=ShadowGateCohortStats)
+    not_flagged: ShadowGateCohortStats = field(default_factory=ShadowGateCohortStats)
+
+
+@dataclass(frozen=True)
+class ShadowGateSummary:
+    """Coverage plus per-gate splits for a closed-trade set."""
+
+    coverage_n: int = 0
+    no_shadow_data: int = 0
+    fee_hurdle: ShadowGateSplit = field(default_factory=ShadowGateSplit)
+    cross_sleeve: ShadowGateSplit = field(default_factory=ShadowGateSplit)
+    either: ShadowGateSplit = field(default_factory=ShadowGateSplit)
 
 
 def aggregate_cost_stats(trades: Sequence[Trade]) -> CostStats:
@@ -650,6 +685,118 @@ def _fee_hurdle_section(
     return lines
 
 
+def has_shadow_gate_snapshot(trade: Trade) -> bool:
+    snapshot = trade.exit_snapshot
+    return isinstance(snapshot, dict) and "shadow_gates_version" in snapshot
+
+
+def shadow_block_flag(trade: Trade, key: str) -> bool | None:
+    """True/False from a shadow bool key; None when missing or stored as null."""
+    snapshot = trade.exit_snapshot
+    if not isinstance(snapshot, dict) or key not in snapshot:
+        return None
+    value = snapshot[key]
+    if value is None:
+        return None
+    return bool(value)
+
+
+def _shadow_gate_cohort_stats(trades: Sequence[Trade]) -> ShadowGateCohortStats:
+    n = len(trades)
+    if n == 0:
+        return ShadowGateCohortStats()
+    net_pnl = sum(float(trade.realized_pnl) for trade in trades)
+    mean_net_r = sum(trade_realized_r(trade) for trade in trades) / n
+    return ShadowGateCohortStats(n=n, net_pnl=net_pnl, mean_net_r=mean_net_r)
+
+
+def _shadow_gate_split(
+    trades: Sequence[Trade], flagged: Callable[[Trade], bool]
+) -> ShadowGateSplit:
+    yes = [trade for trade in trades if flagged(trade)]
+    no = [trade for trade in trades if not flagged(trade)]
+    return ShadowGateSplit(
+        flagged=_shadow_gate_cohort_stats(yes),
+        not_flagged=_shadow_gate_cohort_stats(no),
+    )
+
+
+def shadow_gate_summary(trades: Sequence[Trade]) -> ShadowGateSummary:
+    """Closed-trade shadow-gate coverage and flagged vs not-flagged splits."""
+    with_data: list[Trade] = []
+    without = 0
+    for trade in trades:
+        if has_shadow_gate_snapshot(trade):
+            with_data.append(trade)
+        else:
+            without += 1
+    return ShadowGateSummary(
+        coverage_n=len(with_data),
+        no_shadow_data=without,
+        fee_hurdle=_shadow_gate_split(
+            with_data, lambda trade: shadow_block_flag(trade, "shadow_block_fee_hurdle") is True
+        ),
+        cross_sleeve=_shadow_gate_split(
+            with_data, lambda trade: shadow_block_flag(trade, "shadow_block_cross_sleeve") is True
+        ),
+        either=_shadow_gate_split(
+            with_data,
+            lambda trade: (
+                shadow_block_flag(trade, "shadow_block_fee_hurdle") is True
+                or shadow_block_flag(trade, "shadow_block_cross_sleeve") is True
+            ),
+        ),
+    )
+
+
+def format_shadow_gate_split(name: str, split: ShadowGateSplit) -> str:
+    flagged = split.flagged
+    not_flagged = split.not_flagged
+    return (
+        f"    {name:<12} flagged n={flagged.n} net ${flagged.net_pnl:+,.2f} "
+        f"mean R={flagged.mean_net_r:+.2f}  |  "
+        f"not-flagged n={not_flagged.n} net ${not_flagged.net_pnl:+,.2f} "
+        f"mean R={not_flagged.mean_net_r:+.2f}"
+    )
+
+
+def format_shadow_gate_summary(summary: ShadowGateSummary, *, label: str) -> list[str]:
+    return [
+        f"  {label}: coverage n={summary.coverage_n}  no shadow data: {summary.no_shadow_data}",
+        format_shadow_gate_split("fee-hurdle", summary.fee_hurdle),
+        format_shadow_gate_split("cross-sleeve", summary.cross_sleeve),
+        format_shadow_gate_split("either", summary.either),
+    ]
+
+
+def _ops_shadow_fee_hurdle_r_max() -> float:
+    try:
+        from ..config import get_ops
+
+        return float(get_ops().shadow_gates.fee_hurdle_r_max)
+    except Exception:  # noqa: BLE001 - still render the section with the code default
+        return 0.5
+
+
+def _shadow_entry_gates_section(
+    week_trades: Sequence[Trade],
+    all_closed: Sequence[Trade],
+    *,
+    fingerprint_prefix: str = GEN8_CONFIG_FINGERPRINT_PREFIX,
+    threshold: float | None = None,
+) -> list[str]:
+    used = _ops_shadow_fee_hurdle_r_max() if threshold is None else float(threshold)
+    week = shadow_gate_summary(week_trades)
+    gen8 = shadow_gate_summary(trades_matching_config_fingerprint(all_closed, fingerprint_prefix))
+    lines = [
+        "",
+        f"Shadow entry gates (forward-only, no behavior change; threshold {used:.2f} R)",
+    ]
+    lines.extend(format_shadow_gate_summary(week, label="this week"))
+    lines.extend(format_shadow_gate_summary(gen8, label=f"since gen-8 (fp {fingerprint_prefix})"))
+    return lines
+
+
 def intraday_notional_fee_rows(trades: Sequence[Trade]) -> list[IntradayNotionalFee]:
     """Closed-only intraday size vs fee. Callers pass already-closed trades."""
     rows: list[IntradayNotionalFee] = []
@@ -1031,6 +1178,7 @@ def build_weekly_report(
     lines += _stop_loss_fill_rollup_section(closed)
     lines += _mfe_event_snapshot_section(closed)
     lines += _fee_hurdle_section(closed, all_closed)
+    lines += _shadow_entry_gates_section(closed, all_closed)
 
     open_trades = store.open_trades()
     if open_trades:

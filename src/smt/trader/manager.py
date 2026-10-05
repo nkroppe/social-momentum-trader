@@ -72,6 +72,8 @@ class TradeManager:
         trade_alerts: TradeAlertsConfig | None = None,
         strategies: list[StrategyConfig] | None = None,
         config_fingerprint: str | None = None,
+        shadow_gate_fee_hurdle_r_max: float = 0.5,
+        shadow_gates_enabled: bool = True,
     ):
         self.settings = settings
         self.universe = universe
@@ -83,6 +85,8 @@ class TradeManager:
         self.trade_alerts = trade_alerts if trade_alerts is not None else TradeAlertsConfig()
         self.strategies = {strategy.name: strategy for strategy in (strategies or [])}
         self.config_fingerprint = config_fingerprint or stable_config_fingerprint()
+        self.shadow_gate_fee_hurdle_r_max = shadow_gate_fee_hurdle_r_max
+        self.shadow_gates_enabled = shadow_gates_enabled
 
     # ---- Notifications -------------------------------------------------------
 
@@ -180,6 +184,39 @@ class TradeManager:
         )
         return levels.take_profit, levels.stop_loss, levels.note
 
+    def _record_shadow_entry_gates(
+        self,
+        exit_snapshot: dict,
+        *,
+        ticker: str,
+        strategy_name: str,
+        hurdle: float | None,
+    ) -> None:
+        """Write would-block flags. Never raises into the entry path."""
+        if not self.shadow_gates_enabled:
+            return
+        try:
+            threshold = float(self.shadow_gate_fee_hurdle_r_max)
+            block_hurdle = None if hurdle is None else bool(hurdle > threshold)
+            holders = sorted(
+                {
+                    trade.strategy
+                    for trade in self.store.open_trades()
+                    if trade.ticker == ticker and trade.strategy != strategy_name
+                }
+            )
+            exit_snapshot.update(
+                {
+                    "shadow_gate_fee_hurdle_r_max": threshold,
+                    "shadow_block_fee_hurdle": block_hurdle,
+                    "shadow_block_cross_sleeve": bool(holders),
+                    "shadow_cross_sleeve_holders": holders,
+                    "shadow_gates_version": 1,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 - flags are observational only
+            log.warning("shadow entry gates failed: %s", exc)
+
     def open_position(
         self,
         candidate: TradeCandidate,
@@ -220,6 +257,19 @@ class TradeManager:
                 actual_risk > risk_budget_usd * 1.02
                 or fill_slippage > strategy.entry.max_entry_slippage_pct
             )
+        )
+
+        hurdle = fee_hurdle_r(
+            fill.price,
+            fill.qty,
+            initial_risk,
+            strategy.assumed_fee_pct_per_side,
+        )
+        self._record_shadow_entry_gates(
+            exit_snapshot,
+            ticker=candidate.ticker,
+            strategy_name=strategy.name,
+            hurdle=hurdle,
         )
 
         if entry_risk_breach and self.broker.name == "paper":
@@ -266,12 +316,6 @@ class TradeManager:
                 self._notify(*trade_closed_alert(trade))
             return trade
 
-        hurdle = fee_hurdle_r(
-            fill.price,
-            fill.qty,
-            initial_risk,
-            strategy.assumed_fee_pct_per_side,
-        )
         if hurdle is not None:
             exit_snapshot["fee_hurdle_r"] = round(hurdle, 6)
             exit_snapshot["fee_hurdle_pct_per_side"] = strategy.assumed_fee_pct_per_side

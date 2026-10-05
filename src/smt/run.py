@@ -177,6 +177,8 @@ class Runner:
             trade_alerts=self.ops.trade_alerts,
             strategies=self.strategies,
             config_fingerprint=self.config_fingerprint,
+            shadow_gate_fee_hurdle_r_max=self.ops.shadow_gates.fee_hurdle_r_max,
+            shadow_gates_enabled=self.ops.shadow_gates.enabled,
         )
         self.soak = SoakTracker(Path(self.ops.soak.state_file))
         self.weekly = WeeklyScheduler(self.ops.weekly_report)
