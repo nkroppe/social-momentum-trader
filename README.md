@@ -285,6 +285,10 @@ See `docs/compromise-runbook.md` and the fund-protection layers below.
 5. **Code deny-list** - executor blocks any transfer/withdraw/convert path.
 6. **Monitoring + kill** - transfer/anomaly alerts; `touch control/KILL`.
 7. **VPS hygiene** - non-root, SSH keys only, secrets not in git, rotation.
+   Database passwords are masked in doctor output and app logs
+   (`postgresql+psycopg://user:***@host/...`). `logs/smt.log` uses a 50 MB
+   rotating file (5 backups); Compose JSON logs cap at 20 MB × 5 files. See
+   [docs/deploy-vps.md](docs/deploy-vps.md).
 
 ## Deploy on the VPS
 

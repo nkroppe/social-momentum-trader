@@ -116,3 +116,8 @@ See [go-live-checklist.md](go-live-checklist.md) and [venue.md](venue.md).
 - Postgres bound to `127.0.0.1` only (default in compose)
 - No public ports except SSH
 - Rotate API keys quarterly or on any suspicion
+- Database URLs are masked (`user:***@host`) in `smt doctor` and the
+  "Database ready" log line. Compose still connects with the real
+  `DATABASE_URL`. `logs/smt.log` rotates at 50 MB with 5 backups; each
+  Compose service uses the `json-file` driver (`max-size: 20m`, `max-file: 5`).
+  Existing log files are not truncated on startup.

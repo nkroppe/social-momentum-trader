@@ -30,6 +30,7 @@ from .models import (
     TradeStatus,
     utcnow,
 )
+from .security_utils import mask_database_url
 
 log = get_logger("smt.store")
 
@@ -152,7 +153,7 @@ class Store:
     def init_db(self) -> None:
         Base.metadata.create_all(self.engine)
         self._migrate()
-        log.info("Database ready at %s", self.database_url)
+        log.info("Database ready at %s", mask_database_url(self.database_url))
 
     def _migrate(self) -> None:
         """Lightweight, idempotent schema migrations for existing dev DBs.

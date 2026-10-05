@@ -22,6 +22,7 @@ from ..config import (
 from ..ops.edge_gate import live_edge_gate
 from ..ops.soak import SoakTracker
 from ..policy import trading_policy_identity
+from ..security_utils import mask_database_url, mask_database_urls_in_text
 from ..store import Store
 
 REQUIRED_CONFIGS = (
@@ -254,7 +255,11 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
 
     if ops.preflight.require_postgres:
         pg = settings.database_url.startswith("postgresql")
-        pg_detail = settings.database_url if pg else "set DATABASE_URL to postgresql+psycopg://..."
+        pg_detail = (
+            mask_database_url(settings.database_url)
+            if pg
+            else "set DATABASE_URL to postgresql+psycopg://..."
+        )
         results.append(
             CheckResult(
                 "postgres_database_url",
@@ -475,7 +480,13 @@ def run_preflight(profile: str = "production") -> list[CheckResult]:
         edge = live_edge_gate(store, policy.fingerprint)
         results.append(CheckResult("live_edge_gate", edge.passed, edge.detail))
     except Exception as exc:  # noqa: BLE001
-        results.append(CheckResult("live_edge_gate", False, str(exc)))
+        results.append(
+            CheckResult(
+                "live_edge_gate",
+                False,
+                mask_database_urls_in_text(str(exc), settings.database_url),
+            )
+        )
 
     if coinbase_ok and settings.live and settings.live_ack == LIVE_ACK_PHRASE:
         try:

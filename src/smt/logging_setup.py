@@ -3,10 +3,26 @@
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import sys
 from pathlib import Path
 
+# Fallbacks when OpsConfig is not available yet (import-time get_logger).
+# Keep in sync with OpsConfig.log_max_bytes / log_backup_count.
+LOG_MAX_BYTES = 50 * 1024 * 1024
+LOG_BACKUP_COUNT = 5
+
 _CONFIGURED = False
+
+
+def _rotation_limits() -> tuple[int, int]:
+    try:
+        from .config import get_ops
+
+        ops = get_ops()
+        return int(ops.log_max_bytes), int(ops.log_backup_count)
+    except Exception:
+        return LOG_MAX_BYTES, LOG_BACKUP_COUNT
 
 
 def setup_logging(level: int = logging.INFO, log_dir: str = "./logs") -> None:
@@ -19,7 +35,15 @@ def setup_logging(level: int = logging.INFO, log_dir: str = "./logs") -> None:
 
     try:
         Path(log_dir).mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(Path(log_dir) / "smt.log", encoding="utf-8"))
+        max_bytes, backup_count = _rotation_limits()
+        handlers.append(
+            logging.handlers.RotatingFileHandler(
+                Path(log_dir) / "smt.log",
+                maxBytes=max_bytes,
+                backupCount=backup_count,
+                encoding="utf-8",
+            )
+        )
     except OSError:
         # If the log dir is not writable, stdout logging still works.
         pass

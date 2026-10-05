@@ -851,6 +851,10 @@ class OpsConfig(BaseModel):
     telegram_control: TelegramControlConfig = Field(default_factory=TelegramControlConfig)
     weekly_report: WeeklyReportConfig = Field(default_factory=WeeklyReportConfig)
     shadow_report: ShadowReportConfig = Field(default_factory=ShadowReportConfig)
+    # App file-log rotation. Defaults live in code so ops.yaml does not need
+    # a matching key; logging_setup reads these (with the same fallbacks).
+    log_max_bytes: int = 50 * 1024 * 1024
+    log_backup_count: int = 5
 
 
 # ----------------------------------------------------------------------------
